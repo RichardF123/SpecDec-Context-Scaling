@@ -1,0 +1,8 @@
+# Free Colab (T4) — torch/triton preinstalled by Colab; used only for optional draft training.
+transformers>=4.44
+tokenizers>=0.19
+numpy>=1.26
+bitsandbytes>=0.43
+peft>=0.12
+accelerate>=0.33
+datasets>=2.20

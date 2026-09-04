@@ -1,0 +1,36 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+
+# ---- Virtual envs ----
+.venv/
+venv/
+
+# ---- SpecDec runtime artifacts (reproducible outputs live in repo only as summaries) ----
+results.jsonl
+runs/
+checkpoints/
+*.pt
+*.safetensors
+*.bin
+*.gguf
+
+# ---- Secrets / local ----
+.env
+.env.*
+!.env.example
+secrets/
+
+# ---- Editors / OS ----
+.idea/
+.vscode/
+*.swp
+Thumbs.db
+.DS_Store
+
+# ---- Colab / scratch ----
+.ipynb_checkpoints/
+scratch/

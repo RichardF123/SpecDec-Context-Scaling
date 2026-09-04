@@ -1,0 +1,3 @@
+# Kernel work (Phase 3+) — install under WSL2 (Ubuntu), NOT native Windows.
+triton>=2.3
+# (torch with CUDA must already be installed in that WSL2 env)

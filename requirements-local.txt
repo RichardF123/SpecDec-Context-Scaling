@@ -1,0 +1,9 @@
+# Local laptop (RTX 4060 8GB, Windows). PyPI torch wheels bundle CUDA.
+torch>=2.3
+transformers>=4.44
+tokenizers>=0.19
+numpy>=1.26
+# NOTE: official `triton` ships no Windows wheel -> do NOT put it here.
+# Kernel work (Phase 3): run under WSL2 (Ubuntu) using requirements-kernels.txt,
+# or try `pip install triton-windows` on native Windows. If unavailable/slow:
+# LOCK EAGER (go/no-go rule) and proceed with L4/L4b/L5.
