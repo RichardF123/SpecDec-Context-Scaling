@@ -15,6 +15,28 @@
 - 性能基线（Qwen2.5-0.5B）：CPU fp32 decode ≈ 9.2 tok/s；GPU fp16 decode
   ≈ 10.6 tok/s（latency-bound 的朴素解码——是后续各级优化要超越的起点）。
 
+## 项目简介
+
+**在做什么**：从零手写 Qwen2 架构推理引擎（RMSNorm / RoPE / GQA attention /
+SwiGLU / KV-cache 解码 / 贪心生成），再沿 **KV-cache → int8/int4 量化 → fp8 KV
+量化 → 投机解码** 逐级优化，用可复现测量表回答研究问题：
+> 投机解码在 8GB 小卡上随上下文变长到哪里失效？KV 量化能否延长它的获利区间？
+
+**意义**：课程要求"原创 + hands-on LLM system"——我们交付自写引擎 + 质量×成本
+测量表（decode tokens/s / 显存 / 接受率 / ppl），而不是跑教程报一个数字；结果
+可作为小模型部署的决策表；亲手实现 transformer 与推理引擎也正是 AI Infra
+方向的核心技能。
+
+**技术栈**：Python + PyTorch 2.6（cu124）；自写引擎 `engine/model_self.py`（OURS）；
+HuggingFace 仅用于权重加载与 tokenizer（LIB）；对齐/缓存/生成测试 vs transformers
+eager；规划 int8/int4（L4）、fp8 KV（L4b）、固定链投机解码（L5）、受控 CUDA kernel 轨、
+Spec-Bench 风格测量协议 + `results.jsonl`。
+
+**为什么这么做**：调 API/库只能看整机表现，研究问题（缓存、量化、投机解码的收益）
+需要引擎内部控制权（缓存布局、解码循环、计时插桩）——这是自建引擎的必要性而非炫技；
+"从零"配上对齐基线（0.000）才让每个结论可复现、可归因；同时遵守风险分层纪律
+（只承诺纯 PyTorch MUST，高方差项为加分轨）。
+
 ## 快速开始
 
 ```powershell
