@@ -69,10 +69,15 @@
 ### 4.3 外部对照 sanity（评审要求：基线是否有可避免开销）
 | 实现 | decode tok/s | ms/token | 条件 |
 |---|---|---|---|
-| transformers eager（fp16, cuda, generate 循环）| **8.29** | 120.6 | 同 prompt、同 GPU、N=20 |
-| **我们的引擎（fp16, cuda）** | **10.58** | 94.5 | 同条件（decode 64, warmup）|
+| transformers eager（fp16, cuda, generate 循环）| **8.29–9.40** | ~106–121 | 同 prompt、同 GPU、N=20–32 |
+| **我们的引擎（fp16, cuda）** | **10.58–13.82** | ~72–95 | 同条件（decode 32–64, warmup）|
 
-**结论**：我们的朴素 eager decode **不慢于** transformers eager 参考（反而快 ~27%）→ 10.58 tok/s 是该 eager/单 token 配置的固有水平（latency-bound），非可避免开销；**L5 净加速比的分母可信，报告可与库参考对照引用**。
+**结论**：我们的朴素 eager decode **不慢于** transformers eager 参考（反而快 ~27–47%）→ 该数字是 eager/单 token 配置的固有水平（latency-bound），非可避免开销；**L5 净加速比的分母可信，报告可与库参考对照引用**。
+
+### 4.4 8K fp16 prefill 显存（探针 C 段）
+- **结果：单次 8K eager prefill（ours，fp16）CUDA OOM**：scores（14×8192×8192×fp16）≈ 1.75GiB/层瞬时 + logits（8192×151936×fp16）≈ 2.5GiB + 双模型常驻 > 8GB；
+- transformers eager 同配置也会 OOM（其也被强制 eager）。
+- **含义/方案**：18 格的 8K 行不能"一次性喂 8K"获取，需分块 prefill（块级因果 mask，引擎小改造）+ 缓存构建路径跳过 logits + 单模型常驻/expandable_segments；该 OOM 本身可作为"为什么需要 KV 压缩/量化/长上下文优化"的动机素材。
 
 ## 5. 复现设置（每次记录必须带上）
 - seed=42（测试）；性能脚本 seed=0，3 reps 取最优 + warmup；
