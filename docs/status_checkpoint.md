@@ -34,11 +34,12 @@
 | GPU fp16 decode（**transformers eager 参考**）| **8.29–9.40 tok/s** | 同条件 sanity |
 | 结论 | 基线无"可避免开销"（快 ~27–47%），L5 分母可信 | — |
 | **8K fp16 单次 prefill** | **OOM（CUDA）**：scores 1.75GiB + logits 2.5GiB + 双模型 >8GB | 需分块 prefill + 跳过 prefill logits（详见 data_ledger §4.4）|
+| **分块 prefill** | ✅ 已实现并验证：fp32 下与一次性 prefill 一致（worst 7.8e-4、逐层平滑）；fp16 缓存有取整漂移（量级随层累积）但 token 行为一致（首 token + 6–12 步 decode 全同）| 8K/18 格硬前提已清 |
 
 ## 4. 未决/待办
 - [ ] 修 `model_self.py` 末尾 `__main__` 残留（评审跑直接运行会 NameError）
 - [ ] 10/7 前：定 2–3 人团队与分工（贡献声明影响个人评分）
-- [ ] **8K 测量前置工程**：分块 prefill（块级因果 mask 小改造）+ prefill 缓存构建路径跳过 logits（18 格 8K 行的前提）
+- [x] ~~8K 测量前置工程~~（分块 prefill 已完成并验证）
 - [ ] L4 int8/int4 权重量化（下一主线）
 
 ## 5. 下一步（建议顺序）

@@ -89,8 +89,15 @@ class SelfAttention(nn.Module):
         k = kv_repeat(k, self.heads // self.kv_heads)
         v = kv_repeat(v, self.heads // self.kv_heads)
         scores = torch.matmul(q, k.transpose(-2, -1)) / (self.head_dim ** 0.5)
+        T = k_cached.shape[2] if cache is not None else s
+        p = T - s
         if cache is None:
             mask = torch.triu(torch.ones(s, s, device=x.device, dtype=torch.bool), diagonal=1)
+            scores = scores.masked_fill(mask, float('-inf'))
+        elif s == 1:
+            pass
+        else:
+            mask = torch.triu(torch.ones(s, T, device=x.device, dtype=torch.bool), diagonal=p + 1)
             scores = scores.masked_fill(mask, float('-inf'))
         attn = torch.softmax(scores, dim=-1)
         out = torch.matmul(attn, v)
@@ -122,7 +129,7 @@ class QwenLM(nn.Module):
         self.head_dim = head_dim
         self.rope_theta = rope_theta 
 
-    def _run(self,x, cache_list = None):
+    def _run(self,x, cache_list = None, need_logits = True):  
         start_pos = 0
         if cache_list is not None and cache_list[0] is not None:
             start_pos = cache_list[0]["k"].shape[2]
@@ -133,9 +140,18 @@ class QwenLM(nn.Module):
             x, new_cache = layer(x, cos, sin, cache)
             new_cache_list.append(new_cache)
         x = self.norm(x)
-        logits = x @ self.embed_tokens.weight.T
-        return logits, new_cache_list
-    
+        if need_logits:
+            logits = x @ self.embed_tokens.weight.T
+            return logits, new_cache_list
+        return None, new_cache_list
+
+    def prefill_chunked(self, token_ids, chunk: int = 1024) -> tuple[torch.Tensor, list[dict]]:
+        cache_list = None
+        for st in range(0, token_ids.size(1), chunk):
+            piece = token_ids[:, st:st + chunk]
+            _, cache_list = self._run(self.embed_tokens(piece), cache_list, need_logits=False)
+        return cache_list
+
     def forward(self, token_ids: torch.Tensor) -> torch.Tensor:
         x = self.embed_tokens(token_ids)
         logits, _ = self._run(x)
