@@ -66,6 +66,14 @@
 **解读**：decode 为 latency-bound（单 token 串行 + 24 层小 kernel + Python 开销），GPU 优势小；**此为后续 L4/L4b/L5/kernel 的对照基线**。
 > 注：GPU 首次运行曾现 `bad allocation`，重跑正常——记录为环境瞬态，未复现。
 
+### 4.3 外部对照 sanity（评审要求：基线是否有可避免开销）
+| 实现 | decode tok/s | ms/token | 条件 |
+|---|---|---|---|
+| transformers eager（fp16, cuda, generate 循环）| **8.29** | 120.6 | 同 prompt、同 GPU、N=20 |
+| **我们的引擎（fp16, cuda）** | **10.58** | 94.5 | 同条件（decode 64, warmup）|
+
+**结论**：我们的朴素 eager decode **不慢于** transformers eager 参考（反而快 ~27%）→ 10.58 tok/s 是该 eager/单 token 配置的固有水平（latency-bound），非可避免开销；**L5 净加速比的分母可信，报告可与库参考对照引用**。
+
 ## 5. 复现设置（每次记录必须带上）
 - seed=42（测试）；性能脚本 seed=0，3 reps 取最优 + warmup；
 - prompt 固定（bench_basic.PROMPT，38 tok）；decode 数 64；
