@@ -12,6 +12,10 @@ Run（交互式 GPU 终端）:  python -m specdec.engine.fp8_kv_v4_probe
 from __future__ import annotations
 
 import math
+import os
+
+# 须在首次 CUDA 分配前生效: 缓解碎片化导致的伪 OOM
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import torch
 

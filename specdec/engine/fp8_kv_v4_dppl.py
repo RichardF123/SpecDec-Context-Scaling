@@ -20,6 +20,10 @@ from __future__ import annotations
 
 import math
 import os
+
+# 须在首次 CUDA 分配前生效: 缓解碎片化导致的伪 OOM
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
 import time
 import urllib.request
 import zipfile
@@ -98,17 +102,18 @@ def window_stats(ours, ids_w: torch.Tensor, fmt: str) -> tuple[float, int, bool]
             piece = ids_w[gs:gs + CHUNK]
             lg, cache_list = ours._run(
                 ours.embed_tokens(piece.unsqueeze(0)), cache_list, need_logits=True)
-            # lg: (1, s, vocab)
-            lg32 = lg[0].to(torch.float32)
-            finite &= bool(torch.isfinite(lg32).all().item())
+            # lg: (1, s, vocab) fp16; finite 直接在 fp16 上查（不造 fp32 全量副本）
+            finite &= bool(torch.isfinite(lg).all().item())
             # 目标 = 下一 token: 行 r(位置 gs+r) 对 ids_w[gs+r+1]; 窗口末尾无下一 token
             tgt = ids_w[gs + 1: gs + 1 + CHUNK]
             rows = tgt.shape[0]
             if rows <= 0:
                 continue
-            ls = torch.log_softmax(lg32[:rows], dim=-1)
+            # fp32 转换只发生在 log_softmax 内部临时量（不长期持有整块 fp32）
+            ls = torch.log_softmax(lg[0, :rows].to(torch.float32), dim=-1)
             nll_sum += -ls[torch.arange(rows, device=lg.device), tgt].sum().item()
             n_tok += rows
+            del ls, lg
     return nll_sum, n_tok, finite
 
 
