@@ -49,9 +49,10 @@ def main() -> int:
     base = base.view(T, H, 1)
     x = base * torch.randn(T, H, D, device=dev)
 
-    # ---- 边界: 全零组 / 单点离群组 ----
+    # ---- 边界: 全零组 / 单点离群组（确定性构造: 正常元素固定 N(0,1), 不依赖随机 base）----
     x[:2] = 0.0                                       # 全零
-    x[2, 0, 0] = 1e4                                  # 离群（组内 max 被它主导）
+    x[2] = torch.randn(H, D, device=dev)              # 组 2: 幅值 ~N(0,1)（seed 0 → 可复现）
+    x[2, 0, 0] = 1e4                                  # head0 单点离群 = 其它元素 ~1e4 倍
     x = x.to(torch.float16)
 
     ok = True
@@ -93,18 +94,19 @@ def main() -> int:
           f"(==0 且无 NaN/Inf: "
           f"{zero_grp_hat.abs().max().item() == 0 and torch.isfinite(zero_grp_hat).all().item()})")
     ok &= zero_grp_hat.abs().max().item() == 0
-    # 离群组: 组内其它元素不应被离群毁掉（per-token-per-head scale 的意义）。
-    # 正确检查对象 = head 0 的 63 个非离群元素（旧版误取 head 1 —— harness 修正）。
-    # 判据用相对误差: 它们幅值可达离群的一半, abs 误差上百是 E4M3 数学预期。
+    # 离群组: 正常元素（head0 第 1: 维, 幅值 N(0,1)）不应被 1e4 离群毁掉。
+    # 判据 = 绝对误差 <= max|others|/16（它们自己的 E4M3 上界）;
+    # 若 scale 被离群撑爆、正常元素被压成 0, 误差 ~2.4 会远超 ~0.15 → 能抓到。
     q3, s3 = quantize_kv_fp8(x[2:3])
     hat3 = dequant_kv_fp8(q3, s3)
-    others = x[2:3][:, 0, 1:]                      # head 0, 排除第 0 维离群点
-    others_hat = hat3[:, 0, 1:]
-    rel_other = ((others_hat - others.to(torch.float32)).abs()
-                 / (others.abs().to(torch.float32) + 1e-12)).max().item()
-    print(f"[4] outlier-group head0 others: max rel|Δ|={rel_other:.4f} "
-          f"（<0.1: {rel_other < 0.1}）")
-    ok &= rel_other < 0.1
+    others_x = x[2, 0, 1:].to(torch.float32)
+    others_hat = hat3[0, 0, 1:].to(torch.float32)
+    err_others = (others_hat - others_x).abs().max().item()
+    bound_others = others_x.abs().max().item() / 16.0
+    print(f"[4] outlier-group head0 others: max|Δ|={err_others:.3e}  "
+          f"bound=max|others|/16≈{bound_others:.3e}  "
+          f"（离群被 per-head scale 吸收: {err_others <= bound_others}）")
+    ok &= err_others <= bound_others
 
     # 5) 极值映射: max 恰好映射到 448
     xm = torch.full((1, 1, 4), 448.0, device=dev, dtype=torch.float16)
