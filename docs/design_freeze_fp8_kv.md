@@ -93,6 +93,12 @@ FP8 模式：payload 仍用键名 `"k"/"v"`、形状 `(B,kv,T,d)`，**dtype=floa
 4. 量化/反量化为**独立小函数**（如 `quantize_kv_fp8(fp16_tensor) -> (payload, scale)`、`dequant_kv_fp8(payload, scale) -> fp16`），便于 harness 单测与复用；
 5. fp16 路径**零改动**（G1/G2 回归不受影响）。
 
+**4.1 接口契约（v1.0.1 澄清，供实现与 harness 对齐；不改变任何 D* 决策）**
+- 模型级开关：`QwenLM` 增加属性 `kv_format: str`（默认 `"fp16"`）+ 方法 `set_kv_format(fmt)`，递归设置到每个 `SelfAttention`（层内存 `self.kv_format`）；
+- 首次建缓存（`cache is None`）时按 `self.kv_format` 决定写格式；`cache["fmt"]` 记录实际格式；`SelfAttention` 读路径以 `cache["fmt"]` 为准（防御混用）；
+- harness 调用序列：`model = build_from_config(cfg)` → 载权重 → `model.set_kv_format("fp8")` → 正常 `_run`/`prefill_chunked`/`generate`（签名不变）；
+- fp8 模式下 payload 键仍为 `"k"/"v"`（dtype float8_e4m3fn）、新增 `"k_scale"/"v_scale"` (B,kv,T) fp32 —— harness 通过 `cache_list[i]["k"].shape[2]` 等既有访问方式不变。
+
 ## 5. 验证 harness 计划（AI 写，你在 GPU 跑）
 - **V1 往返精度单测**（随机 + 真实幅值分布 K/V）：quant→dequant 的 max|Δ| / 相对误差；无 NaN/Inf；max ≤ 448；
 - **V2 fp8-vs-fp16 短窗行为**：同 prompt，fp8 cache vs fp16 cache decode 前 N tok：logits max|Δ| + token 分歧数（报数，不设门槛）；
@@ -110,4 +116,4 @@ FP8 模式：payload 仍用键名 `"k"/"v"`、形状 `(B,kv,T,d)`，**dtype=floa
 - [ ] 修改意见：＿＿＿＿＿＿＿＿＿＿
 
 ---
-*变更记录：v0.1（DRAFT，2026-09-08）：初稿。v1.0（FROZEN，2026-09-08）：用户批准，D1–D8 生效。*
+*变更记录：v0.1（DRAFT，2026-09-08）：初稿。v1.0（FROZEN，2026-09-08）：用户批准，D1–D8 生效。v1.0.1（2026-09-08）：§4.1 澄清接口契约（`set_kv_format`），无决策变更。*

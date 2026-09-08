@@ -57,6 +57,17 @@
 | G1.3 | greedy 生成 vs HF 全量贪心 | **4/4 序列一致 PASS** | 同上；4 prompts × max_new=12 |
 | 注 | 0.5B 全部旧数据标记为 **development-stage validation**；G1 为 target 正式门 | | |
 
+### 3.5 FP8 KV V1 往返精度单测（G3 门第 1 项，2026-09-08，`fp8_kv_v1_roundtrip.py`）
+| 检查 | 结果 | 条件 |
+|---|---|---|
+| payload 不变量 | max|q|=448.0（≤448），无 NaN/Inf | CUDA RTX4060；`torch.float8_e4m3fn`；D4 参考实现（fp32 除法单次舍入）|
+| 往返误差 | max|Δ|=1.06e2，max|v|=1e4，理论界 max/16=6.25e2 → **不超界 PASS**（E4M3 rel≤2⁻⁴）| 合成 (2048,2,64)，log-uniform 1e-2…1e3 + 边界组 |
+| 确定性 | 同输入两次量化逐位一致 PASS | — |
+| 全零组 | 往返 max|Δ|=0（s=1 防除零路径）PASS | — |
+| 离群组 | head0 正常元素 max|Δ|=6.06e-2 ≤ max|others|/16=1.74e-1（per-head scale 吸收 1e4 离群）PASS | 确定性构造：others ~ N(0,1) |
+| 极值映射 | max 恰好映射 448 PASS | — |
+| 结论 | **V1 PASS**（V1 修 harness 自身断言 2 次：错误全局上界 → max/16；离群组随机基+相对误差判据 → 确定性构造+abs 界）| | |
+
 ## 4. 性能基线（L2 朴素解码，正式协议前的初步数字）
 
 ### 4.1 CPU fp32
@@ -148,4 +159,4 @@
 
 ## 7. 变更日志
 - 2026-09-02：建台账；登记 L1 对齐（0.000）、L2 缓存等价与生成对齐（PASS）、CPU/GPU 性能基线。
-- 2026-09-08：登记 G1（1.5B target 正确性门 PASS，§3.4）；登记 8K 分块 prefill 最小可行性预检通过（§4.5）与**正式 G2 门 PASS**（§4.5.1，含峰值测量伪影教训）。
+- 2026-09-08：登记 G1（1.5B target 正确性门 PASS，§3.4）；登记 8K 分块 prefill 最小可行性预检通过（§4.5）与正式 G2 门 PASS（§4.5.1，含峰值测量伪影教训）；登记 FP8 KV V1 往返单测 PASS（§3.5）。
