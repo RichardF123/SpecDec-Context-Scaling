@@ -199,6 +199,7 @@ def main() -> int:
             s_p = s_p.masked_fill(mask.unsqueeze(0).unsqueeze(0), float("-inf"))
             p_p = torch.softmax(s_p, dim=-1)
             ds = (s_p - s_b).abs()
+            ds = ds.masked_fill(mask.unsqueeze(0).unsqueeze(0), 0.0)   # 排除 masked(-inf) 位置
             dp = (p_p - p_b).abs()
             print(f" L{li:2d} gs={gs:3d}: score max/mean {ds.max().item():.2f}/"
                   f"{ds.mean().item():.4f} | prob L1-mean {dp.mean().item():.2e}")
