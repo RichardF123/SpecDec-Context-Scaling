@@ -8,7 +8,7 @@
 本文件内置 quantize_kv_fp8 / dequant_kv_fp8 **参考实现**（引擎 helper 必须与之数值一致）;
 检查项（无人工精度阈值, 只记录量级 + 硬性不变量）:
   1. payload 无 NaN / Inf; max|q| <= 448（E4M3FN 无 inf, 构造上不溢出）
-  2. 往返 max|Δ| 量级（理论界: 组内 abs err <= s/16 = max|v|/(448*16)）
+  2. 往返 max|Δ| 量级（理论界: 逐元素相对误差 <= 2^-4 → 全局 abs err <= max|v|/16）
   3. 确定性: 同输入两次量化逐位一致
   4. 边界: 全零组（s=1 路径）; 单点离群组（per-token scale 应吸收）; 幅值跨 5 个数量级
 
@@ -71,11 +71,14 @@ def main() -> int:
     max_abs = xf.abs().amax().item()
     max_err = err.amax().item()
     rel = (err / (xf.abs() + 1e-12)).amax().item()
-    th = max_abs / (448.0 * 16.0)          # 理论: 组内 abs err <= max/(448*16)
+    # 正确理论界: E4M3 逐元素相对误差 <= 2^-4  →  全局 abs err <= max|v|/16
+    # （旧版误写 max|v|/(448*16)=1.4, 把"最高 binade 半步长"当全局上界 —— harness 修正）
+    th = max_abs / 16.0
     print(f"[2] roundtrip: max|Δ|={max_err:.3e}  max|v|={max_abs:.3e}  "
-          f"理论界≈{th:.3e}  超界={max_err > th * 1.5}")
-    print(f"    max rel|Δ|={rel:.3e}（小元素处相对误差大属预期, abs 才是记账量）")
-    ok &= max_err <= th * 1.5
+          f"理论界=max/16≈{th:.3e}  超界={max_err > th}")
+    print(f"    max rel|Δ|={rel:.3e}（接近 1 仅来自近零小元素, abs 才是记账量; "
+          f"正常幅值处 rel<=2^-4≈0.0625）")
+    ok &= max_err <= th
 
     # 3) 确定性
     q2, s2 = quantize_kv_fp8(x)
@@ -90,14 +93,18 @@ def main() -> int:
           f"(==0 且无 NaN/Inf: "
           f"{zero_grp_hat.abs().max().item() == 0 and torch.isfinite(zero_grp_hat).all().item()})")
     ok &= zero_grp_hat.abs().max().item() == 0
-    # 离群组: 组内其它 63 个正常值不应被离群毁掉（per-token scale 的意义）
+    # 离群组: 组内其它元素不应被离群毁掉（per-token-per-head scale 的意义）。
+    # 正确检查对象 = head 0 的 63 个非离群元素（旧版误取 head 1 —— harness 修正）。
+    # 判据用相对误差: 它们幅值可达离群的一半, abs 误差上百是 E4M3 数学预期。
     q3, s3 = quantize_kv_fp8(x[2:3])
     hat3 = dequant_kv_fp8(q3, s3)
-    small_err = (hat3[0, 1:] - x[2:3][0, 1:].to(torch.float32)).abs().max().item()
-    print(f"[4] outlier-group: 其它元素 max|Δ|={small_err:.3e} "
-          f"（离群被 scale 吸收, 正常值仍准: "
-          f"{small_err < 1.0}）")
-    ok &= small_err < 1.0
+    others = x[2:3][:, 0, 1:]                      # head 0, 排除第 0 维离群点
+    others_hat = hat3[:, 0, 1:]
+    rel_other = ((others_hat - others.to(torch.float32)).abs()
+                 / (others.abs().to(torch.float32) + 1e-12)).max().item()
+    print(f"[4] outlier-group head0 others: max rel|Δ|={rel_other:.4f} "
+          f"（<0.1: {rel_other < 0.1}）")
+    ok &= rel_other < 0.1
 
     # 5) 极值映射: max 恰好映射到 448
     xm = torch.full((1, 1, 4), 448.0, device=dev, dtype=torch.float16)
