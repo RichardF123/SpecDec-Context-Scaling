@@ -82,8 +82,9 @@ def main() -> int:
     print(f"reserved_peak: min={min(resvs):.2f} max={max(resvs):.2f} "
           f"spread={max(resvs)-min(resvs):.2f} GiB")
     if spread < 0.1:
-        print("VERDICT: stable — 6.83 was cold-start underestimate; steady peak ≈",
-              f"{max(allocs):.2f} GiB")
+        print("VERDICT: prefill alloc_peak is deterministic (", f"{min(allocs):.2f}",
+              "GiB across all reps); any higher peak seen elsewhere is a script-state "
+              "artifact (previous-run tensors held across reset), not a real footprint")
     else:
         print("VERDICT: allocator variance confirmed (spread", f"{spread:.2f} GiB)",
               ")— record peak as median over reps in formal runs")

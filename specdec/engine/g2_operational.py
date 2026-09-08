@@ -179,6 +179,9 @@ def main() -> int:
               f"| peak(prefill)={peak_prefill:.2f} peak(total)={peak_total:.2f} GiB",
               flush=True)
         run_records.append(tokens)
+        # 关键: 释放本 run 的 0.62 GiB last_logits 与缓存引用 —— 否则它们跨
+        # empty_cache/reset 存活, 污染下一 run 的峰值测量（曾致 6.83 -> 7.62 伪影）
+        del last_logits, cache
 
     stable = all(r == run_records[0] for r in run_records)
     print(f"stable across {RUNS} runs: {stable}")
