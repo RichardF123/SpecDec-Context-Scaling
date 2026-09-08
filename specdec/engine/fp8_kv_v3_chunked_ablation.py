@@ -81,9 +81,10 @@ def main() -> int:
     from transformers import AutoTokenizer
     tok = AutoTokenizer.from_pretrained(MODEL, trust_remote_code=True)
     ids = make_text(tok, PROMPT).to("cuda")
-    print(f"prompt={PROMPT} tok  chunks={CHUNKS}  decode={DECODE_N}  fp8 dtype={DTYPE}\n", flush=True)
+    print(f"prompt={PROMPT} tok  chunks={CHUNKS}  decode={DECODE_N}  "
+          f"mode=v_fp8(K bf16 + V FP8) dtype={DTYPE}\n", flush=True)
 
-    ours = load_model("fp8")
+    ours = load_model("v_fp8")
     eos = tok.eos_token_id
 
     caches, last_lgs = {}, {}
@@ -95,18 +96,18 @@ def main() -> int:
         print(f"chunk={ch}: cache built (fmt={c[0].get('fmt')}, "
               f"k dtype={c[0]['k'].dtype})", flush=True)
 
-    # [0] 显存记账（V-only 非对称; 按张量实际 element_size, K bf16 2B + V fp8 1B + scales 4B）
+    # [0] 显存记账（正式 V-only; K bf16 2B + V fp8 1B + v_scale 4B, 按实测张量）
     c = caches[CHUNKS[0]]
     pl_b = sum(int(t.numel()) * t.element_size() for lay in c
                for t in (lay["k"], lay["v"]))
     sc_b = sum(int(t.numel()) * 4 for lay in c
-               for t in (lay.get("k_scale"), lay.get("v_scale")) if t is not None)
+               for t in (lay.get("v_scale"),) if t is not None)
     kv_elems = sum(int(lay["k"].numel()) + int(lay["v"].numel()) for lay in c)
     bf16_b = kv_elems * 2       # 全 bf16 KV 基线
     tot = pl_b + sc_b
     T = c[0]["k"].shape[2]
     L = len(c)
-    print(f"[0] FP8-asym(V-only) cache memory (T={T}, layers={L}): "
+    print(f"[0] V-only cache memory (T={T}, layers={L}): "
           f"payload={pl_b/2**20:.2f} MiB + scales={sc_b/2**20:.2f} MiB "
           f"= {tot/2**20:.2f} MiB | vs BF16 {bf16_b/2**20:.2f} MiB "
           f"-> {tot/bf16_b*100:.1f}% ({bf16_b/tot:.2f}x)")
@@ -116,16 +117,17 @@ def main() -> int:
           f"{s0//T} B = {(pl_b + sc_b)//L//T} B (bf16 {bf16_b//L//T} B)")
 
     ok = True
-    # [1] 漂移量级
+    # [1] 漂移量级（V-only: K 未量化, V fp8; 比较按 scale 键存在与否读取）
     overall_d, per_layer_d = cache_kv_payload_diff(caches[CHUNKS[0]], caches[CHUNKS[1]])
     L = len(per_layer_d)
     trend = {i: per_layer_d[i] for i in [0, L // 2, L - 1]}
-    print(f"[1] fp8 KV max|Δ| (chunk1024 vs chunk512, dequantized): overall={overall_d:.3e}")
+    print(f"[1] V-only KV max|Δ| (chunk1024 vs chunk512, dequantized): overall={overall_d:.3e}")
     print(f"    per-layer @ 0/{L//2}/{L-1}: "
           f"{[f'{v:.3e}' for v in trend.values()]}")
     fin = all(torch.isfinite(t.to(torch.float32)).all().item()
               for c in caches.values()
-              for t in (c[0]["k"], c[0]["v"], c[0]["k_scale"], c[0]["v_scale"]))
+              for t in (c[0]["k"], c[0]["v"],
+                        c[0].get("v_scale", torch.zeros(0, device="cuda"))))
     print(f"    payload/scale finite: {fin}")
     ok &= fin
 
@@ -146,7 +148,7 @@ def main() -> int:
         print(f"chunk={ch}: decode{DECODE_N} -> {tok.decode(got)[:50]!r} ({len(got)} tok)",
               flush=True)
     eq = seqs[CHUNKS[0]] == seqs[CHUNKS[1]]
-    print(f"[2] decode sequences equal (fp8, chunk1024 vs chunk512): {eq}")
+    print(f"[2] decode sequences equal (v_fp8, chunk1024 vs chunk512): {eq}")
     ok &= eq
 
     print("\nV3:", "PASS" if ok else "CHECK")

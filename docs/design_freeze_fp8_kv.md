@@ -32,16 +32,20 @@
   - K/V 共享 scale：K、V 幅值分布不同，共享会伤害较小者。
 - **理由**：per-head-per-token 是 KV 量化文献的标准折中（如 DeepSeek-V2 路线）；本模型 kv_heads=2，元数据开销小。
 
-**D2b（v1.1 临时修订，2026-09-08，以 V4 实测为准）**：per-kv-head × per-token 粒度实测
-（bf16 base, 40 窗）relative ΔPPL ≈ **+283%** —— 过粗。改为 **per-token × per-kv-head ×
-组内分组**：head_dim=64 先按 **G=2 组 × 32 维**（元数据 ×2）；若仍不足再 G=4 × 16 维（×4）。
-- scale 形状 `(B, kv, T, G)`（G=2 或 4）；payload 形状不变 `(B,kv,T,64)` fp8；
-- 量化/反量化只改 `quantize_kv_fp8`/`dequantize_kv_fp8` 内部（末维 view 成组），
-  注意力/缓存读写路径零改动；scale 拼接仍在最后一维；
-- 记账（G=2 / G=4，fp16 512 B 基准）：payload 256 B + scales 32 B → **288 B（1.78×）**；
-  或 256+64 → **320 B（1.60×）**；
-- 保留开关 `GROUP`（32 → 16），便于同一 harness 快速 A/B。
-- **若 G=4 后 relative ΔPPL 仍大 → 停止细粒度方向，走 D 语义一致化或 A（negative/mixed）。**
+**D2b → 正式修订（v1.2/v1.3，2026-09-08，pilot-driven amendment）**：
+| 项 | 内容 |
+|---|---|
+| 原始假设 | K 与 V 都压缩进 FP8 E4M3（full-FP8 KV, 先 per-head 后 2×32 分组） |
+| pilot 发现 1 | **K-FP8 在所有已测粒度（128/64/32/16/1）ΔNLL ≥ +2.4 nats**（group128 最轻仍 +2.4；更细反而更差） |
+| pilot 发现 2 | **V-only FP8 在 gs32 与 gs128 下 ΔNLL ≈ 0（≤+0.002）**；K1/V1 无损哨兵 ≈ 0 |
+| 正式修订 | **Asymmetric V-only FP8 KV**：K cache = BF16（不量化）；V cache = FP8 E4M3；V scale = per-token × per-KV-head；**V group size = 128**（=1 group/head） |
+| 保留 | `fmt="fp8"` = full FP8 K/V（negative ablation）；`fmt="fp8_groups/fp8_matrices"` 旋钮可复现 K-only/full 各粒度 |
+| 修订原因 | 以 pilot 证据保护模型质量；不能把本模型 K-FP8 失败外推为"所有模型的 K 都不能量化" |
+- 实现：`set_kv_format("v_fp8")`（正式）、`("fp8")`（ablation）、`("fp16")`（base/bf16 KV）；`assert head_dim % group_size == 0` 保留。
+- 记账（Qwen2.5-1.5B：kv=2, head_dim=128, 每 token/layer）：K bf16 512 B + V payload 256 B + v_scale（g=1）8 B = **776 B** vs bf16 1024 B → 75.78%（**~1.32×**，仅 KV cache，非整模型/不代表 8GB 可行性）。
+- 每层 cache：`k` BF16 [B,kv,T,d]、`v` FP8 [B,kv,T,d]、`v_scale` FP32 [B,kv,T,1]、`fmt="v_fp8"`；K 无 `k_scale`。
+- 报告口径限定为：*在 Qwen2.5-1.5B、当前在线 max-abs E4M3 量化与 eager attention 实现下，K-FP8 导致显著质量退化，而 V-FP8 基本无损。*
+- **正式实测（独立 40 窗 offset 40..79，与 pilot 0..3 不相交）**：ΔNLL **+0.000397**；PPL base 10.1041 / V-only 10.1081；absolute ΔPPL +0.0040；relative **+0.040%**；per-window ΔPPL mean +0.0044 (min −0.0332, max +0.0370)；finite True。V2 prefix 32/32；V3 chunk1024/512 decode16 一致；localize 相对 base 额外 coupling K +0.379 / V +0.891。8K(同脚本 paired)：KV logical 224.00 → 169.75 MiB（75.78%, **1.320×**）；decode 有反量化开销（eager 每步把 FP8 V 解回 bf16）——**不**把 KV 压缩率当作整模型压缩或速度收益。*小负/微小正 Δ 不作"量化提升"或"显著损失"解读。*
 
 ### D3 scale 存储与生命周期
 - scale 存 **fp32**（4 B），与 payload **同生命周期**（token 进缓存即算，读到缓存淘汰才消失——本引擎缓存随 run 生命周期存在）。
@@ -128,4 +132,4 @@ FP8 模式：payload 仍用键名 `"k"/"v"`、形状 `(B,kv,T,d)`，**dtype=floa
 - [ ] 修改意见：＿＿＿＿＿＿＿＿＿＿
 
 ---
-*变更记录：v0.1（DRAFT，2026-09-08）：初稿。v1.0（FROZEN，2026-09-08）：用户批准，D1–D8 生效。v1.0.1（2026-09-08）：§4.1 澄清接口契约（`set_kv_format`），无决策变更。v1.0.2（2026-09-08）：D4 澄清引擎反量化输出须为 fp16（单次舍入），无决策变更。v1.1（2026-09-08，**临时**）：D2b scale 粒度加组内分组（G=2×32 起），待 V4 实测定稿；运行 dtype 因平台改为 bf16（CUDA fp16 对 Qwen NaN）。**v1.2（2026-09-08，正式）**：pilot 证明 V-fp8 任何粒度无损（ΔNLL≤+0.002）、K-fp8 任何粒度（128/64/32/16/1）均致 ΔNLL≥+2.4 → **正式方案改为非对称：K 保持 bf16（不量化），V 走 FP8（group=32）**；K-fp8 全粒度记录为 negative ablation；实现经 `set_fp8_matrices(k_on/v_on/k_group/v_group)` 支持（默认即正式路径），D 语义保留。*
+*变更记录：v0.1（DRAFT，2026-09-08）：初稿。v1.0（FROZEN，2026-09-08）：用户批准，D1–D8 生效。v1.0.1（2026-09-08）：§4.1 澄清接口契约（`set_kv_format`），无决策变更。v1.0.2（2026-09-08）：D4 澄清引擎反量化输出须为 fp16（单次舍入），无决策变更。v1.1（2026-09-08，临时）：D2b group 粒度（2×32）；运行 dtype 改 bf16。**v1.2/v1.3（2026-09-08，正式）**：pilot-driven amendment —— full-FP8 的 K-FP8 全粒度 ΔNLL≥+2.4（negative ablation）、V-only FP8 ΔNLL≈0 → **正式方案 = Asymmetric V-only FP8 KV（K BF16 + V FP8 E4M3, per-token×per-head scale, group=128）**；`set_kv_format("v_fp8")` 为正式入口、`"fp8"` 保留为 full-FP8 negative ablation、`"fp16"`=base/bf16；引擎支持每矩阵开关与粒度旋钮；报告结论限定 Qwen2.5-1.5B + 在线 max-abs E4M3 + eager attention 范围。*

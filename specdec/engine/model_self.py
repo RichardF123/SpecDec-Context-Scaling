@@ -65,7 +65,8 @@ def kv_repeat(x: torch.Tensor, n_rep: int) -> torch.Tensor:
     return x.unsqueeze(2).expand(b, kv, n_rep, s, d).reshape(b, kv * n_rep, s, d)
 
 E4M3_MAX = 448.0
-GROUP_SIZE = 32     
+GROUP_SIZE = 32      # full-FP8 ablation 默认组粒度
+GROUP_V = 128        # 正式 Asymmetric V-only: V 的 group size(=1 group/head)
 
 def quantize_kv_fp8(x: torch.Tensor, group_size: int = GROUP_SIZE):
     d = x.shape[-1]
@@ -96,10 +97,10 @@ class SelfAttention(nn.Module):
         self.kv_heads = kv_heads
         self.head_dim = head_dim
         self.kv_format = "fp16" 
-        # 诊断/策略开关(默认 = 正式非对称路径): K 不量化(bf16), V 走 FP8(group32)
+        # 策略旋钮: 'fp8'(full K/V ablation) 时生效; 'v_fp8'(正式) 时 V 固定 GROUP_V
         self.fp8_g_k = GROUP_SIZE
         self.fp8_g_v = GROUP_SIZE
-        self.fp8_k = False
+        self.fp8_k = True
         self.fp8_v = True
 
     def forward(self, x: torch.Tensor, cos, sin, cache = None) -> torch.Tensor:
@@ -110,21 +111,26 @@ class SelfAttention(nn.Module):
         q = apply_rope(q, cos, sin)
         k = apply_rope(k, cos, sin)
         fmt = cache.get("fmt", self.kv_format) if cache is not None else self.kv_format
-        qk_cur = qv_cur = ks_cur = vs_cur = None
-        if fmt == 'fp8':
-            # 非对称策略(正式默认 K 不量化/bf16, V 走 FP8): fp8_k / fp8_v 逐矩阵开关
-            if self.fp8_k:
-                qk_cur, ks_cur = quantize_kv_fp8(k, self.fp8_g_k)
-                k_cur16 = dequantize_kv_fp8(qk_cur, ks_cur, x.dtype)
-            else:
-                k_cur16 = k
-            if self.fp8_v:
-                qv_cur, vs_cur = quantize_kv_fp8(v, self.fp8_g_v)
-                v_cur16 = dequantize_kv_fp8(qv_cur, vs_cur, x.dtype)
-            else:
-                v_cur16 = v
+        # 模式语义: 'fp16'=base(bf16 KV 计算); 'v_fp8'=正式 V-only(K bf16 + V FP8 GROUP_V);
+        #           'fp8'=full FP8 K/V(negative ablation, 粒度经 fp8_g_*/fp8_k/v 旋钮)
+        if fmt == 'v_fp8':
+            k_on, v_on, gk, gv = False, True, GROUP_SIZE, GROUP_V
+        elif fmt == 'fp8':
+            k_on, v_on, gk, gv = self.fp8_k, self.fp8_v, self.fp8_g_k, self.fp8_g_v
         else:
-            k_cur16, v_cur16 = k, v
+            k_on = v_on = False
+            gk = gv = GROUP_SIZE
+        qk_cur = qv_cur = ks_cur = vs_cur = None
+        if k_on:
+            qk_cur, ks_cur = quantize_kv_fp8(k, gk)
+            k_cur16 = dequantize_kv_fp8(qk_cur, ks_cur, x.dtype)
+        else:
+            k_cur16 = k
+        if v_on:
+            qv_cur, vs_cur = quantize_kv_fp8(v, gv)
+            v_cur16 = dequantize_kv_fp8(qv_cur, vs_cur, x.dtype)
+        else:
+            v_cur16 = v
         if cache is None:
             k_all, v_all = k_cur16, v_cur16
         elif fmt == 'fp16':
@@ -164,25 +170,25 @@ class SelfAttention(nn.Module):
         out = torch.matmul(attn, v_rep)
         out = out.transpose(1, 2).contiguous().view(b, s, self.heads * self.head_dim)
         if cache is None:
-            if fmt == 'fp8':
+            if fmt in ('fp8', 'v_fp8'):
                 nc = {"fmt": fmt}
-                if self.fp8_k:
+                if k_on:
                     nc["k"], nc["k_scale"] = qk_cur, ks_cur
                 else:
                     nc["k"] = k_all                    # bf16(K 不量化)
-                if self.fp8_v:
+                if v_on:
                     nc["v"], nc["v_scale"] = qv_cur, vs_cur
                 else:
                     nc["v"] = v_all
                 new_cache = nc
             else:
                 new_cache = {"k": k_all, "v": v_all}
-        elif fmt == 'fp8':
-            if self.fp8_k:
+        elif fmt in ('fp8', 'v_fp8'):
+            if k_on:
                 cache["k"] = torch.cat([cache["k"], qk_cur], dim=2)
                 cache["k_scale"] = torch.cat([cache["k_scale"], ks_cur], dim=2)
             # else: K 已在读路径按 bf16 全长写回
-            if self.fp8_v:
+            if v_on:
                 cache["v"] = torch.cat([cache["v"], qv_cur], dim=2)
                 cache["v_scale"] = torch.cat([cache["v_scale"], vs_cur], dim=2)
             new_cache = cache
@@ -255,10 +261,22 @@ class QwenLM(nn.Module):
                 logits, cache_list = self._run(self.embed_tokens(next_id.unsqueeze(1)), cache_list)
         return gen
     def set_kv_format(self, fmt: str) -> None:
-        assert fmt in ("fp16", "fp8"), fmt
+        """缓存格式: 'fp16'=base(bf16 KV); 'v_fp8'=正式 Asymmetric V-only
+        (K bf16 不量化 + V FP8 E4M3 group=GROUP_V=128, 每 head 1 group);
+        'fp8'=full FP8 K/V(negative ablation; K/V 粒度可经 set_fp8_groups/matrices 调)。"""
+        assert fmt in ("fp16", "fp8", "v_fp8"), fmt
+        if fmt == "v_fp8":
+            assert self.head_dim % GROUP_V == 0, f"head_dim {self.head_dim} % GROUP_V != 0"
         self.kv_format = fmt
         for layer in self.layers:
-            layer.self_attn.kv_format = fmt
+            a = layer.self_attn
+            a.kv_format = fmt
+            if fmt == "v_fp8":
+                a.fp8_k, a.fp8_v, a.fp8_g_v = False, True, GROUP_V
+            elif fmt == "fp8":
+                a.fp8_k, a.fp8_v = True, True
+                a.fp8_g_k, a.fp8_g_v = GROUP_SIZE, GROUP_SIZE
+            # 'fp16': 仅记录格式; fp8 旋钮不影响 base 路径
 
     def set_fp8_groups(self, k_group: int | None = None, v_group: int | None = None) -> None:
         """诊断开关: K/V 各自 FP8 scale 分组粒度(须整除 head_dim)。默认 None=不动。

@@ -158,9 +158,9 @@ def main() -> int:
     runs = {
         "A_base_1024": ("fp16", 1024),
         "B_base_512": ("fp16", 512),
-        "C_fp8_1024": ("fp8", 1024),
-        "D_fp8_512": ("fp8", 512),
-        "E_fp8_512_rep": ("fp8", 512),
+        "C_vf_1024": ("v_fp8", 1024),
+        "D_vf_512": ("v_fp8", 512),
+        "E_vf_512_rep": ("v_fp8", 512),
     }
     snaps, lg_map, seqs = {}, {}, {}
     for name, (fmt, ch) in runs.items():
@@ -176,9 +176,9 @@ def main() -> int:
 
     pairs = [
         ("P1 base chunk drift (A1024 vs B512)", "A_base_1024", "B_base_512"),
-        ("P2 fp8   chunk drift (C1024 vs D512)", "C_fp8_1024", "D_fp8_512"),
-        ("P3 fp8-vs-base same chunk 1024 (C vs A)", "C_fp8_1024", "A_base_1024"),
-        ("P4 determinism (D512 vs E512)", "D_fp8_512", "E_fp8_512_rep"),
+        ("P2 v_fp8 chunk drift (C1024 vs D512)", "C_vf_1024", "D_vf_512"),
+        ("P3 v_fp8-vs-base same chunk 1024 (C vs A)", "C_vf_1024", "A_base_1024"),
+        ("P4 determinism (D512 vs E512)", "D_vf_512", "E_vf_512_rep"),
     ]
     for label, na, nb in pairs:
         dk, dv, info = pair_stats(snaps[na], snaps[nb])
@@ -188,9 +188,9 @@ def main() -> int:
         for line in info:
             print("  " + line)
 
-    # fp8 相对 base 新增的 chunk coupling(逐层差)
+    # v_fp8 相对 base 新增的 chunk coupling(逐层差)
     dk_b, dv_b, _ = pair_stats(snaps["A_base_1024"], snaps["B_base_512"])
-    dk_f, dv_f, _ = pair_stats(snaps["C_fp8_1024"], snaps["D_fp8_512"])
+    dk_f, dv_f, _ = pair_stats(snaps["C_vf_1024"], snaps["D_vf_512"])
     ex_k = max(f - b for f, b in zip(dk_f, dk_b))
     ex_v = max(f - b for f, b in zip(dv_f, dv_b))
     print(f"\nfp8 extra chunk coupling over base: K +{ex_k:.3f}  V +{ex_v:.3f} "
@@ -199,7 +199,7 @@ def main() -> int:
     # decode 一致前缀(生成级 chunk 耦合 / 与 base 的差异)
     print("\n[decode16] agreeing prefix:")
     baseA = seqs["A_base_1024"]
-    for name in ["A_base_1024", "B_base_512", "C_fp8_1024", "D_fp8_512", "E_fp8_512_rep"]:
+    for name in ["A_base_1024", "B_base_512", "C_vf_1024", "D_vf_512", "E_vf_512_rep"]:
         a = 0
         for x, y in zip(baseA, seqs[name]):
             if x == y:
@@ -208,8 +208,8 @@ def main() -> int:
                 break
         print(f"    vs base-1024  {name:14}: {a}/{min(len(baseA), len(seqs[name]))}")
     for na, nb, lab in [("A_base_1024", "B_base_512", "base 1024 vs base 512"),
-                        ("C_fp8_1024", "D_fp8_512", "fp8 1024 vs fp8 512"),
-                        ("D_fp8_512", "E_fp8_512_rep", "fp8 512 vs fp8 512 rep")]:
+                        ("C_vf_1024", "D_vf_512", "v_fp8 1024 vs v_fp8 512"),
+                        ("D_vf_512", "E_vf_512_rep", "v_fp8 512 vs v_fp8 512 rep")]:
         a = 0
         for x, y in zip(seqs[na], seqs[nb]):
             if x == y:

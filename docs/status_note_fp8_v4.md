@@ -81,3 +81,25 @@ argmax `Paris / Paris` —— **bf16 基线路径恢复到合理状态（短 pro
 - [ ] **③ B** per-head 内 2×32 分组 scale（GROUP=32）→ 重跑 V4 看 ΔPPL%; 不足再 GROUP=16
 - [ ] **④** 依 V3/V4 结果: 改进版定稿 → G3 PASS(改进) 或 如实登记 negative/mixed → 才进 G4
 - [ ] 全部按 bf16 口径记入 ledger（§3.5.1 修正行 + §3.5.2 定稿; 旧 fp16 行为数字标注作废）
+
+---
+
+## 7. 最终判定（2026-09-08 晚）
+
+**G3: FROZEN（正式方案 = Asymmetric V-only FP8 KV，见 §3.5.3）**
+- 正式独立窗口（40..79, disjoint pilot 0..3）：ΔNLL **+0.000397**、relative ΔPPL **+0.040%**（40 窗）。
+- V2 prefix 32/32；V3 chunk 一致 16/16；localize 相对 base 额外 coupling K +0.379 / V +0.891。
+- 8K（同脚本 paired）：KV logical 224.00 → 169.75 MiB（**1.320×**）；alloc 峰值 5.07 → 5.01 GiB；decode 有反量化开销。
+- Negative ablation：full-FP8（128 / gs32）与 K-only 各粒度（ΔNLL≥+2.4）——报告按限定范围如实写。
+- 记账：per token/layer 776 B（75.78125%）；不把 1.32× 写成整模型压缩；54 MiB 是否足以容纳 0.5B draft 由 G4 dual-model 实测回答。
+
+## 8. G4 前置清单（未启动 G4）
+- [x] G1（target correctness）PASS；bf16 OURS-vs-HF 全对齐（max|Δ|=0, argmax 100%, NLL/PPL 相等）
+- [x] G2（8K target-only operational）PASS（旧口径 6.83 GiB 与 V-only 新脚本数字不跨脚本比较）
+- [x] G3 正式方案冻结（Asymmetric V-only FP8 KV）+ 8K paired operational
+- [ ] G4-0：0.5B draft 在引擎上的 correctness（复用 G1 式三检查，bf16）——开发级门
+- [ ] G4-1：fixed-chain spec-dec k=4 设计冻结（verify 语义、draft/target cache 回滚、日志口径）+ output-equivalence sanity
+- [ ] G4-2：dual-model 内存编排与 8K×spec 可行性实测（回答 V-only 54 MiB 是否够放 0.5B draft 的可行性问题）
+- [ ] G5 instrumentation / G6 prompt families 之后才进 pilot/final factorial
+
+**G4 建议第一步（不启动）**：跑 0.5B draft 的 G1 式三检查（ours fp32/CPU 对齐 + bf16 GPU 行为），随后做 k=4 spec-dec 设计冻结文档。

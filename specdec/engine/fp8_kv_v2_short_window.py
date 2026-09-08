@@ -86,34 +86,34 @@ def main() -> int:
     ids = make_text(tok, PROMPT).to("cuda")
     print(f"prompt={PROMPT} tok  chunk={CHUNK}  decode={DECODE_N}  model=1.5B dtype={DTYPE}\n", flush=True)
 
-    # fp16 一次; fp8 两次（确定性）
-    print("running fp16 ...", flush=True)
+    # base/bf16 一次; V-only(v_fp8) 两次（确定性）
+    print("running base/bf16 KV ...", flush=True)
     _, toks16, logs16, cache16 = build(ids, "fp16")
-    print("running fp8 (pass A) ...", flush=True)
-    _, toks8a, logs8a, cache8 = build(ids, "fp8")
-    print("running fp8 (pass B) ...", flush=True)
-    _, toks8b, logs8b, _ = build(ids, "fp8")
+    print("running v_fp8 (pass A) ...", flush=True)
+    _, toks8a, logs8a, cache8 = build(ids, "v_fp8")
+    print("running v_fp8 (pass B) ...", flush=True)
+    _, toks8b, logs8b, _ = build(ids, "v_fp8")
 
     ok = True
-    # [1] 结构检查（正式非对称: K bf16 无 scale, V fp8 + v_scale (B,kv,S,g)）
-    from .model_self import GROUP_SIZE
+    # [1] 结构检查（正式 Asymmetric V-only: K bf16 无 k_scale, V fp8, v_scale (B,kv,S,1)）
+    from .model_self import GROUP_V
     c0 = cache8[0]
     d = c0["k"].shape[-1]
-    g = d // GROUP_SIZE
-    stru = (c0.get("fmt") == "fp8"
+    g = d // GROUP_V
+    stru = (c0.get("fmt") == "v_fp8"
             and c0["k"].dtype == DTYPE                      # K: bf16（不量化）
             and "k_scale" not in c0
-            and c0["v"].dtype == torch.float8_e4m3fn        # V: fp8
+            and c0["v"].dtype == torch.float8_e4m3fn        # V: fp8 payload
             and c0["v_scale"].shape[:3] == c0["v"].shape[:3]
-            and c0["v_scale"].shape[-1] == g
+            and c0["v_scale"].shape[-1] == g               # GROUP_V=128 -> 1
             and c0["v_scale"].dtype == torch.float32)
-    print(f"[1] fp8 structure ok (asymmetric V-only): {stru}  (head_dim={d} "
-          f"v_groups={g}, v_scale={tuple(c0['v_scale'].shape)})")
+    print(f"[1] v_fp8 structure ok: {stru}  (head_dim={d} v_groups={g}, "
+          f"v_scale={tuple(c0['v_scale'].shape)})")
     ok &= stru
 
-    # [2] prefill 末位置 logits（各自第一次 decode 的 logits 即 prefill 末位置）
+    # [2] prefill 末位置 logits（base/bf16 vs v_fp8）
     d0 = (logs16[0].to(torch.float32) - logs8a[0].to(torch.float32)).abs().max().item()
-    print(f"[2] prefill last-pos logits fp16-vs-fp8 max|Δ| = {d0:.3e}")
+    print(f"[2] prefill last-pos logits base-vs-v_fp8 max|Δ| = {d0:.3e}")
     fin = all(torch.isfinite(l).all().item() for l in logs8a) and \
           all(torch.isfinite(l).all().item() for l in logs16)
     print(f"    all logits finite: {fin}")
@@ -126,17 +126,17 @@ def main() -> int:
             agree += 1
         else:
             break
-    print(f"[3] tokens fp16: {tok.decode(toks16)[:50]!r}")
-    print(f"    tokens fp8 : {tok.decode(toks8a)[:50]!r}")
+    print(f"[3] tokens base  : {tok.decode(toks16)[:50]!r}")
+    print(f"    tokens v_fp8 : {tok.decode(toks8a)[:50]!r}")
     print(f"    agreeing prefix: {agree}/{min(len(toks16), len(toks8a))}  "
-          f"(len16={len(toks16)} len8={len(toks8a)})")
+          f"(len_base={len(toks16)} len_v={len(toks8a)})")
     for k in (0, 1, 5, 10, min(31, len(logs16) - 1)):
         dk = (logs16[k].to(torch.float32) - logs8a[k].to(torch.float32)).abs().max().item()
         print(f"    step {k}: logits max|Δ| = {dk:.3e}")
 
-    # [4] fp8 确定性
+    # [4] v_fp8 确定性
     det = toks8a == toks8b
-    print(f"[4] fp8 deterministic (two passes identical): {det}")
+    print(f"[4] v_fp8 deterministic (two passes identical): {det}")
     ok &= det
 
     print("\nV2:", "PASS" if ok else "CHECK",
