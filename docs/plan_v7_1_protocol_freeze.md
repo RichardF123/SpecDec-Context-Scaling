@@ -104,7 +104,7 @@ dataset=Wikitext-2 test；窗口=非重叠固定上下文窗口；每 condition 
 - [ ] ≥16 final prompt families frozen
 - [ ] generation settings frozen
 - [ ] Spec k frozen（k=4）
-- [ ] FP8 format/scaling frozen
+- [x] FP8 format/scaling frozen（design_freeze_fp8_kv.md v1.0，2026-09-08）
 - [ ] speedup equations frozen
 - [ ] decode-only vs E2E definitions frozen
 - [ ] quality dataset/protocol frozen
