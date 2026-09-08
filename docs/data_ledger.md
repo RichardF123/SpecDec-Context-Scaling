@@ -8,29 +8,47 @@
 
 ## 1. 环境基线（数据有效性前提）
 
+### 1.1 主目标机（最终 8GB 结论）
 | 项 | 值 | 备注 |
 |---|---|---|
-| GPU | NVIDIA GeForce RTX 4060 Laptop 8GB（sm_89）| nvidia-smi 待补显存占用 |
+| GPU | NVIDIA GeForce RTX 4060 Laptop 8GB（sm_89）| 最终核心数字需在此机复跑 |
 | CPU / RAM | i7-12700H / 32GB | — |
 | OS / Python | Windows / 3.11（venv）| — |
 | torch | 2.6.0+cu124 | PyPI 官方 cu124 |
 | transformers | （待补精确版本号）| `pip show transformers` |
 | HF cache | D:\hf-cache | HF_HOME |
 | 临时目录 | D:\RealDSH\pip-tmp | 防 C 盘锁/满 |
-| 模型（被测）| Qwen/Qwen2.5-0.5B-Instruct | Apache-2.0，tie、attn_bias=True |
+| 模型（早期 L1/L2）| Qwen/Qwen2.5-0.5B-Instruct | Apache-2.0，tie、attn_bias=True |
+
+### 1.2 A6 开发/预实验机（非最终 4060 结论）
+| 项 | 值 | 备注 |
+|---|---|---|
+| GPU | NVIDIA GeForce RTX 4090 D 24GB | AutoDL；A6 开发与预实验 |
+| OS / Python | Ubuntu 22.04 / Python 3.12 | AutoDL 基础镜像 |
+| RAM | 62GB | AutoDL 实例配置 |
+| 系统盘 | 30GB | AutoDL 实例配置 |
+| torch / CUDA | torch 2.5.1+cu124 / CUDA 12.4 | benchmark 日志实测 |
+| 模型 | Qwen/Qwen2.5-1.5B-Instruct | ModelScope 本地 checkpoint；Transformers 仅作参考实现/加载 |
+| 角色 | A6 implementation / 4090D evidence | 正确性、storage、PPL 与本机性能证据已完成；RTX 4060 专属 VRAM/latency 结论须在目标机复跑 |
 
 ## 2. 模型配置（被测对象）
 
+### 2.1 Qwen2.5-0.5B（L1/L2）
 | 参数 | 值 |
 |---|---|
 | hidden / layers / heads / kv_heads / head_dim | 896 / 24 / 14 / 2 / 64 |
 | intermediate / vocab / rope_theta / rms_eps | 4864 / 151936 / 1_000_000 / 1e-6 |
 | attention_bias / tie_word_embeddings | True / True |
-| 引擎实现 | 自写 model_self.py（OURS），HF 仅加载权重 |
+| 引擎实现 | 自写 model_self.py（OURS），Transformers 仅加载权重/作参考 |
+
+### 2.2 Qwen2.5-1.5B（A6）
+- 模型：`Qwen/Qwen2.5-1.5B-Instruct`；OURS 引擎由同一 `build_from_config` 从 config 构建并复制权重。
+- L4 量化目标：每层 7 个 Linear（q/k/v/o + gate/up/down）；1.5B 共 **196/196** 个目标模块完成替换。
+- INT8：对称 RTN，per-output-channel scale；INT4：真实 4-bit packed storage，group size = 64，运行时 eager dequant 后进入普通浮点 `F.linear`。
 
 ## 3. 正确性数据
 
-### 3.1 L1 对齐门（ours full vs HF full）
+### 3.1 L1 对齐门（ours full vs Transformers full）
 | 日期 | 精度/设备 | prompts | 结果 |
 |---|---|---|---|
 | 2026-09-02 | fp32 / CPU eager | 5（≤48 tok）| **worst max|Δ| = 0.000** |
@@ -43,11 +61,27 @@
 | 真 Qwen 0.5B | 21 tok 文本，k=5/10/15/20 | 1.6e-5 ~ 2.2e-5 | 全一致 |
 | 判据 | 逐层差 ~1e-7 且不放大 = fp kernel 顺序噪声（容差 1e-3）| | |
 
-### 3.3 生成对齐门（ours.generate vs HF 全量逐步贪心）
+### 3.3 生成对齐门（ours.generate vs Transformers 全量逐步贪心）
 | 日期 | 参考 | prompts | 结果 |
 |---|---|---|---|
-| 2026-09-02 | HF full-forward 循环（use_cache 无关）| 4 | **全序列逐 token 一致 PASS** |
-| 发现 | `hf.generate` 与其全量前向不一致（官方 logits ' is'=21.75 vs 其输出 ' was'）→ 不用其当裁判 | | |
+| 2026-09-02 | Transformers full-forward 循环（use_cache 无关）| 4 | **全序列逐 token 一致 PASS** |
+| 发现 | `transformers.generate` 与其全量前向不一致（官方 logits ' is'=21.75 vs 其输出 ' was'）→ 不用其当裁判 | | |
+
+### 3.4 1.5B FP32 参考有效性检查（A6 前置）
+| 日期 | 设备/精度 | 指标 | 结果 |
+|---|---|---|---|
+| 2026-09-08 | RTX 4090 D / fp32 | short-sequence max\|Δ logits\| | **3.53e-05** |
+| 2026-09-08 | RTX 4090 D / fp32 | mean\|Δ logits\| | **2.67e-06** |
+| 2026-09-08 | RTX 4090 D / fp32 | last-token top1 | **一致** |
+| 2026-09-08 | RTX 4090 D / fp32 | OURS PPL / Transformers PPL | **22.98598 / 22.98600** |
+| 2026-09-08 | RTX 4090 D / fp32 | PPL relative diff | **7.15e-07** |
+
+**结论**：Qwen2.5-1.5B OURS 数学路径与 Transformers eager 参考一致；A6 的质量差异可以归因到精度/量化路径，而不是模型权重加载或架构错配。
+
+### 3.5 A6 前发现的 fp16 数值问题与修复
+- 首轮 1.5B fp16 PPL 出现 NaN/异常；定位到不是量化模块独有问题，而是公共 fp16 数值路径。
+- 最小正确性修复：RMSNorm 方差用 fp32 累积；QK score + softmax 用 fp32，attention probability 再 cast 回运行 dtype；RoPE frequency/position/freq 用 fp32 计算，cos/sin 最后 cast 回运行 dtype。
+- 修复后 fp16 质量恢复：**PPL = 22.975503**，与 fp32 reference 22.98598 接近；随后才重新跑 A6 最终性能数据。
 
 ## 4. 性能基线（L2 朴素解码，正式协议前的初步数字）
 
@@ -75,29 +109,41 @@
 **结论**：我们的朴素 eager decode **不慢于** transformers eager 参考（反而快 ~27–47%）→ 该数字是 eager/单 token 配置的固有水平（latency-bound），非可避免开销；**L5 净加速比的分母可信，报告可与库参考对照引用**。
 
 ### 4.4 8K fp16 prefill 显存（探针 C 段）
-- **结果：单次 8K eager prefill（ours，fp16）CUDA OOM**：scores（14×8192×8192×fp16）≈ 1.75GiB/层瞬时 + logits（8192×151936×fp16）≈ 2.5GiB + 双模型常驻 > 8GB；
+- **历史探针结果：单次 8K eager prefill（ours，fp16）CUDA OOM**。探针运行时 scores 为 fp16，14×8192×8192×2 bytes ≈ 1.75GiB/层瞬时，另有 logits（8192×151936×fp16）≈ 2.5GiB 与双模型常驻开销。当前 fp16-stable 引擎已改为 QK score 在 fp32 计算；同形状 score 约 3.5GiB，因此更需要分块 prefill。
 - transformers eager 同配置也会 OOM（其也被强制 eager）。
-- **含义/方案**：18 格的 8K 行不能"一次性喂 8K"获取，需分块 prefill（块级因果 mask，引擎小改造）+ 缓存构建路径跳过 logits + 单模型常驻/expandable_segments；该 OOM 本身可作为"为什么需要 KV 压缩/量化/长上下文优化"的动机素材。
+- **含义/方案**：18 格的 8K 行不能“一次性喂 8K”获取，需分块 prefill（块级因果 mask，引擎小改造）+ 缓存构建路径跳过 logits + 单模型常驻/expandable_segments；该 OOM 本身可作为“为什么需要 KV 压缩/量化/长上下文优化”的动机素材。
 
 ## 5. 复现设置（每次记录必须带上）
-- seed=42（测试）；性能脚本 seed=0，3 reps 取最优 + warmup；
-- prompt 固定（bench_basic.PROMPT，38 tok）；decode 数 64；
-- dtype/设备随行标注（fp32/CPU、fp16/CUDA）；attn eager；no_grad；
-- 待补：torch/transformers 精确版本、nvidia-smi 输出存档。
+- seed=42（测试）；性能脚本 seed=0；`bench_l4` 使用 batch=1、固定 38-token prompt、decode=64、warmup=4、reps=3；A6 性能比较以 **median** 为主，best 只留作原始记录。
+- A6 质量脚本：固定本地文本，在看到 L4 PPL 结果前冻结；406 个 target tokens；fp16 compute；INT4 group size=64。
+- A6 预注册质量门：**relative PPL increase <= 10% 为 PASS**；不因结果事后调整阈值。
+- dtype/设备随行标注；attention eager；`torch.no_grad()`。
+- A6 的 4090D latency/peak VRAM 是 development/preliminary evidence；最终回答 8GB 硬件问题时，必须在 RTX 4060 8GB 上按同协议复跑。
 
-## 6. 预留登记表（后续里程碑——现在为空，跑完填）
+## 6. 里程碑登记表
 
-### 6.1 L4 权重量化（int8 / int4）
-| 方案 | 权重大小 | peak VRAM | decode tok/s | ppl(Δ) | 自建题集 acc | 备注 |
-|---|---|---|---|---|---|---|
-| fp16 基线 | | | | | | 填 |
-| int8 | | | | | | 填 |
-| int4 | | | | | | 填 |
+### 6.1 L4 权重量化（A6，Qwen2.5-1.5B，RTX 4090 D 开发机）
 
-### 6.2 L4b KV 量化（fp16→fp8→int4→int2）
+**日期：2026-09-08；torch 2.5.1+cu124；seed=0；batch=1；prompt=38 tok；decode=64；warmup=4；reps=3；性能主统计=median。**
+
+| 方案 | 权重大小 | peak VRAM | decode median | ppl(Δ vs fp16) | 自建题集 acc | 备注 |
+|---|---:|---:|---:|---:|---|---|
+| fp16 基线 | 2944.4 MiB (2.875 GiB) | 2.898 GiB | **35.85 tok/s** (27.89 ms/token) | **22.975503** | 待正式 held-out task | baseline；best=53.86 tok/s |
+| int8 RTN | 1696.1 MiB (1.656 GiB) | 1.786 GiB | **27.27 tok/s** (36.67 ms/token) | **23.234550 (+1.13%)** | 待正式 held-out task | **质量门 PASS**；196/196 Linear；storage ↓42.4%，peak VRAM ↓38.4% |
+| int4 packed RTN, g64 | 1109.2 MiB (1.083 GiB) | 1.201 GiB | **26.00 tok/s** (38.47 ms/token) | **27.954204 (+21.67%)** | 待正式 held-out task | **质量门 FAIL**；196/196 Linear；storage ↓62.3%，peak VRAM ↓58.6% |
+
+#### A6 结论
+1. **INT8 是当前 L4 主线 operating point**：显著降低模型 storage/VRAM，同时 PPL 仅增加 1.13%，通过预注册 10% 质量门。
+2. **INT4 是诚实负结果/更激进 trade-off**：g64 packed INT4 进一步压缩显存，但 PPL 增加 21.67%，超过质量门，因此不作为后续默认权重量化配置。
+3. 当前 eager 实现中 INT8/INT4 **没有带来 decode 加速**。原因是压缩权重在运行时先 dequant，再进入普通浮点 `F.linear`；没有专用 quantized GEMM kernel，因此 memory saving 与 latency speedup 不能等同。
+4. 4090D 上的正确性、storage、PPL 与本机性能结果构成 A6 完整实现证据；但若最终报告回答“RTX 4060 8GB 上的 latency / peak VRAM”，必须在目标机按同协议复跑，不能直接移用本表的 4090D 数字。
+5. A6/L4 状态：**implementation + real-model integration + 4090D system/quality evidence CLOSED**；RTX 4060 目标机复跑属于最终 hardware-specific validation，不阻塞进入 A7/L4b fp8 KV-cache。
+
+### 6.2 L4b KV 量化（fp16→fp8；int4/int2 仅非主线预留）
 | KV dtype | bytes/token | 峰值显存 | 长上下文(8K)可行? | ppl(Δ) | 备注 |
 |---|---|---|---|---|---|
 | fp16 | | | | | 填 |
+| fp8 | | | | | 填 |
 
 ### 6.3 L5 固定链投机解码（2K/4K/8K）
 | 上下文 | 接受率 | net speedup | tokens/s | ppl | 备注 |
@@ -113,3 +159,4 @@
 
 ## 7. 变更日志
 - 2026-09-02：建台账；登记 L1 对齐（0.000）、L2 缓存等价与生成对齐（PASS）、CPU/GPU 性能基线。
+- 2026-09-08：登记 A6/L4 1.5B INT8/INT4 开发结果；补 4090D 环境、1.5B FP32 reference validity、fp16 数值稳定性修复、最终 storage/VRAM/decode/PPL 表。INT8 通过质量门；INT4(g64) 作为诚实负结果；明确 4090D 数字非最终 RTX 4060 核心结论。
