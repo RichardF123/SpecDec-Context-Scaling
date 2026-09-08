@@ -67,16 +67,17 @@ argmax `Paris / Paris` —— **bf16 基线路径恢复到合理状态（短 pro
 | **C per-channel 诊断** | 每 (head, 64 维中每维) 一个 scale（精度优先诊断）| 判定"大 ΔPPL 是否 scale 粒度造成" | decode 单步时 per-channel 需跨 token 统计 → 需静态/校准 scale 或两遍，复杂；**只作诊断不冻结** |
 | **D 语义一致化** | **本 chunk 的 K/V 也在 attention 前量化→反量化**（"所有 token 都经 fp8 视图"），对齐生产 FP8-KV 语义 | 消除 chunk-size 敏感（V3 稳定）；语义 = 真·FP8-compressed KV | 本 chunk K/V 也带 fp8 噪声（更真实）；compute 略增；改动在 fp8 读路径 |
 
-**推荐实验顺序（每步 ~1 分钟 GPU + 一次 V4/V3）**：
-1. **先跑 B（g=32）只看 V4**：若 relative ΔPPL% 从 +283% 大幅回落（<~+30%）→ 证明主因是 scale
-   粒度 → 进入 2；若几乎不变 → 主因不是粒度 → 直接试 3。
-2. **再跑 D**（语义一致化）+ V3 消融（预期稳定）+ V4（复核 ΔPPL 与 fp8 真实代价）。
-3. B+D 组合定稿 → V2/V3/V4 全套 bf16 重跑 → 达标则 G3 PASS（改进版），仍差则 **A**（negative/mixed
-   如实登记：ΔPPL 大 + chunk 敏感 = F3/F4 型诚实结果）→ 再进 G4。
+**最终路线（2026-09-08 用户拍板, 覆盖上文“推荐顺序”; A 暂不选）**：
+`① 基线验证（bf16 对齐 + G1 回归）→ ② D 语义一致化 → ③ B 细粒度 scale → ④ 依 V3/V4 定 FP8 去留 → 才考虑 G4`
+理由：先确认"基础链路已对齐"再动 FP8 方案, 否则异常无法归因; +283% 混有"粒度过粗"与
+"chunk 语义不一致"两个可修因素, 现阶段冻结 negative/mixed 过早。
 
-## 6. 下一步动作（等你执行/确认）
+## 6. 下一步动作（既定路线 ①→④, 等你执行/确认）
 
-- [ ] GPU 单跑 `python -m specdec.engine.gpu_bf16_align_probe`（中等长度 bf16 对齐，确认基线可信）
-- [ ] G1 CPU fp32 回归（bias 默认改动后应仍 PASS）
-- [ ] 选定 §5 实验（推荐 B→D→组合 或 直接 A）
-- [ ] 所有重跑结果按 bf16 口径记入 ledger（补 §3.5.1 修正行 + §3.5.2 定稿），旧 fp16 行为数字标注作废
+- [ ] **①a** GPU 单跑 `python -m specdec.engine.gpu_bf16_align_probe`
+      （中等长度 bf16 ours-vs-HF: finite / max|Δ| / argmax% / NLL / control Paris）
+- [ ] **①b** `python -m specdec.engine.g1_target_15b`（fp32 CPU 回归, 应仍 PASS 三检查）
+- [ ] 基线过 → **② D** 语义一致化（本 chunk K/V 也在 attention 前量化→反量化）→ 重跑 V3（预期消融稳定）+ V4
+- [ ] **③ B** per-head 内 2×32 分组 scale（GROUP=32）→ 重跑 V4 看 ΔPPL%; 不足再 GROUP=16
+- [ ] **④** 依 V3/V4 结果: 改进版定稿 → G3 PASS(改进) 或 如实登记 negative/mixed → 才进 G4
+- [ ] 全部按 bf16 口径记入 ledger（§3.5.1 修正行 + §3.5.2 定稿; 旧 fp16 行为数字标注作废）

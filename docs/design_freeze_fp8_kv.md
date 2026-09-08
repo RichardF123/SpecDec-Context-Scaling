@@ -32,6 +32,17 @@
   - K/V 共享 scale：K、V 幅值分布不同，共享会伤害较小者。
 - **理由**：per-head-per-token 是 KV 量化文献的标准折中（如 DeepSeek-V2 路线）；本模型 kv_heads=2，元数据开销小。
 
+**D2b（v1.1 临时修订，2026-09-08，以 V4 实测为准）**：per-kv-head × per-token 粒度实测
+（bf16 base, 40 窗）relative ΔPPL ≈ **+283%** —— 过粗。改为 **per-token × per-kv-head ×
+组内分组**：head_dim=64 先按 **G=2 组 × 32 维**（元数据 ×2）；若仍不足再 G=4 × 16 维（×4）。
+- scale 形状 `(B, kv, T, G)`（G=2 或 4）；payload 形状不变 `(B,kv,T,64)` fp8；
+- 量化/反量化只改 `quantize_kv_fp8`/`dequantize_kv_fp8` 内部（末维 view 成组），
+  注意力/缓存读写路径零改动；scale 拼接仍在最后一维；
+- 记账（G=2 / G=4，fp16 512 B 基准）：payload 256 B + scales 32 B → **288 B（1.78×）**；
+  或 256+64 → **320 B（1.60×）**；
+- 保留开关 `GROUP`（32 → 16），便于同一 harness 快速 A/B。
+- **若 G=4 后 relative ΔPPL 仍大 → 停止细粒度方向，走 D 语义一致化或 A（negative/mixed）。**
+
 ### D3 scale 存储与生命周期
 - scale 存 **fp32**（4 B），与 payload **同生命周期**（token 进缓存即算，读到缓存淘汰才消失——本引擎缓存随 run 生命周期存在）。
 - 布局：`k_scale / v_scale` 形状 `(B, kv_heads, T)` fp32。
@@ -117,4 +128,4 @@ FP8 模式：payload 仍用键名 `"k"/"v"`、形状 `(B,kv,T,d)`，**dtype=floa
 - [ ] 修改意见：＿＿＿＿＿＿＿＿＿＿
 
 ---
-*变更记录：v0.1（DRAFT，2026-09-08）：初稿。v1.0（FROZEN，2026-09-08）：用户批准，D1–D8 生效。v1.0.1（2026-09-08）：§4.1 澄清接口契约（`set_kv_format`），无决策变更。v1.0.2（2026-09-08）：D4 澄清引擎反量化输出须为 fp16（单次舍入），无决策变更。*
+*变更记录：v0.1（DRAFT，2026-09-08）：初稿。v1.0（FROZEN，2026-09-08）：用户批准，D1–D8 生效。v1.0.1（2026-09-08）：§4.1 澄清接口契约（`set_kv_format`），无决策变更。v1.0.2（2026-09-08）：D4 澄清引擎反量化输出须为 fp16（单次舍入），无决策变更。v1.1（2026-09-08，**临时**）：D2b scale 粒度加组内分组（G=2×32 起），待 V4 实测定稿；运行 dtype 因平台改为 bf16（CUDA fp16 对 Qwen NaN）。*
