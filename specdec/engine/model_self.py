@@ -65,16 +65,28 @@ def kv_repeat(x: torch.Tensor, n_rep: int) -> torch.Tensor:
     return x.unsqueeze(2).expand(b, kv, n_rep, s, d).reshape(b, kv * n_rep, s, d)
 
 E4M3_MAX = 448.0
+GROUP_SIZE = 32      # B: FP8 KV scale 分组粒度（Qwen2.5-1.5B head_dim=128 -> 4 组/head）
 
 def quantize_kv_fp8(x: torch.Tensor):
-    m = x.abs().amax(dim=-1, keepdim=True)
-    s = m.to(torch.float32) / E4M3_MAX
-    s = torch.where(s == 0, torch.ones_like(s), s)
-    q = (x.to(torch.float32) / s).to(torch.float8_e4m3fn)
-    return q, s.squeeze(-1)
+    """B (groupwise): x (B,kv,S,D) -> payload fp8 同形 + scale (B,kv,S, D//GROUP_SIZE).
+    每 GROUP_SIZE 维组独立 max-abs/scale; payload reshape 回原形。fp32 除法单次舍入; 全零组 scale=1。"""
+    d = x.shape[-1]
+    g = d // GROUP_SIZE
+    xg = x.to(torch.float32).view(*x.shape[:-1], g, GROUP_SIZE)  # 组 = 沿 D 连续切分
+    m = xg.abs().amax(dim=-1, keepdim=True)                      # (…, g, 1)
+    s = m / E4M3_MAX
+    s = torch.where(s == 0, torch.ones_like(s), s)               # 全零组安全 scale
+    q = (xg / s).to(torch.float8_e4m3fn)                         # (…, g, GROUP_SIZE)
+    q = q.reshape_as(x)
+    return q, s.squeeze(-1)                                      # scale (B,kv,S,g)
 
 def dequantize_kv_fp8(q: torch.Tensor, scale: torch.Tensor, dtype: torch.dtype = torch.float16):
-    return (q.to(torch.float32) * scale.unsqueeze(-1)).to(dtype)
+    """B 反量化: q (B,kv,S,D) fp8, scale (B,kv,S,g) -> (B,kv,S,D) 于 dtype.
+    与量化同序 view 成组 -> scale.unsqueeze(-1) 乘回 -> 恢复原形 -> dtype。"""
+    g = scale.shape[-1]
+    qg = q.to(torch.float32).view(*q.shape[:-1], g, q.shape[-1] // g)
+    hat = qg * scale.unsqueeze(-1)
+    return hat.reshape_as(q).to(dtype)
 
 class SelfAttention(nn.Module):
     def __init__(self, hidden: int, heads: int, kv_heads: int, head_dim:int, attn_bias: bool = False):
@@ -96,11 +108,6 @@ class SelfAttention(nn.Module):
         q = apply_rope(q, cos, sin)
         k = apply_rope(k, cos, sin)
         fmt = cache.get("fmt", self.kv_format) if cache is not None else self.kv_format
-        # —— D: fp8 语义一致化 ——
-        # fp8 下, 当前 chunk 的 k/v 也先 量化→反量化, attention 用反量化视图;
-        # 存储复用同一份 payload/scale（不二次量化）。于是"chunk 内兄弟 token"
-        # 与"跨 chunk 读到的历史 token"对 attention 呈现同一种 fp8 表示,
-        # chunk 边界不再改变计算（对齐生产 FP8-KV 语义）。fp16 路径完全不动。
         qk_cur = qv_cur = ks_cur = vs_cur = None
         if fmt == 'fp8':
             qk_cur, ks_cur = quantize_kv_fp8(k)
@@ -139,18 +146,17 @@ class SelfAttention(nn.Module):
         out = torch.matmul(attn, v_rep)
         out = out.transpose(1, 2).contiguous().view(b, s, self.heads * self.head_dim)
         if cache is None:
-            if fmt == 'fp8':
-                # 首建缓存: 直接存 attention 前那份 payload（qk_cur/qv_cur 已量化）
+            if fmt == 'fp8':             
                 new_cache = {"k": qk_cur, "v": qv_cur, "k_scale": ks_cur,
                              "v_scale": vs_cur, "fmt": fmt}
             else:
                 new_cache = {"k": k_all, "v": v_all}
         elif fmt == 'fp8':
-            # 复用同一份 payload/scale 追加（不再二次量化 → 口径一致）
             cache['k'] = torch.cat([cache['k'], qk_cur], dim=2)
             cache['v'] = torch.cat([cache['v'], qv_cur], dim=2)
-            cache['k_scale'] = torch.cat([cache['k_scale'], ks_cur], dim=-1)
-            cache['v_scale'] = torch.cat([cache['v_scale'], vs_cur], dim=-1)
+            # B: scale (B,kv,S,g) —— token 维是 dim=2, 不能沿 dim=-1(group 维) 拼接
+            cache['k_scale'] = torch.cat([cache['k_scale'], ks_cur], dim=2)
+            cache['v_scale'] = torch.cat([cache['v_scale'], vs_cur], dim=2)
             new_cache = cache
         else:
             new_cache = cache

@@ -93,6 +93,22 @@ def main() -> int:
         print(f"chunk={ch}: cache built (fmt={c[0].get('fmt')}, "
               f"k dtype={c[0]['k'].dtype})", flush=True)
 
+    # [0] 显存记账（B 版 scale 元数据; 以 chunk1024 fp8 cache 实测张量为准）
+    c = caches[CHUNKS[0]]
+    pl_n = sum(int(t.numel()) for lay in c for t in (lay["k"], lay["v"]))
+    sc_n = sum(int(t.numel()) for lay in c for t in (lay["k_scale"], lay["v_scale"]))
+    pl_b = pl_n * 1            # fp8 1 B/elem
+    sc_b = sc_n * 4            # fp32 4 B/elem
+    bf16_b = pl_n * 2          # 同形状 bf16 K/V
+    tot = pl_b + sc_b
+    print(f"[0] FP8 KV cache memory (T={c[0]['k'].shape[2]}, layers={len(c)}): "
+          f"payload={pl_b/2**20:.2f} MiB + scales={sc_b/2**20:.2f} MiB "
+          f"= {tot/2**20:.2f} MiB | vs BF16 {bf16_b/2**20:.2f} MiB "
+          f"-> {tot/bf16_b*100:.1f}% ({bf16_b/tot:.2f}x)")
+    print(f"    per token/layer: payload {pl_n//len(c)//c[0]['k'].shape[2]} B + "
+          f"scales {sc_n//len(c)//c[0]['k'].shape[2]} B "
+          f"= {(pl_n+sc_n)//len(c)//c[0]['k'].shape[2]} B (bf16 {pl_n//len(c)//c[0]['k'].shape[2]*2} B)")
+
     ok = True
     # [1] 漂移量级
     overall_d, per_layer_d = cache_kv_payload_diff(caches[CHUNKS[0]], caches[CHUNKS[1]])
