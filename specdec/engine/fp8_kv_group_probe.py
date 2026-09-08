@@ -107,7 +107,7 @@ def kv_metrics(base_bf16, gs):
             hat.flatten(1), x.flatten(1), dim=1).mean().item()
         out[key] = (ae.mean().item(), (e * e).mean().sqrt().item(),
                     ae.max().item(), rel2.item(), cos)
-    return out
+    return out["k"], out["v"]   # (K-metrics tuple, V-metrics tuple)
 
 
 def main() -> int:
