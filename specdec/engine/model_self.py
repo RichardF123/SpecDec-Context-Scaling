@@ -65,24 +65,21 @@ def kv_repeat(x: torch.Tensor, n_rep: int) -> torch.Tensor:
     return x.unsqueeze(2).expand(b, kv, n_rep, s, d).reshape(b, kv * n_rep, s, d)
 
 E4M3_MAX = 448.0
-GROUP_SIZE = 32      # B: FP8 KV scale 分组粒度（Qwen2.5-1.5B head_dim=128 -> 4 组/head）
+GROUP_SIZE = 32     
 
-def quantize_kv_fp8(x: torch.Tensor):
-    """B (groupwise): x (B,kv,S,D) -> payload fp8 同形 + scale (B,kv,S, D//GROUP_SIZE).
-    每 GROUP_SIZE 维组独立 max-abs/scale; payload reshape 回原形。fp32 除法单次舍入; 全零组 scale=1。"""
+def quantize_kv_fp8(x: torch.Tensor, group_size: int = GROUP_SIZE):
     d = x.shape[-1]
-    g = d // GROUP_SIZE
-    xg = x.to(torch.float32).view(*x.shape[:-1], g, GROUP_SIZE)  # 组 = 沿 D 连续切分
-    m = xg.abs().amax(dim=-1, keepdim=True)                      # (…, g, 1)
+    assert d % group_size == 0, f"head_dim {d} % group_size {group_size} != 0"
+    g = d // group_size
+    xg = x.to(torch.float32).view(*x.shape[:-1], g, group_size)  
+    m = xg.abs().amax(dim=-1, keepdim=True)                     
     s = m / E4M3_MAX
-    s = torch.where(s == 0, torch.ones_like(s), s)               # 全零组安全 scale
-    q = (xg / s).to(torch.float8_e4m3fn)                         # (…, g, GROUP_SIZE)
+    s = torch.where(s == 0, torch.ones_like(s), s)               
+    q = (xg / s).to(torch.float8_e4m3fn)                         
     q = q.reshape_as(x)
-    return q, s.squeeze(-1)                                      # scale (B,kv,S,g)
+    return q, s.squeeze(-1)                                     
 
 def dequantize_kv_fp8(q: torch.Tensor, scale: torch.Tensor, dtype: torch.dtype = torch.float16):
-    """B 反量化: q (B,kv,S,D) fp8, scale (B,kv,S,g) -> (B,kv,S,D) 于 dtype.
-    与量化同序 view 成组 -> scale.unsqueeze(-1) 乘回 -> 恢复原形 -> dtype。"""
     g = scale.shape[-1]
     qg = q.to(torch.float32).view(*q.shape[:-1], g, q.shape[-1] // g)
     hat = qg * scale.unsqueeze(-1)
@@ -99,6 +96,9 @@ class SelfAttention(nn.Module):
         self.kv_heads = kv_heads
         self.head_dim = head_dim
         self.kv_format = "fp16" 
+        # 诊断开关(默认=正式路径): K/V 各自 group size; 1 = 逐元素(对 bf16 无损)
+        self.fp8_g_k = GROUP_SIZE
+        self.fp8_g_v = GROUP_SIZE
 
     def forward(self, x: torch.Tensor, cos, sin, cache = None) -> torch.Tensor:
         b, s, _ = x.shape
@@ -110,8 +110,8 @@ class SelfAttention(nn.Module):
         fmt = cache.get("fmt", self.kv_format) if cache is not None else self.kv_format
         qk_cur = qv_cur = ks_cur = vs_cur = None
         if fmt == 'fp8':
-            qk_cur, ks_cur = quantize_kv_fp8(k)
-            qv_cur, vs_cur = quantize_kv_fp8(v)
+            qk_cur, ks_cur = quantize_kv_fp8(k, self.fp8_g_k)
+            qv_cur, vs_cur = quantize_kv_fp8(v, self.fp8_g_v)
             k_cur16 = dequantize_kv_fp8(qk_cur, ks_cur, x.dtype)
             v_cur16 = dequantize_kv_fp8(qv_cur, vs_cur, x.dtype)
         else:
@@ -154,7 +154,6 @@ class SelfAttention(nn.Module):
         elif fmt == 'fp8':
             cache['k'] = torch.cat([cache['k'], qk_cur], dim=2)
             cache['v'] = torch.cat([cache['v'], qv_cur], dim=2)
-            # B: scale (B,kv,S,g) —— token 维是 dim=2, 不能沿 dim=-1(group 维) 拼接
             cache['k_scale'] = torch.cat([cache['k_scale'], ks_cur], dim=2)
             cache['v_scale'] = torch.cat([cache['v_scale'], vs_cur], dim=2)
             new_cache = cache
@@ -231,7 +230,21 @@ class QwenLM(nn.Module):
         self.kv_format = fmt
         for layer in self.layers:
             layer.self_attn.kv_format = fmt
-    
+
+    def set_fp8_groups(self, k_group: int | None = None, v_group: int | None = None) -> None:
+        """诊断开关: K/V 各自 FP8 scale 分组粒度(须整除 head_dim)。默认 None=不动。
+        group=1 => 逐元素(对 bf16 无损); 128 => per-head; 32 => 正式值。仅 fp8 模式生效。"""
+        if k_group is not None:
+            assert self.head_dim % k_group == 0
+        if v_group is not None:
+            assert self.head_dim % v_group == 0
+        for layer in self.layers:
+            a = layer.self_attn
+            if k_group is not None:
+                a.fp8_g_k = k_group
+            if v_group is not None:
+                a.fp8_g_v = v_group
+
 if __name__ == "__main__":
     ids = torch.randint(0, 151936, (1, 10))
     full = model(ids)                                  # 全量 10 词

@@ -105,9 +105,10 @@ def main() -> int:
           f"payload={pl_b/2**20:.2f} MiB + scales={sc_b/2**20:.2f} MiB "
           f"= {tot/2**20:.2f} MiB | vs BF16 {bf16_b/2**20:.2f} MiB "
           f"-> {tot/bf16_b*100:.1f}% ({bf16_b/tot:.2f}x)")
-    print(f"    per token/layer: payload {pl_n//len(c)//c[0]['k'].shape[2]} B + "
-          f"scales {sc_n//len(c)//c[0]['k'].shape[2]} B "
-          f"= {(pl_n+sc_n)//len(c)//c[0]['k'].shape[2]} B (bf16 {pl_n//len(c)//c[0]['k'].shape[2]*2} B)")
+    print(f"    per token/layer: payload {pl_n//len(c)//c[0]['k'].shape[2]*1} B + "
+          f"scales {sc_n//len(c)//c[0]['k'].shape[2]*4} B "
+          f"= {(pl_n*1 + sc_n*4)//len(c)//c[0]['k'].shape[2]} B "
+          f"(bf16 {pl_n//len(c)//c[0]['k'].shape[2]*2} B)")
 
     ok = True
     # [1] 漂移量级
