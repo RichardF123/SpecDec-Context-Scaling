@@ -188,7 +188,7 @@ def main() -> int:
         s_b = torch.matmul(q, krep.transpose(-2, -1)) / math.sqrt(attn.head_dim)
         rows = torch.arange(128, device=q.device)
         mask = rows.view(128, 1) + R0 < torch.arange(2048, device=q.device).view(1, 2048)
-        s_b = s_b.masked_fill(mask.unsqueeze(1), float("-inf"))
+        s_b = s_b.masked_fill(mask.unsqueeze(0).unsqueeze(0), float("-inf"))
         p_b = torch.softmax(s_b, dim=-1)
         out_b = torch.matmul(p_b, vrep)
         for gs in (128, 32):
@@ -196,7 +196,7 @@ def main() -> int:
                                      torch.float32)
             kpolr = kv_repeat(kpol, nrep)
             s_p = torch.matmul(q, kpolr.transpose(-2, -1)) / math.sqrt(attn.head_dim)
-            s_p = s_p.masked_fill(mask.unsqueeze(1), float("-inf"))
+            s_p = s_p.masked_fill(mask.unsqueeze(0).unsqueeze(0), float("-inf"))
             p_p = torch.softmax(s_p, dim=-1)
             ds = (s_p - s_b).abs()
             dp = (p_p - p_b).abs()
