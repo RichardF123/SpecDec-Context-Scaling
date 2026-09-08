@@ -52,7 +52,8 @@ def load_model():
     return ours
 
 
-def prefill_chunked(ours, ids, chunk=CHUNK, need_logits_last=True, hooks=None):
+def prefill_chunked(ours, ids, chunk=CHUNK, need_logits_last=True):
+    """分块 prefill; 返回 (末块 logits, cache). hook 捕获的层输入以最后一次(末块)为准。"""
     cache_list = None
     last_logits = None
     S = ids.shape[1]
@@ -60,9 +61,6 @@ def prefill_chunked(ours, ids, chunk=CHUNK, need_logits_last=True, hooks=None):
         for st in range(0, S, chunk):
             piece = ids[:, st:st + chunk]
             last = (st + chunk >= S)
-            if hooks is not None:
-                for h in hooks:
-                    h["seen"] = False
             lg, cache_list = ours._run(ours.embed_tokens(piece), cache_list,
                                        need_logits=(need_logits_last and last))
             if last:
@@ -132,7 +130,7 @@ def main() -> int:
         handles.append(ours.layers[li].register_forward_hook(
             lambda m, a, o, c=cap: c.__setitem__("x", a[0].detach())))
         caps[li] = cap
-    lg_base, cache_base = prefill_chunked(ours, w0.unsqueeze(0), hooks=caps)
+    lg_base, cache_base = prefill_chunked(ours, w0.unsqueeze(0))
     base_snap = snapshot(cache_base)
     for h in handles:
         h.remove()
