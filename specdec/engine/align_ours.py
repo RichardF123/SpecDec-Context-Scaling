@@ -30,11 +30,12 @@ def build_from_config(cfg, attn_bias_force=None) -> QwenLM:
     heads = int(d["num_attention_heads"])
     kv = int(d.get("num_key_value_heads", heads))
     head_dim = int(d.get("head_dim", hidden // heads))
-    attn_bias = (
-        bool(attn_bias_force)
-        if attn_bias_force is not None
-        else bool(d.get("attention_bias", False))
-    )
+    if attn_bias_force is not None:
+        attn_bias = bool(attn_bias_force)
+    else:
+        # Qwen2 configs used here do not expose attention_bias, but their
+        # q/k/v projections do include bias tensors in the checkpoint.
+        attn_bias = bool(d.get("attention_bias", d.get("model_type") == "qwen2"))
     # transformers folds rope_theta into rope_parameters; read it from there first.
     rope_theta = float(
         (d.get("rope_parameters") or {}).get("rope_theta", d.get("rope_theta", 10000.0))

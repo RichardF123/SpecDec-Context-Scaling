@@ -29,6 +29,7 @@ import torch
 from .align_ours import build_from_config
 
 MODEL = "Qwen/Qwen2.5-1.5B-Instruct"
+DTYPE = torch.bfloat16     # CUDA fp16 produces NaNs for this Qwen path; bf16 is stable on RTX 4060.
 WINDOW = 2048
 CHUNK = 512            # fp16/fp8 同 chunk —— 只让 KV 存储精度成为差异
 LOSS_ROWS = 64         # loss 按位置小块算，避免整块 logits 转 fp32 造成 OOM
@@ -73,7 +74,7 @@ def load_model():
     cfg = AutoConfig.from_pretrained(MODEL, trust_remote_code=True)
     hf = AutoModelForCausalLM.from_pretrained(
         MODEL, config=cfg, attn_implementation="eager",
-        torch_dtype=torch.float16, trust_remote_code=True).to("cuda").eval()
+        torch_dtype=DTYPE, trust_remote_code=True).to("cuda").eval()
     ours = build_from_config(cfg)
     sd = {k.removeprefix("model."): v for k, v in hf.state_dict().items()}
     if cfg.to_dict().get("tie_word_embeddings", False):
@@ -81,7 +82,7 @@ def load_model():
     ours.load_state_dict(sd, strict=False)
     del hf
     torch.cuda.empty_cache()
-    ours = ours.to("cuda", torch.float16).eval()
+    ours = ours.to("cuda", DTYPE).eval()
     return ours
 
 
@@ -129,7 +130,7 @@ def main() -> int:
     ids = torch.tensor(tok(text)["input_ids"], dtype=torch.long)
     n_win = min(N_WINDOWS, ids.shape[0] // WINDOW)
     print(f"data: {path}\ntotal tokens={ids.shape[0]}  windows={n_win}  "
-          f"W={WINDOW} chunk={CHUNK}  model=1.5B", flush=True)
+          f"W={WINDOW} chunk={CHUNK}  model=1.5B dtype={DTYPE}", flush=True)
     if n_win < 32:
         print(f"WARNING: windows={n_win} < protocol min 32", flush=True)
 
@@ -177,9 +178,9 @@ def main() -> int:
     print(f"chunk size        : {CHUNK}")
     print(f"total predicted   : {tot_tok}")
     print(f"logits finite     : {finite_all}")
-    print(f"mean NLL fp16 KV  : {mean16:.6f}")
+    print(f"mean NLL base KV  : {mean16:.6f}")
     print(f"mean NLL fp8 KV   : {mean8:.6f}")
-    print(f"PPL(fp16 KV)      : {ppl16:.4f}")
+    print(f"PPL(base KV)      : {ppl16:.4f}")
     print(f"PPL(fp8 KV)       : {ppl8:.4f}")
     print(f"ΔPPL              : {dppl:+.4f}")
     print(f"relative ΔPPL%    : {rel:+.3f}")

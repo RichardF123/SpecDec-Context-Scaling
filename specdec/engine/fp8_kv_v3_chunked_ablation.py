@@ -15,10 +15,11 @@ from __future__ import annotations
 import torch
 
 from .align_ours import build_from_config
-from .fp8_kv_v1_roundtrip import dequant_kv_fp8
+from .model_self import dequantize_kv_fp8
 from .g2_operational import make_text
 
 MODEL = "Qwen/Qwen2.5-1.5B-Instruct"
+DTYPE = torch.bfloat16
 PROMPT = 4096
 DECODE_N = 16
 CHUNKS = (1024, 512)
@@ -29,7 +30,7 @@ def load_model(fmt: str):
     cfg = AutoConfig.from_pretrained(MODEL, trust_remote_code=True)
     hf = AutoModelForCausalLM.from_pretrained(
         MODEL, config=cfg, attn_implementation="eager",
-        torch_dtype=torch.float16, trust_remote_code=True).to("cuda").eval()
+        torch_dtype=DTYPE, trust_remote_code=True).to("cuda").eval()
     ours = build_from_config(cfg)
     sd = {k.removeprefix("model."): v for k, v in hf.state_dict().items()}
     if cfg.to_dict().get("tie_word_embeddings", False):
@@ -37,7 +38,7 @@ def load_model(fmt: str):
     ours.load_state_dict(sd, strict=False)
     del hf
     torch.cuda.empty_cache()
-    ours = ours.to("cuda", torch.float16).eval()
+    ours = ours.to("cuda", DTYPE).eval()
     ours.set_kv_format(fmt)
     return ours
 
@@ -62,11 +63,11 @@ def cache_kv_payload_diff(cache_a, cache_b) -> tuple[float, list[float]]:
     per_layer = []
     overall = 0.0
     for la, lb in zip(cache_a, cache_b):
-        # 两缓存都是 fp8 payload + scale → 先反量化回 fp16 再比（与 fp16 基准同尺度）
-        ka = dequant_kv_fp8(la["k"], la["k_scale"])
-        kb = dequant_kv_fp8(lb["k"], lb["k_scale"])
-        va = dequant_kv_fp8(la["v"], la["v_scale"])
-        vb = dequant_kv_fp8(lb["v"], lb["v_scale"])
+        # 两缓存都是 fp8 payload + scale → 先反量化回运行 dtype 再比。
+        ka = dequantize_kv_fp8(la["k"], la["k_scale"], DTYPE)
+        kb = dequantize_kv_fp8(lb["k"], lb["k_scale"], DTYPE)
+        va = dequantize_kv_fp8(la["v"], la["v_scale"], DTYPE)
+        vb = dequantize_kv_fp8(lb["v"], lb["v_scale"], DTYPE)
         m = max((ka - kb).abs().max().item(), (va - vb).abs().max().item())
         per_layer.append(m)
         overall = max(overall, m)
@@ -78,7 +79,7 @@ def main() -> int:
     from transformers import AutoTokenizer
     tok = AutoTokenizer.from_pretrained(MODEL, trust_remote_code=True)
     ids = make_text(tok, PROMPT).to("cuda")
-    print(f"prompt={PROMPT} tok  chunks={CHUNKS}  decode={DECODE_N}  fp8\n", flush=True)
+    print(f"prompt={PROMPT} tok  chunks={CHUNKS}  decode={DECODE_N}  fp8 dtype={DTYPE}\n", flush=True)
 
     ours = load_model("fp8")
     eos = tok.eos_token_id

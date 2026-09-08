@@ -24,6 +24,7 @@ from .align_ours import build_from_config
 from .g2_operational import make_text
 
 MODEL = "Qwen/Qwen2.5-1.5B-Instruct"
+DTYPE = torch.bfloat16
 PROMPT = 512
 CHUNK = 1024
 DECODE_N = 32
@@ -36,7 +37,7 @@ def build(ids, fmt: str):
     tok = AutoTokenizer.from_pretrained(MODEL, trust_remote_code=True)
     hf = AutoModelForCausalLM.from_pretrained(
         MODEL, config=cfg, attn_implementation="eager",
-        torch_dtype=torch.float16, trust_remote_code=True).to("cuda").eval()
+        torch_dtype=DTYPE, trust_remote_code=True).to("cuda").eval()
     ours = build_from_config(cfg)
     sd = {k.removeprefix("model."): v for k, v in hf.state_dict().items()}
     if cfg.to_dict().get("tie_word_embeddings", False):
@@ -44,7 +45,7 @@ def build(ids, fmt: str):
     ours.load_state_dict(sd, strict=False)
     del hf
     torch.cuda.empty_cache()
-    ours = ours.to("cuda", torch.float16).eval()
+    ours = ours.to("cuda", DTYPE).eval()
     ours.set_kv_format(fmt)
 
     eos = tok.eos_token_id
@@ -83,7 +84,7 @@ def main() -> int:
     from transformers import AutoTokenizer
     tok = AutoTokenizer.from_pretrained(MODEL, trust_remote_code=True)
     ids = make_text(tok, PROMPT).to("cuda")
-    print(f"prompt={PROMPT} tok  chunk={CHUNK}  decode={DECODE_N}  model=1.5B\n", flush=True)
+    print(f"prompt={PROMPT} tok  chunk={CHUNK}  decode={DECODE_N}  model=1.5B dtype={DTYPE}\n", flush=True)
 
     # fp16 一次; fp8 两次（确定性）
     print("running fp16 ...", flush=True)

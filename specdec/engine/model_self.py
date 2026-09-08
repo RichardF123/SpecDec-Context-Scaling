@@ -9,9 +9,11 @@ class RMSNORM(nn.Module):
         self.eps = eps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        variance = torch.mean(x * x, dim=-1, keepdim=True)
-        normed = 1 / torch.sqrt(variance + self.eps)
-        return normed * x * self.weight
+        orig_dtype = x.dtype
+        x32 = x.to(torch.float32)
+        variance = torch.mean(x32 * x32, dim=-1, keepdim=True)
+        normed = x32 * torch.rsqrt(variance + self.eps)
+        return self.weight * normed.to(orig_dtype)
 
 class Embedding(nn.Module):
     def __init__(self, vocab_size: int, hidden: int):
@@ -70,8 +72,8 @@ def quantize_kv_fp8(x: torch.Tensor):
     q = (x.to(torch.float32) / s).to(torch.float8_e4m3fn)
     return q, s.squeeze(-1)
 
-def dequantize_kv_fp8(q: torch.Tensor, scale: torch.Tensor):
-    return (q.to(torch.float32) * scale.unsqueeze(-1)).to(torch.float16)
+def dequantize_kv_fp8(q: torch.Tensor, scale: torch.Tensor, dtype: torch.dtype = torch.float16):
+    return (q.to(torch.float32) * scale.unsqueeze(-1)).to(dtype)
 
 class SelfAttention(nn.Module):
     def __init__(self, hidden: int, heads: int, kv_heads: int, head_dim:int, attn_bias: bool = False):
@@ -102,8 +104,8 @@ class SelfAttention(nn.Module):
             cache["v"] = v
             k_all, v_all = k, v
         else:
-            past_k = dequantize_kv_fp8(cache["k"], cache["k_scale"])
-            past_v = dequantize_kv_fp8(cache["v"], cache["v_scale"])
+            past_k = dequantize_kv_fp8(cache["k"], cache["k_scale"], x.dtype)
+            past_v = dequantize_kv_fp8(cache["v"], cache["v_scale"], x.dtype)
             k_all = torch.cat([past_k, k], dim=2)
             v_all = torch.cat([past_v, v], dim=2)        
         k_rep = kv_repeat(k_all, self.heads // self.kv_heads)
@@ -119,7 +121,7 @@ class SelfAttention(nn.Module):
         else:
             mask = torch.triu(torch.ones(s, T, device=x.device, dtype=torch.bool), diagonal=p + 1)
             scores = scores.masked_fill(mask, float('-inf'))
-        attn = torch.softmax(scores, dim=-1)
+        attn = torch.softmax(scores, dim=-1, dtype=torch.float32).to(q.dtype)
         out = torch.matmul(attn, v_rep)
         out = out.transpose(1, 2).contiguous().view(b, s, self.heads * self.head_dim)
         if cache is None:
