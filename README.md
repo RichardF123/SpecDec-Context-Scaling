@@ -10,8 +10,11 @@
   词表绑定打分）：对齐门 **max|Δ| = 0.000**（与 transformers fp32 逐位一致）。
 - ✅ **L2 — KV-cache 解码 + 贪心生成**：缓存等价 ≈ 2e-5（浮点噪声），
   **生成对齐 PASS**（整条 token 序列与官方模型数学一致）。
-- 🔄 下一步 **L4（int8/int4 权重量化）**；之后 L4b（KV 量化）/ L5（投机解码）；
-  CUDA kernel 轨为受控加分项（见 `docs/plan_v6.md`）。
+- ✅ **L4 — int8 / packed-int4 权重量化**：Qwen2.5-1.5B 的 196/196 个目标
+  Linear 已替换。4090D 实测中，INT8 模型 storage ↓42.4%、peak VRAM ↓38.4%、
+  PPL +1.13%（PASS）；INT4 PPL +21.67%（FAIL，保留为诚实负结果）。
+- 🔄 下一步 **L4b（fp8 KV 量化）/ L5（投机解码）**；RTX 4060 8GB 上的最终
+  hardware-specific latency / peak VRAM 结论将在项目最终出数阶段按同协议复跑。
 - 性能基线（Qwen2.5-0.5B）：CPU fp32 decode ≈ 9.2 tok/s；GPU fp16 decode
   ≈ 10.6 tok/s（latency-bound 的朴素解码——是后续各级优化要超越的起点）。
 
@@ -68,6 +71,22 @@ python -m specdec.engine.align_ours          # L1 门 —— 预期 0.000，PASS
 python -m specdec.engine.test_cache_equiv    # L2 缓存==全量 —— 预期 < 1e-3，PASS
 python -m specdec.engine.align_generate      # L2 生成对齐 —— 预期 PASS
 python -m specdec.engine.bench_basic         # 性能基线（CPU，有 GPU 则含 GPU）
+
+# A6：轻量工程门（无需下载 1.5B 权重）
+python -m specdec.quant.test_int8
+python -m specdec.quant.test_int4
+
+# A6：真实权重集成门（默认 Qwen2.5-0.5B）
+python -m specdec.quant.align_int8
+python -m specdec.quant.align_int4
+
+# A6：1.5B 系统成本与质量（CUDA；每种 mode 单独进程运行）
+python -m specdec.quant.bench_l4 --mode fp16
+python -m specdec.quant.bench_l4 --mode int8
+python -m specdec.quant.bench_l4 --mode int4
+python -m specdec.quant.eval_l4_ppl --mode fp16
+python -m specdec.quant.eval_l4_ppl --mode int8
+python -m specdec.quant.eval_l4_ppl --mode int4
 ```
 
 ## 文档
@@ -87,7 +106,7 @@ specdec/
   results.py      只追加 results.jsonl 台账
   engine/         model_self.py（OURS 自写）+ 对齐/测试/基准工具
   kernels/        （L3 轨，可选）
-  quant/          Phase 4：int8/int4（OURS）
+  quant/          L4：int8 / packed-int4（OURS，已实现）
   kv_quant/       Phase 4b：KV 量化（OURS）
   spec_dec/       Phase 5：投机解码（OURS）
   bench/          Phase 7：基准测试

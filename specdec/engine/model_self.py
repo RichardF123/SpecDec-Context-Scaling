@@ -9,9 +9,11 @@ class RMSNORM(nn.Module):
         self.eps = eps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        input_dtype = x.dtype
+        x = x.to(torch.float32)
         variance = torch.mean(x * x, dim=-1, keepdim=True)
-        normed = 1 / torch.sqrt(variance + self.eps)
-        return normed * x * self.weight
+        x = x * torch.rsqrt(variance + self.eps)
+        return self.weight * x.to(input_dtype)
 
 class Embedding(nn.Module):
     def __init__(self, vocab_size: int, hidden: int):
@@ -34,18 +36,46 @@ class MLP(nn.Module):
         down = self.down_proj(gate * up)
         return down
 
-def Build_Rope_cache(head_dim: int, seq_len: int, theta:float, device: torch.device,dtype: torch.dtype,start_pos: int = 0) -> tuple[torch.Tensor, torch.Tensor]:
-    # Calculate the inverse frequencies
-    exponents = torch.arange(0, head_dim, 2, device=device, dtype=dtype) / head_dim
+def Build_Rope_cache(
+    head_dim: int,
+    seq_len: int,
+    theta: float,
+    device: torch.device,
+    dtype: torch.dtype,
+    start_pos: int = 0,
+) -> tuple[torch.Tensor, torch.Tensor]:
+
+    # RoPE frequencies must be computed in fp32.
+    exponents = torch.arange(
+        0,
+        head_dim,
+        2,
+        device=device,
+        dtype=torch.float32,
+    ) / head_dim
+
     inv_freq = 1.0 / (theta ** exponents)
-    # Create the position indices
-    postitions = torch.arange(start_pos, start_pos + seq_len, device=device, dtype=dtype)
-    # Compute the outer product to get the angles
-    freqs = torch.outer(postitions, inv_freq)  # (seq_len, head_dim/2)
-    # Compute the cosine and sine values
-    cos = torch.cat([torch.cos(freqs), torch.cos(freqs)], dim=-1).unsqueeze(0).unsqueeze(0)  # (1, 1, seq_len, head_dim)
-    sin = torch.cat([torch.sin(freqs), torch.sin(freqs)], dim=-1).unsqueeze(0).unsqueeze(0)  # (1, 1, seq_len, head_dim)
-    return cos, sin
+
+    positions = torch.arange(
+        start_pos,
+        start_pos + seq_len,
+        device=device,
+        dtype=torch.float32,
+    )
+
+    freqs = torch.outer(positions, inv_freq)
+
+    cos = torch.cat(
+        [torch.cos(freqs), torch.cos(freqs)],
+        dim=-1,
+    ).unsqueeze(0).unsqueeze(0)
+
+    sin = torch.cat(
+        [torch.sin(freqs), torch.sin(freqs)],
+        dim=-1,
+    ).unsqueeze(0).unsqueeze(0)
+
+    return cos.to(dtype), sin.to(dtype)
 
 def rotate_half(x: torch.Tensor) -> torch.Tensor:
     d = x.shape[-1]
@@ -88,7 +118,10 @@ class SelfAttention(nn.Module):
         v_cached = v if cache is None else cache["v"]
         k = kv_repeat(k, self.heads // self.kv_heads)
         v = kv_repeat(v, self.heads // self.kv_heads)
-        scores = torch.matmul(q, k.transpose(-2, -1)) / (self.head_dim ** 0.5)
+        scores = torch.matmul(
+            q.to(torch.float32),
+            k.to(torch.float32).transpose(-2, -1),
+        ) / (self.head_dim ** 0.5)
         T = k_cached.shape[2] if cache is not None else s
         p = T - s
         if cache is None:
@@ -100,6 +133,7 @@ class SelfAttention(nn.Module):
             mask = torch.triu(torch.ones(s, T, device=x.device, dtype=torch.bool), diagonal=p + 1)
             scores = scores.masked_fill(mask, float('-inf'))
         attn = torch.softmax(scores, dim=-1)
+        attn = attn.to(v.dtype)
         out = torch.matmul(attn, v)
         out = out.transpose(1, 2).contiguous().view(b, s, self.heads * self.head_dim)
         new_cache = {"k": k_cached, "v": v_cached } if cache is None else cache
