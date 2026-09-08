@@ -100,9 +100,10 @@ def main() -> int:
     print(f"[1] fp8 KV max|Δ| (chunk1024 vs chunk512, dequantized): overall={overall_d:.3e}")
     print(f"    per-layer @ 0/{L//2}/{L-1}: "
           f"{[f'{v:.3e}' for v in trend.values()]}")
-    fin = all(torch.isfinite(t).all().item() for c in caches.values()
-              for t in (c[0]["k"], c[0]["v"]))
-    print(f"    payload finite: {fin}")
+    fin = all(torch.isfinite(t.to(torch.float32)).all().item()
+              for c in caches.values()
+              for t in (c[0]["k"], c[0]["v"], c[0]["k_scale"], c[0]["v_scale"]))
+    print(f"    payload/scale finite: {fin}")
     ok &= fin
 
     # [2] 行为等价
