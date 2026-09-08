@@ -87,6 +87,17 @@
 - transformers eager 同配置也会 OOM（其也被强制 eager）。
 - **含义/方案**：18 格的 8K 行不能"一次性喂 8K"获取，需分块 prefill（块级因果 mask，引擎小改造）+ 缓存构建路径跳过 logits + 单模型常驻/expandable_segments；该 OOM 本身可作为"为什么需要 KV 压缩/量化/长上下文优化"的动机素材。
 
+### 4.5 8K chunked prefill 可运行性 —— G2 minimal（v7.1 G2 前置门，2026-09-08）
+| 项 | run1 | run2 | 判据 |
+|---|---|---|---|
+| 配置 | Qwen2.5-1.5B-Instruct fp16 / CUDA，ctx=8192，chunk=2048，decode 6 tok（seed 0）| 同左 | — |
+| 峰值 VRAM | 6.83 GiB | 6.83 GiB | < 7.5 GiB **PASS** |
+| prefill 墙钟 | 11.7 s | 8.3 s | 记录（run1 含 CUDA 首启开销）|
+| prefill+decode | 12.0 s | 8.5 s | 记录 |
+| 生成 token | 两次逐 token 一致 | 同左 | **PASS（稳定）** |
+| 结论 | **G2 MINIMAL: PASS — 8K × 1.5B 分块 prefill 在 8GB 卡上可行**（chunked 路径绕过 §4.4 的一次性 8K OOM）| | |
+> 注：生成文本为重复合成语料截断输入的贪心续写（'!诳!诳!诳'），仅作可运行性/稳定性探针，**不作正确性声明**（正确性由 chunked 等价门另行锚定）。
+
 ## 5. 复现设置（每次记录必须带上）
 - seed=42（测试）；性能脚本 seed=0，3 reps 取最优 + warmup；
 - prompt 固定（bench_basic.PROMPT，38 tok）；decode 数 64；
@@ -121,3 +132,4 @@
 
 ## 7. 变更日志
 - 2026-09-02：建台账；登记 L1 对齐（0.000）、L2 缓存等价与生成对齐（PASS）、CPU/GPU 性能基线。
+- 2026-09-08：登记 G1（1.5B target 正确性门 PASS，§3.4）与 G2 minimal（8K 分块 prefill 可运行性 PASS，§4.5）。
