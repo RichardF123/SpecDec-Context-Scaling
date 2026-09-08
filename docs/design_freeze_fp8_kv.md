@@ -45,6 +45,7 @@ v_hat  = v_q.to(torch.float16) * s              # 反量化点
 ```
 - 无 clamp：`s = max/448` 保证 max 恰好映射到 ≤448，构造上不溢出（E4M3FN 无 inf）。
 - 量化前 K/V 先转 fp32 求 max 再回 fp16 除法（避免 fp16 下 /s 溢出），实现细节以本公式为准。
+- **引擎反量化输出 dtype（v1.0.2 澄清）**：引擎内反量化须产出 **fp16**（供 fp16 eager attention 同 dtype matmul）：`(q.to(f32) * s).to(f16)`（fp32 乘后单次舍入）。harness 参考实现保留 fp32 输出作为比较基准；两者仅差最后一步 fp16 舍入，属 fp16 attention 精度的固有部分。
 
 ### D5 反量化点与写点（注意力路径零改动）
 - **读**：某步需要过去 p 个 token 的 K/V 时：`past16 = dequant(payload[:,:,:p])`（fp8→fp16 × scale）→ 与**本步新算的 fp16 K/V** `cat` → 交给**现有** eager attention（mask/softmax 等全部原样）。
@@ -116,4 +117,4 @@ FP8 模式：payload 仍用键名 `"k"/"v"`、形状 `(B,kv,T,d)`，**dtype=floa
 - [ ] 修改意见：＿＿＿＿＿＿＿＿＿＿
 
 ---
-*变更记录：v0.1（DRAFT，2026-09-08）：初稿。v1.0（FROZEN，2026-09-08）：用户批准，D1–D8 生效。v1.0.1（2026-09-08）：§4.1 澄清接口契约（`set_kv_format`），无决策变更。*
+*变更记录：v0.1（DRAFT，2026-09-08）：初稿。v1.0（FROZEN，2026-09-08）：用户批准，D1–D8 生效。v1.0.1（2026-09-08）：§4.1 澄清接口契约（`set_kv_format`），无决策变更。v1.0.2（2026-09-08）：D4 澄清引擎反量化输出须为 fp16（单次舍入），无决策变更。*
