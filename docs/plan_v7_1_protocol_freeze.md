@@ -99,7 +99,7 @@ dataset=Wikitext-2 test；窗口=非重叠固定上下文窗口；每 condition 
 
 ## 10. Freeze Checklist（全勾才 Final）
 - [ ] Target 1.5B correctness PASS
-- [ ] 8K operational feasibility PASS
+- [x] 8K operational feasibility PASS（ledger §4.5.1，2026-09-08）
 - [ ] paired prompt-family protocol frozen
 - [ ] ≥16 final prompt families frozen
 - [ ] generation settings frozen
