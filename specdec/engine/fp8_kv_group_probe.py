@@ -76,7 +76,8 @@ def window_nll(ours, ids_w, fmt, gk, gv):
     """同窗口以 (fmt, K/V group) 运行, 返回 mean NLL."""
     ours.set_kv_format(fmt)
     if fmt == "fp8":
-        ours.set_fp8_groups(gk, gv)
+        # pilot 语义 = 对 K、V 都应用给定 group size（诊断用; 正式默认是 V-only）
+        ours.set_fp8_matrices(k_on=True, v_on=True, k_group=gk, v_group=gv)
     cache_list = None
     nll_sum = 0.0
     n_tok = 0

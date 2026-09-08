@@ -63,11 +63,13 @@ def cache_kv_payload_diff(cache_a, cache_b) -> tuple[float, list[float]]:
     per_layer = []
     overall = 0.0
     for la, lb in zip(cache_a, cache_b):
-        # 两缓存都是 fp8 payload + scale → 先反量化回运行 dtype 再比。
-        ka = dequantize_kv_fp8(la["k"], la["k_scale"], DTYPE)
-        kb = dequantize_kv_fp8(lb["k"], lb["k_scale"], DTYPE)
-        va = dequantize_kv_fp8(la["v"], la["v_scale"], DTYPE)
-        vb = dequantize_kv_fp8(lb["v"], lb["v_scale"], DTYPE)
+        # 非对称混合缓存: 有 *_scale 键 = fp8 payload(反量化); 否则 bf16 直读。
+        def ld(entry, key):
+            t = entry[key]
+            skey = key + "_scale"
+            return dequantize_kv_fp8(t, entry[skey], DTYPE) if skey in entry else t
+        ka, kb = ld(la, "k"), ld(lb, "k")
+        va, vb = ld(la, "v"), ld(lb, "v")
         m = max((ka - kb).abs().max().item(), (va - vb).abs().max().item())
         per_layer.append(m)
         overall = max(overall, m)
@@ -93,22 +95,25 @@ def main() -> int:
         print(f"chunk={ch}: cache built (fmt={c[0].get('fmt')}, "
               f"k dtype={c[0]['k'].dtype})", flush=True)
 
-    # [0] 显存记账（B 版 scale 元数据; 以 chunk1024 fp8 cache 实测张量为准）
+    # [0] 显存记账（V-only 非对称; 按张量实际 element_size, K bf16 2B + V fp8 1B + scales 4B）
     c = caches[CHUNKS[0]]
-    pl_n = sum(int(t.numel()) for lay in c for t in (lay["k"], lay["v"]))
-    sc_n = sum(int(t.numel()) for lay in c for t in (lay["k_scale"], lay["v_scale"]))
-    pl_b = pl_n * 1            # fp8 1 B/elem
-    sc_b = sc_n * 4            # fp32 4 B/elem
-    bf16_b = pl_n * 2          # 同形状 bf16 K/V
+    pl_b = sum(int(t.numel()) * t.element_size() for lay in c
+               for t in (lay["k"], lay["v"]))
+    sc_b = sum(int(t.numel()) * 4 for lay in c
+               for t in (lay.get("k_scale"), lay.get("v_scale")) if t is not None)
+    kv_elems = sum(int(lay["k"].numel()) + int(lay["v"].numel()) for lay in c)
+    bf16_b = kv_elems * 2       # 全 bf16 KV 基线
     tot = pl_b + sc_b
-    print(f"[0] FP8 KV cache memory (T={c[0]['k'].shape[2]}, layers={len(c)}): "
+    T = c[0]["k"].shape[2]
+    L = len(c)
+    print(f"[0] FP8-asym(V-only) cache memory (T={T}, layers={L}): "
           f"payload={pl_b/2**20:.2f} MiB + scales={sc_b/2**20:.2f} MiB "
           f"= {tot/2**20:.2f} MiB | vs BF16 {bf16_b/2**20:.2f} MiB "
           f"-> {tot/bf16_b*100:.1f}% ({bf16_b/tot:.2f}x)")
-    print(f"    per token/layer: payload {pl_n//len(c)//c[0]['k'].shape[2]*1} B + "
-          f"scales {sc_n//len(c)//c[0]['k'].shape[2]*4} B "
-          f"= {(pl_n*1 + sc_n*4)//len(c)//c[0]['k'].shape[2]} B "
-          f"(bf16 {pl_n//len(c)//c[0]['k'].shape[2]*2} B)")
+    s0 = int(c[0]["v_scale"].numel()) * 4 if "v_scale" in c[0] else 0
+    print(f"    per token/layer: K bf16 {int(c[0]['k'].numel())//T*2} B + V "
+          f"{int(c[0]['v'].numel())*c[0]['v'].element_size()//T} B + V-scales "
+          f"{s0//T} B = {(pl_b + sc_b)//L//T} B (bf16 {bf16_b//L//T} B)")
 
     ok = True
     # [1] 漂移量级

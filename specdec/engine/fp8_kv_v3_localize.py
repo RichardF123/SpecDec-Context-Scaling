@@ -96,10 +96,11 @@ def to_f32(kv_tensor):
 
 
 def layer_tensor(entry, key):
-    """返回第 entry 层 K 或 V 的 fp32 值(按需反量化)."""
+    """返回第 entry 层 K 或 V 的 fp32 值(有 *_scale 键则反量化, 否则 bf16 直读)."""
     t = entry[key]
-    if entry.get("fmt") == "fp8":
-        return dequantize_kv_fp8(t, entry[key + "_scale"], torch.float32)
+    skey = key + "_scale"
+    if skey in entry:
+        return dequantize_kv_fp8(t, entry[skey], torch.float32)
     return t.to(torch.float32)
 
 

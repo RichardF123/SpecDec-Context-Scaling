@@ -95,19 +95,20 @@ def main() -> int:
     _, toks8b, logs8b, _ = build(ids, "fp8")
 
     ok = True
-    # [1] 结构检查（B 版: scale 带 group 维 (B,kv,S,g), g = head_dim // GROUP_SIZE）
+    # [1] 结构检查（正式非对称: K bf16 无 scale, V fp8 + v_scale (B,kv,S,g)）
     from .model_self import GROUP_SIZE
     c0 = cache8[0]
     d = c0["k"].shape[-1]
     g = d // GROUP_SIZE
     stru = (c0.get("fmt") == "fp8"
-            and c0["k"].dtype == torch.float8_e4m3fn
-            and c0["v"].dtype == torch.float8_e4m3fn
-            and c0["k_scale"].shape[:3] == c0["k"].shape[:3]
-            and c0["k_scale"].shape[-1] == g
-            and c0["k_scale"].dtype == torch.float32)
-    print(f"[1] fp8 structure ok: {stru}  (head_dim={d} groups={g}, "
-          f"scale={tuple(c0['k_scale'].shape)})")
+            and c0["k"].dtype == DTYPE                      # K: bf16（不量化）
+            and "k_scale" not in c0
+            and c0["v"].dtype == torch.float8_e4m3fn        # V: fp8
+            and c0["v_scale"].shape[:3] == c0["v"].shape[:3]
+            and c0["v_scale"].shape[-1] == g
+            and c0["v_scale"].dtype == torch.float32)
+    print(f"[1] fp8 structure ok (asymmetric V-only): {stru}  (head_dim={d} "
+          f"v_groups={g}, v_scale={tuple(c0['v_scale'].shape)})")
     ok &= stru
 
     # [2] prefill 末位置 logits（各自第一次 decode 的 logits 即 prefill 末位置）
