@@ -86,7 +86,7 @@ argmax `Paris / Paris` —— **bf16 基线路径恢复到合理状态（短 pro
 
 ## 7. 最终判定（2026-09-08 晚）
 
-**G3: FROZEN（正式方案 = Asymmetric V-only FP8 KV，见 §3.5.3）**
+**G3: PASS / FROZEN（A4 确认于会话续：V-only V1 全 [1]–[7] PASS——K 与 base 逐位同、v_fp8 结构、helper gs128 全零/确定性/max→448、两次 prefill 逐位、dim=2 拼接、current-V payload==stored；正式方案 = Asymmetric V-only FP8 KV，见 §3.5.3）**
 - 正式独立窗口（40..79, disjoint pilot 0..3）：ΔNLL **+0.000397**、relative ΔPPL **+0.040%**（40 窗）。
 - V2 prefix 32/32；V3 chunk 一致 16/16；localize 相对 base 额外 coupling K +0.379 / V +0.891。
 - 8K（同脚本 paired）：KV logical 224.00 → 169.75 MiB（**1.320×**）；alloc 峰值 5.07 → 5.01 GiB；decode 有反量化开销。

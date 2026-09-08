@@ -16,6 +16,7 @@ from __future__ import annotations
 import torch
 
 from .align_ours import build_from_config
+from .g2_operational import make_text
 from .model_self import E4M3_MAX, GROUP_V, dequantize_kv_fp8, quantize_kv_fp8
 
 MODEL = "Qwen/Qwen2.5-1.5B-Instruct"
@@ -56,10 +57,7 @@ def main() -> int:
     torch.manual_seed(0)
     from transformers import AutoTokenizer
     tok = AutoTokenizer.from_pretrained(MODEL, trust_remote_code=True)
-    ids = tok("The history of artificial intelligence and neural networks spans many "
-              "decades of research into learning systems that process language with "
-              "attention over long sequences of tokens.", return_tensors="pt").input_ids
-    ids = ids[:, :PROMPT].cuda()
+    ids = make_text(tok, PROMPT).to("cuda")   # 保证恰好 PROMPT=96 token(两 chunk)
 
     ours = load_model()
     ok = True
@@ -98,11 +96,10 @@ def main() -> int:
     q1, s1 = quantize_kv_fp8(x.to(DTYPE), GROUP_V)
     q2, s2 = quantize_kv_fp8(x.to(DTYPE), GROUP_V)
     det_h = torch.equal(q1, q2) and torch.equal(s1, s2)
-    # 每个非零组最大元素应映射到 |448|
-    has_nz = (s1 > 0)
-    map448 = bool((q1.to(torch.float32).abs()
-                   .amax(dim=(-1, -2)).flatten()[has_nz.flatten()] == 448.0).all().item()
-                  if has_nz.any().item() else True)
+    # 每个 (head, token) 非零组的最大 |q| 应映射到 |448|（group=128 -> 整向量一个组）
+    qmax = q1.to(torch.float32).abs().amax(dim=-1)        # (1,2,16)
+    has_nz = (s1 > 0).squeeze(-1)                          # (1,2,16)
+    map448 = bool((qmax[has_nz] == 448.0).all().item() if has_nz.any().item() else True)
     print(f"[4] helper gs128: all-zero exact & finite: {zero_ok} | deterministic: {det_h} "
           f"| scale shape {tuple(s1.shape)} | nonzero groups max->448: {map448}")
     ok &= zero_ok and det_h and tuple(s1.shape) == (1, 2, 16, 1)
@@ -123,6 +120,32 @@ def main() -> int:
     print(f"[6] cache tokens along dim=2: v={cache_v1[0]['v'].shape[2]} "
           f"(expected {PROMPT}), v_scale={cache_v1[0]['v_scale'].shape[2]}: {tok_ok}")
     ok &= tok_ok
+
+    # [7] D 一致性: current V 的 quantize 结果(反量化后进 attention 的那份)
+    #     必须与写入 cache 的 payload/scale 完全相同(写路径不得二次量化/错位)。
+    # 用测试钩子记录"第一次 v 量化调用"(层0, 首 chunk, 48 tok)的返回值, 与最终 cache 段比较。
+    from . import model_self as ms
+    rec = {}
+    orig = ms.quantize_kv_fp8
+
+    def wrapped(x, group_size=ms.GROUP_SIZE):
+        r = orig(x, group_size)
+        if "q" not in rec:
+            rec["q"], rec["s"] = r
+        return r
+
+    ms.quantize_kv_fp8 = wrapped
+    try:
+        cache_v3 = prefill(ours, ids, "v_fp8")
+    finally:
+        ms.quantize_kv_fp8 = orig
+    q0, s0 = rec["q"], rec["s"]
+    l0 = cache_v3[0]
+    same = (torch.equal(l0["v"][:, :, :CHUNK], q0)
+            and torch.equal(l0["v_scale"][:, :, :CHUNK], s0))
+    print(f"[7] current-V quantized payload == stored cache payload (layer0, first "
+          f"{CHUNK} tokens): {same}  (payload {tuple(q0.shape)}, scale {tuple(s0.shape)})")
+    ok &= same
 
     print("\nV-only V1:", "PASS" if ok else "CHECK")
     return 0 if ok else 1

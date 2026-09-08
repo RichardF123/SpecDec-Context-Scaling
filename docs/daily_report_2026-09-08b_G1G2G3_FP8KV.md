@@ -60,10 +60,27 @@ full-forward 3.099e-05 / cached-vs-full 2.038e-05 / argmax same / generation equ
 验证：`gpu_bf16_align_probe`、`g1_target_15b`、`fp8_kv_v1_roundtrip`、`fp8_kv_v2_short_window`、`fp8_kv_v3_chunked_ablation`、`fp8_kv_v3_localize`、`fp8_kv_v4_dppl`（正式 40..79）、`fp8_kv_group_probe`（pilot）、`fp8_scale_diag`（弃置探索：分组误差近同）、`g2_operational/g2_peak_probe`、**新增 `fp8_vonly_v1_roundtrip`（V-only gs128 直接结构测试，待跑）与 `fp8_vonly_8k_operational`（base vs v_fp8 paired）**。
 文档：`design_freeze_fp8_kv.md` v1.0→v1.3（pilot-driven amendment）、`status_note_fp8_v4.md`（§7 判定、§8 G4 清单）、`data_ledger.md`（§3.4/§3.5–3.5.4/§4.5.1）。
 
-## 六、未决 / 下一步
-- [ ] `fp8_vonly_v1_roundtrip` 用户 GPU 跑一次回填（K 与 base 逐位相同 / 结构 / 确定性 断言）；
-- [ ] G4-0：0.5B draft 的 G1 式三检查（bf16 行为）→ G4-1 k=4 spec-dec 设计冻结 → G4-2 dual-model 内存实测（回答 54 MiB 是否够放 draft）；
+## 六、未决 / 下一步（收尾时点更新）
+- [x] `fp8_vonly_v1_roundtrip` 已 GPU 实测 **[1]–[7] 全 PASS → G3 FROZEN**（见 §七）；
+- [ ] B2 协议批准（`design_freeze_g4_specdec.md` v0.1 DRAFT → v1.0）后：B3 双模型 8GB 可行性 → B4 cache API → B5 greedy 主循环 → B6 correctness gate；
+- [ ] G4-0：0.5B draft 的 G1 式三检查（bf16 行为）可与 B3 一并推进；
 - [ ] V2/V3/V4 旧 fp16 时代行为行已在台账标注作废；正式行见 §3.5.3。
 - 结论诚实声明：微小负 Δ 不解读为量化提升；+0.040% 不作显著损失；未启动 G4；跨脚本显存不比较。
 
-—— 归档于 2026-09-08 深夜（本会话）。
+## 七、晚间续（2026-09-08 会话末收尾）
+
+### 阶段 A 完成：G3 正式冻结
+- `fp8_vonly_v1_roundtrip.py`：补 **[7] current==stored** 断言（测试钩子记录首 chunk/层 V 量化结果，与最终 cache 段逐位比较，证写路径无二次量化/错位）；修 prompt 为 `make_text` 96 token、修 map448 索引；实测 **[1]–[7] 全 PASS**；
+- **G3: PASS / FROZEN**：正式 = **Asymmetric V-only FP8 KV**（K BF16 + V FP8 E4M3，per-token×per-head scale，gs128）；negative = K-FP8/full-FP8；
+- 复核冻结口径：质量目标达到（正式 40 窗 ΔNLL +0.000397、rel ΔPPL +0.040%）；工程稳定达到（V2 32/32、V3 chunk 一致、deterministic、finite）；KV 压缩 1.32×；整机峰值仅 ~0.06 GiB；**eager decode 无加速且 V-only 有反量化开销**；是否改变 SpecDec 可行性 → G4 dual-model 实测。
+
+### 阶段 B 已做（仅文档/讲解，无实现代码）
+- B1：SpecDec 原理与数据流讲解（token/logits/K-V cache 状态机、bonus、EOS、预算<mismatch、为何不保证加速）；
+- B2：`docs/design_freeze_g4_specdec.md` **v0.1 DRAFT**（k=4/greedy/exact-equivalence 门/cache 不变式与 trim 语义/B3 前置门/范围排除）；
+- B3–B6 未实现；待协议批准后推进。
+
+### 文档/进度指针
+- 状态：`status_note_fp8_v4.md` §7（A4 冻结确认）§8（G4 前置清单）；`design_freeze_g4_specdec.md`（新）；`data_ledger.md` §3.5.3/§3.5.4 + 变更日志；
+- 当日代码/文档已随 `c7eb1d1` 与本收尾快照 commit 入库并推送。
+
+—— 2026-09-08 全天归档终。
