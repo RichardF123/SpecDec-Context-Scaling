@@ -32,20 +32,34 @@ DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__
                         "data")
 RAW_DIR = os.path.join(DATA_DIR, "wikitext-2-raw")
 TEST_RAW = os.path.join(RAW_DIR, "wiki.test.raw")
-ZIP_URL = "https://s3.amazonaws.com/research.metamind.io/wikitext/wikitext-2-raw-v1.zip"
+# 候选下载源（依次尝试）: llama.cpp CI 镜像 + hf-mirror 等价路径
+ZIP_URLS = [
+    "https://huggingface.co/datasets/ggml-org/ci/resolve/main/wikitext-2-raw-v1.zip",
+    "https://hf-mirror.com/datasets/ggml-org/ci/resolve/main/wikitext-2-raw-v1.zip",
+]
 
 
 def ensure_data() -> str:
     if os.path.exists(TEST_RAW):
         return TEST_RAW
     os.makedirs(RAW_DIR, exist_ok=True)
-    zip_path = os.path.join(DATA_DIR, "wikitext-2-raw-v1.zip")
-    if not os.path.exists(zip_path):
-        print(f"downloading {ZIP_URL} ...", flush=True)
-        urllib.request.urlretrieve(ZIP_URL, zip_path)
-    with zipfile.ZipFile(zip_path) as z:
-        z.extract("wikitext-2-raw/wiki.test.raw", DATA_DIR)
-    return TEST_RAW
+    last_err = None
+    for url in ZIP_URLS:
+        zip_path = os.path.join(DATA_DIR, os.path.basename(url).split("?")[0])
+        try:
+            print(f"downloading {url} ...", flush=True)
+            urllib.request.urlretrieve(url, zip_path)
+            with zipfile.ZipFile(zip_path) as z:
+                z.extract("wikitext-2-raw/wiki.test.raw", DATA_DIR)
+            print("ok", flush=True)
+            return TEST_RAW
+        except Exception as e:  # noqa: BLE001
+            last_err = e
+            print(f"  failed ({e}); trying next source", flush=True)
+    raise RuntimeError(
+        "all download sources failed; last error: " + repr(last_err) +
+        "\nmanual fix: download wikitext-2-raw-v1.zip and extract "
+        "wikitext-2-raw/wiki.test.raw into " + RAW_DIR)
 
 
 def load_model():
