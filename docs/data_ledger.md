@@ -49,6 +49,14 @@
 | 2026-09-02 | HF full-forward 循环（use_cache 无关）| 4 | **全序列逐 token 一致 PASS** |
 | 发现 | `hf.generate` 与其全量前向不一致（官方 logits ' is'=21.75 vs 其输出 ' was'）→ 不用其当裁判 | | |
 
+### 3.4 G1 —— 1.5B target correctness gate（v7.1 G1，2026-09-08）
+| 检查 | 内容 | 结果 | 条件 |
+|---|---|---|---|
+| G1.1 | OUR 1.5B full forward vs HF 1.5B full | **max|Δ| = 3.10e-05 PASS** | fp32/CPU eager；Qwen/Qwen2.5-1.5B-Instruct（hidden1536/l28/h12/kv2/vocab151936/attn_bias=True）|
+| G1.2 | OUR 1.5B cached decode vs OUR full | **max|Δ| = 2.04e-05，argmax same PASS** | 同上；32-token 输入 |
+| G1.3 | greedy 生成 vs HF 全量贪心 | **4/4 序列一致 PASS** | 同上；4 prompts × max_new=12 |
+| 注 | 0.5B 全部旧数据标记为 **development-stage validation**；G1 为 target 正式门 | | |
+
 ## 4. 性能基线（L2 朴素解码，正式协议前的初步数字）
 
 ### 4.1 CPU fp32
