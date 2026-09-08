@@ -20,10 +20,6 @@ from __future__ import annotations
 
 import math
 import os
-
-# 须在首次 CUDA 分配前生效: 缓解碎片化导致的伪 OOM
-os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
-
 import time
 import urllib.request
 import zipfile
@@ -35,6 +31,7 @@ from .align_ours import build_from_config
 MODEL = "Qwen/Qwen2.5-1.5B-Instruct"
 WINDOW = 2048
 CHUNK = 512            # fp16/fp8 同 chunk —— 只让 KV 存储精度成为差异
+LOSS_ROWS = 64         # loss 按位置小块算，避免整块 logits 转 fp32 造成 OOM
 N_WINDOWS = 40         # >= 协议最低 32
 DIAG_PPL = 1e3         # 诊断门（仅触发 debug 表, 不作质量判定）
 DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
@@ -109,11 +106,15 @@ def window_stats(ours, ids_w: torch.Tensor, fmt: str) -> tuple[float, int, bool]
             rows = tgt.shape[0]
             if rows <= 0:
                 continue
-            # fp32 转换只发生在 log_softmax 内部临时量（不长期持有整块 fp32）
-            ls = torch.log_softmax(lg[0, :rows].to(torch.float32), dim=-1)
-            nll_sum += -ls[torch.arange(rows, device=lg.device), tgt].sum().item()
+            # 只按少量位置转 fp32/log_softmax，PPL 口径不变，峰值显存低很多。
+            for rs in range(0, rows, LOSS_ROWS):
+                re = min(rs + LOSS_ROWS, rows)
+                ls = torch.log_softmax(lg[0, rs:re].to(torch.float32), dim=-1)
+                idx = torch.arange(re - rs, device=lg.device)
+                nll_sum += -ls[idx, tgt[rs:re]].sum().item()
+                del ls, idx
             n_tok += rows
-            del ls, lg
+            del lg
     return nll_sum, n_tok, finite
 
 

@@ -15,9 +15,6 @@ Run（交互式 GPU 终端）:  python -m specdec.engine.gpu_fp16_align_probe
 from __future__ import annotations
 
 import math
-import os
-
-os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import torch
 
@@ -28,10 +25,14 @@ MODEL = "Qwen/Qwen2.5-1.5B-Instruct"
 N = 256
 
 
-def load_pair():
-    from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
+def load_model(name: str):
+    """按需加载单个模型; name='hf'|'ours'. 同一时刻只常驻一个模型(省显存)."""
+    from transformers import AutoConfig, AutoModelForCausalLM
     cfg = AutoConfig.from_pretrained(MODEL, trust_remote_code=True)
-    tok = AutoTokenizer.from_pretrained(MODEL, trust_remote_code=True)
+    if name == "hf":
+        return AutoModelForCausalLM.from_pretrained(
+            MODEL, config=cfg, attn_implementation="eager",
+            torch_dtype=torch.float16, trust_remote_code=True).to("cuda").eval()
     hf = AutoModelForCausalLM.from_pretrained(
         MODEL, config=cfg, attn_implementation="eager",
         torch_dtype=torch.float16, trust_remote_code=True).to("cuda").eval()
@@ -40,8 +41,15 @@ def load_pair():
     if cfg.to_dict().get("tie_word_embeddings", False):
         sd.pop("lm_head.weight", None)
     ours.load_state_dict(sd, strict=False)
+    del hf
+    torch.cuda.empty_cache()
     ours = ours.to("cuda", torch.float16).eval()
-    return tok, hf, ours
+    return ours
+
+
+def mem_report() -> str:
+    free, total = torch.cuda.mem_get_info()
+    return f"cuda free={free/2**30:.2f} GiB / total={total/2**30:.2f} GiB"
 
 
 def mean_nll_and_argmax(logits, ids):
@@ -63,17 +71,33 @@ def main() -> int:
     with open(path, encoding="utf-8") as f:
         text = f.read()
     ids = torch.tensor(tok(text)["input_ids"][:N], dtype=torch.long)
-
-    print("loading pair (ours + HF, fp16 cuda) ...", flush=True)
-    _, hf, ours = load_pair()
     ids_c = ids.unsqueeze(0).cuda()
 
+    print(f"[0] {mem_report()}  —— 若 free < 3 GiB, 先查 nvidia-smi 里其它 GPU 占用进程",
+          flush=True)
+
+    # A) 只加载 ours, logits 落 CPU 后释放模型
+    print("loading ours (fp16 cuda) ...", flush=True)
+    ours = load_model("ours")
     with torch.inference_mode():
         lg_o = ours.forward(ids_c)
+    torch.cuda.synchronize()
+    lg_o = lg_o.detach().to("cpu", torch.float32)   # 落 CPU 再释放模型
+    del ours
+    torch.cuda.empty_cache()
+    print(f"    ours done ({mem_report()})", flush=True)
+
+    # B) 只加载 HF, logits 落 CPU
+    print("loading HF (fp16 cuda) ...", flush=True)
+    hf = load_model("hf")
+    with torch.inference_mode():
         lg_h = hf(ids_c).logits
     torch.cuda.synchronize()
+    lg_h = lg_h.detach().to("cpu", torch.float32)
+    del hf
+    torch.cuda.empty_cache()
 
-    d = (lg_o.to(torch.float32) - lg_h.to(torch.float32)).abs()
+    d = (lg_o - lg_h).abs()
     print(f"[1] logits max|Δ| (ours vs HF, fp16 cuda) = {d.amax().item():.3e}")
 
     am_o = lg_o[0, :-1].argmax(dim=-1)
