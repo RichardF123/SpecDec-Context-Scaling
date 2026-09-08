@@ -37,17 +37,18 @@ class MLP(nn.Module):
         return down
 
 def Build_Rope_cache(head_dim: int, seq_len: int, theta:float, device: torch.device,dtype: torch.dtype,start_pos: int = 0) -> tuple[torch.Tensor, torch.Tensor]:
+    calc_dtype = torch.float32
     # Calculate the inverse frequencies
-    exponents = torch.arange(0, head_dim, 2, device=device, dtype=dtype) / head_dim
+    exponents = torch.arange(0, head_dim, 2, device=device, dtype=calc_dtype) / head_dim
     inv_freq = 1.0 / (theta ** exponents)
     # Create the position indices
-    postitions = torch.arange(start_pos, start_pos + seq_len, device=device, dtype=dtype)
+    postitions = torch.arange(start_pos, start_pos + seq_len, device=device, dtype=calc_dtype)
     # Compute the outer product to get the angles
     freqs = torch.outer(postitions, inv_freq)  # (seq_len, head_dim/2)
     # Compute the cosine and sine values
     cos = torch.cat([torch.cos(freqs), torch.cos(freqs)], dim=-1).unsqueeze(0).unsqueeze(0)  # (1, 1, seq_len, head_dim)
     sin = torch.cat([torch.sin(freqs), torch.sin(freqs)], dim=-1).unsqueeze(0).unsqueeze(0)  # (1, 1, seq_len, head_dim)
-    return cos, sin
+    return cos.to(dtype), sin.to(dtype)
 
 def rotate_half(x: torch.Tensor) -> torch.Tensor:
     d = x.shape[-1]
@@ -95,8 +96,21 @@ class SelfAttention(nn.Module):
         q = apply_rope(q, cos, sin)
         k = apply_rope(k, cos, sin)
         fmt = cache.get("fmt", self.kv_format) if cache is not None else self.kv_format
+        # —— D: fp8 语义一致化 ——
+        # fp8 下, 当前 chunk 的 k/v 也先 量化→反量化, attention 用反量化视图;
+        # 存储复用同一份 payload/scale（不二次量化）。于是"chunk 内兄弟 token"
+        # 与"跨 chunk 读到的历史 token"对 attention 呈现同一种 fp8 表示,
+        # chunk 边界不再改变计算（对齐生产 FP8-KV 语义）。fp16 路径完全不动。
+        qk_cur = qv_cur = ks_cur = vs_cur = None
+        if fmt == 'fp8':
+            qk_cur, ks_cur = quantize_kv_fp8(k)
+            qv_cur, vs_cur = quantize_kv_fp8(v)
+            k_cur16 = dequantize_kv_fp8(qk_cur, ks_cur, x.dtype)
+            v_cur16 = dequantize_kv_fp8(qv_cur, vs_cur, x.dtype)
+        else:
+            k_cur16, v_cur16 = k, v
         if cache is None:
-            k_all, v_all = k, v
+            k_all, v_all = k_cur16, v_cur16
         elif fmt == 'fp16':
             k = torch.cat([cache["k"], k], dim=2)
             v = torch.cat([cache["v"], v], dim=2)
@@ -106,8 +120,8 @@ class SelfAttention(nn.Module):
         else:
             past_k = dequantize_kv_fp8(cache["k"], cache["k_scale"], x.dtype)
             past_v = dequantize_kv_fp8(cache["v"], cache["v_scale"], x.dtype)
-            k_all = torch.cat([past_k, k], dim=2)
-            v_all = torch.cat([past_v, v], dim=2)        
+            k_all = torch.cat([past_k, k_cur16], dim=2)
+            v_all = torch.cat([past_v, v_cur16], dim=2)
         k_rep = kv_repeat(k_all, self.heads // self.kv_heads)
         v_rep = kv_repeat(v_all, self.heads // self.kv_heads)
         scores = torch.matmul(q, k_rep.transpose(-2, -1)) / (self.head_dim ** 0.5)
@@ -126,18 +140,17 @@ class SelfAttention(nn.Module):
         out = out.transpose(1, 2).contiguous().view(b, s, self.heads * self.head_dim)
         if cache is None:
             if fmt == 'fp8':
-                qk, ks = quantize_kv_fp8(k)
-                qv, vs = quantize_kv_fp8(v)
-                new_cache = {"k": qk, "v": qv, "k_scale": ks, "v_scale": vs, "fmt": fmt}
-            else:                
+                # 首建缓存: 直接存 attention 前那份 payload（qk_cur/qv_cur 已量化）
+                new_cache = {"k": qk_cur, "v": qv_cur, "k_scale": ks_cur,
+                             "v_scale": vs_cur, "fmt": fmt}
+            else:
                 new_cache = {"k": k_all, "v": v_all}
         elif fmt == 'fp8':
-            qk, ks = quantize_kv_fp8(k)
-            qv, vs = quantize_kv_fp8(v)
-            cache['k'] = torch.cat([cache['k'], qk], dim=2)
-            cache['v'] = torch.cat([cache['v'], qv], dim=2)
-            cache['k_scale'] = torch.cat([cache['k_scale'], ks], dim=-1)
-            cache['v_scale'] = torch.cat([cache['v_scale'], vs], dim=-1)
+            # 复用同一份 payload/scale 追加（不再二次量化 → 口径一致）
+            cache['k'] = torch.cat([cache['k'], qk_cur], dim=2)
+            cache['v'] = torch.cat([cache['v'], qv_cur], dim=2)
+            cache['k_scale'] = torch.cat([cache['k_scale'], ks_cur], dim=-1)
+            cache['v_scale'] = torch.cat([cache['v_scale'], vs_cur], dim=-1)
             new_cache = cache
         else:
             new_cache = cache
