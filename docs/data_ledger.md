@@ -83,6 +83,14 @@
 - 最小正确性修复：RMSNorm 方差用 fp32 累积；QK score + softmax 用 fp32，attention probability 再 cast 回运行 dtype；RoPE frequency/position/freq 用 fp32 计算，cos/sin 最后 cast 回运行 dtype。
 - 修复后 fp16 质量恢复：**PPL = 22.975503**，与 fp32 reference 22.98598 接近；随后才重新跑 A6 最终性能数据。
 
+### 3.4 G1 —— 1.5B target correctness gate（v7.1 G1，2026-09-08）
+| 检查 | 内容 | 结果 | 条件 |
+|---|---|---|---|
+| G1.1 | OUR 1.5B full forward vs HF 1.5B full | **max|Δ| = 3.10e-05 PASS** | fp32/CPU eager；Qwen/Qwen2.5-1.5B-Instruct（hidden1536/l28/h12/kv2/vocab151936/attn_bias=True）|
+| G1.2 | OUR 1.5B cached decode vs OUR full | **max|Δ| = 2.04e-05，argmax same PASS** | 同上；32-token 输入 |
+| G1.3 | greedy 生成 vs HF 全量贪心 | **4/4 序列一致 PASS** | 同上；4 prompts × max_new=12 |
+| 注 | 0.5B 全部旧数据标记为 **development-stage validation**；G1 为 target 正式门 | | |
+
 ## 4. 性能基线（L2 朴素解码，正式协议前的初步数字）
 
 ### 4.1 CPU fp32
@@ -112,6 +120,19 @@
 - **历史探针结果：单次 8K eager prefill（ours，fp16）CUDA OOM**。探针运行时 scores 为 fp16，14×8192×8192×2 bytes ≈ 1.75GiB/层瞬时，另有 logits（8192×151936×fp16）≈ 2.5GiB 与双模型常驻开销。当前 fp16-stable 引擎已改为 QK score 在 fp32 计算；同形状 score 约 3.5GiB，因此更需要分块 prefill。
 - transformers eager 同配置也会 OOM（其也被强制 eager）。
 - **含义/方案**：18 格的 8K 行不能“一次性喂 8K”获取，需分块 prefill（块级因果 mask，引擎小改造）+ 缓存构建路径跳过 logits + 单模型常驻/expandable_segments；该 OOM 本身可作为“为什么需要 KV 压缩/量化/长上下文优化”的动机素材。
+
+### 4.5 8K chunked prefill 最小可行性预检（2026-09-08；**非正式 G2 门**）
+> 状态声明：`g2_feasibility.py` 是**最小可行性预检**（用户要求"先跑最小可行性验证"），仅证明 8K×1.5B 分块 prefill 可运行。
+> **正式 G2 门（v7.1 §7：规定 decode 长度 + 连续多次稳定 + correctness sanity PASS + 温度/时钟记录）尚未完成。**
+| 项 | run1 | run2 | 判据 |
+|---|---|---|---|
+| 配置 | Qwen2.5-1.5B-Instruct fp16 / CUDA，ctx=8192，chunk=2048，decode 6 tok（seed 0）| 同左 | — |
+| 峰值 VRAM | 6.83 GiB | 6.83 GiB | < 7.5 GiB **PASS** |
+| prefill 墙钟 | 11.7 s | 8.3 s | 记录（run1 含 CUDA 首启开销）|
+| prefill+decode | 12.0 s | 8.5 s | 记录 |
+| 生成 token | 两次逐 token 一致 | 同左 | **PASS（稳定）** |
+| 结论 | **预检通过：8K × 1.5B 分块 prefill 在 8GB 卡上可运行**（chunked 路径绕过 §4.4 的一次性 8K OOM）；**正式 G2 门待补跑** | | |
+> 注：生成文本为重复合成语料截断输入的贪心续写（'!诳!诳!诳'），仅作可运行性/稳定性探针，**不作正确性声明**（正确性由 chunked 等价门另行锚定）。
 
 ## 5. 复现设置（每次记录必须带上）
 - seed=42（测试）；性能脚本 seed=0；`bench_l4` 使用 batch=1、固定 38-token prompt、decode=64、warmup=4、reps=3；A6 性能比较以 **median** 为主，best 只留作原始记录。
@@ -160,3 +181,4 @@
 ## 7. 变更日志
 - 2026-09-02：建台账；登记 L1 对齐（0.000）、L2 缓存等价与生成对齐（PASS）、CPU/GPU 性能基线。
 - 2026-09-08：登记 A6/L4 1.5B INT8/INT4 开发结果；补 4090D 环境、1.5B FP32 reference validity、fp16 数值稳定性修复、最终 storage/VRAM/decode/PPL 表。INT8 通过质量门；INT4(g64) 作为诚实负结果；明确 4090D 数字非最终 RTX 4060 核心结论。
+- 2026-09-08：登记 G1（1.5B target 正确性门 PASS，§3.4）；登记 8K 分块 prefill **最小可行性预检通过**（§4.5，正式 G2 门未完成）。
