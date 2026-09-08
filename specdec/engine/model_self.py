@@ -61,6 +61,18 @@ def kv_repeat(x: torch.Tensor, n_rep: int) -> torch.Tensor:
     b, kv, s, d = x.shape
     return x.unsqueeze(2).expand(b, kv, n_rep, s, d).reshape(b, kv * n_rep, s, d)
 
+E4M3_MAX = 448.0
+
+def quantize_kv_fp8(x: torch.Tensor):
+    m = x.abs().amax(dim=-1, keepdim=True)
+    s = m.to(torch.float32) / E4M3_MAX
+    s = torch.where(s == 0, torch.ones_like(s), s)
+    q = (x.to(torch.float32) / s).to(torch.float8_e4m3fn)
+    return q, s.squeeze(-1)
+
+def dequantize_kv_fp8(q: torch.Tensor, scale: torch.Tensor):
+    return (q.to(torch.float32) * scale.unsqueeze(-1)).to(torch.float16)
+
 class SelfAttention(nn.Module):
     def __init__(self, hidden: int, heads: int, kv_heads: int, head_dim:int, attn_bias: bool = False):
         super().__init__()
@@ -71,6 +83,7 @@ class SelfAttention(nn.Module):
         self.heads = heads
         self.kv_heads = kv_heads
         self.head_dim = head_dim
+        self.kv_format = "fp16" 
 
     def forward(self, x: torch.Tensor, cos, sin, cache = None) -> torch.Tensor:
         b, s, _ = x.shape
@@ -79,17 +92,24 @@ class SelfAttention(nn.Module):
         v = self.v_proj(x).view(b, s, self.kv_heads, self.head_dim).transpose(1, 2)
         q = apply_rope(q, cos, sin)
         k = apply_rope(k, cos, sin)
-        if cache is not None:
+        fmt = cache.get("fmt", self.kv_format) if cache is not None else self.kv_format
+        if cache is None:
+            k_all, v_all = k, v
+        elif fmt == 'fp16':
             k = torch.cat([cache["k"], k], dim=2)
             v = torch.cat([cache["v"], v], dim=2)
             cache["k"] = k
             cache["v"] = v
-        k_cached = k if cache is None else cache["k"]
-        v_cached = v if cache is None else cache["v"]
-        k = kv_repeat(k, self.heads // self.kv_heads)
-        v = kv_repeat(v, self.heads // self.kv_heads)
-        scores = torch.matmul(q, k.transpose(-2, -1)) / (self.head_dim ** 0.5)
-        T = k_cached.shape[2] if cache is not None else s
+            k_all, v_all = k, v
+        else:
+            past_k = dequantize_kv_fp8(cache["k"], cache["k_scale"])
+            past_v = dequantize_kv_fp8(cache["v"], cache["v_scale"])
+            k_all = torch.cat([past_k, k], dim=2)
+            v_all = torch.cat([past_v, v], dim=2)        
+        k_rep = kv_repeat(k_all, self.heads // self.kv_heads)
+        v_rep = kv_repeat(v_all, self.heads // self.kv_heads)
+        scores = torch.matmul(q, k_rep.transpose(-2, -1)) / (self.head_dim ** 0.5)
+        T = k_all.shape[2] if cache is not None else s
         p = T - s
         if cache is None:
             mask = torch.triu(torch.ones(s, s, device=x.device, dtype=torch.bool), diagonal=1)
@@ -100,9 +120,25 @@ class SelfAttention(nn.Module):
             mask = torch.triu(torch.ones(s, T, device=x.device, dtype=torch.bool), diagonal=p + 1)
             scores = scores.masked_fill(mask, float('-inf'))
         attn = torch.softmax(scores, dim=-1)
-        out = torch.matmul(attn, v)
+        out = torch.matmul(attn, v_rep)
         out = out.transpose(1, 2).contiguous().view(b, s, self.heads * self.head_dim)
-        new_cache = {"k": k_cached, "v": v_cached } if cache is None else cache
+        if cache is None:
+            if fmt == 'fp8':
+                qk, ks = quantize_kv_fp8(k)
+                qv, vs = quantize_kv_fp8(v)
+                new_cache = {"k": qk, "v": qv, "k_scale": ks, "v_scale": vs, "fmt": fmt}
+            else:                
+                new_cache = {"k": k_all, "v": v_all}
+        elif fmt == 'fp8':
+            qk, ks = quantize_kv_fp8(k)
+            qv, vs = quantize_kv_fp8(v)
+            cache['k'] = torch.cat([cache['k'], qk], dim=2)
+            cache['v'] = torch.cat([cache['v'], qv], dim=2)
+            cache['k_scale'] = torch.cat([cache['k_scale'], ks], dim=-1)
+            cache['v_scale'] = torch.cat([cache['v_scale'], vs], dim=-1)
+            new_cache = cache
+        else:
+            new_cache = cache
         return self.o_proj(out), new_cache
     
     
@@ -127,7 +163,8 @@ class QwenLM(nn.Module):
         self.layers = nn.ModuleList([DecoderLayer(hidden, heads, kv_heads, head_dim, intermediate, attn_bias) for _ in range(num_layers)])
         self.norm = RMSNORM(hidden)
         self.head_dim = head_dim
-        self.rope_theta = rope_theta 
+        self.rope_theta = rope_theta
+        self.kv_format = "fp16"   
 
     def _run(self,x, cache_list = None, need_logits = True):  
         start_pos = 0
@@ -168,6 +205,11 @@ class QwenLM(nn.Module):
                 gen = torch.cat([gen, next_id.unsqueeze(1)], dim=1)
                 logits, cache_list = self._run(self.embed_tokens(next_id.unsqueeze(1)), cache_list)
         return gen
+    def set_kv_format(self, fmt: str) -> None:
+        assert fmt in ("fp16", "fp8"), fmt
+        self.kv_format = fmt
+        for layer in self.layers:
+            layer.self_attn.kv_format = fmt
     
 if __name__ == "__main__":
     ids = torch.randint(0, 151936, (1, 10))

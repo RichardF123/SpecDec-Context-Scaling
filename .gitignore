@@ -34,3 +34,10 @@ Thumbs.db
 # ---- Colab / scratch ----
 .ipynb_checkpoints/
 scratch/
+
+# ---- Local data / probe scratch (downloadable; raw outputs not source) ----
+data/
+output/
+tmp/
+probe_err.txt
+*.err.txt
