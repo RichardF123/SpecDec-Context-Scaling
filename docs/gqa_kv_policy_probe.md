@@ -69,6 +69,110 @@ The pilot does not measure or claim speedup. Eager dequantization may make a mor
 compressed representation slower; latency belongs to a separate target-hardware
 measurement after quality selection.
 
+## Round-1 pilot outcome (RTX 4060 8GB)
+
+The native-head current policy remained near-lossless (`dNLL=+0.0016`,
+`relative dPPL=+0.161%`, `1.320x` logical KV compression). Direct 2-to-1 K/V
+head merging was catastrophic (`dNLL >= +7.44`) and is rejected without an
+explicit uptraining procedure. Per-token/per-head K-INT8 + V-FP8 improved
+substantially over the earlier K-FP8 negative ablation but still produced
+`dNLL=+0.1701` / `relative dPPL=+18.541%`; it is not promoted to formal
+confirmation.
+
+## Round-2 targeted candidates
+
+Round 2 retains both native KV heads and tests only mechanisms motivated by the
+round-1 localization:
+
+- `v_int4`: K remains BF16; V uses symmetric packed INT4 with per-token,
+  per-head, group-32 scales.  Logical storage is 672 B/token/layer (`1.524x`
+  vs BF16), compared with 776 B for the current V-FP8 policy.
+- `k_pc_int8_v_fp8`: completed 32-token K blocks use per-channel INT8 scales;
+  an incomplete K tail remains BF16, while V retains the current FP8 encoding.
+  At a block boundary this is 552 B/token/layer (`1.855x` vs BF16).  The BF16
+  residual is always fewer than 32 tokens and makes incremental decode valid.
+
+Run `kv_policy_v2` first, then `kv_policy_pilot_v2`.  The second pilot repeats
+the baseline/current rows for paired comparison but excludes all rejected
+head-reduction and per-token K-INT8 variants, so it evaluates only 16
+policy-windows.  Formal windows 40..79 remain untouched.
+
+### Round-2 selection freeze (before reading confirmation windows)
+
+RTX 4060 pilot results on windows 0..3 were:
+
+| Policy | dNLL | relative dPPL | Compression vs BF16 |
+|---|---:|---:|---:|
+| current V-FP8 | +0.001600 | +0.161% | 1.320x |
+| packed V-INT4 group32 | +0.006937 | +0.696% | 1.524x |
+| K per-channel INT8 block32 + V-FP8 | +0.008800 | +0.884% | 1.855x |
+
+The **single selected confirmation candidate** is K per-channel INT8 block32 +
+V-FP8 with both native KV heads.  It uses 552 vs 776 B/token/layer for the
+current policy (28.9% fewer logical KV bytes), while its pilot quality difference
+is under 1% relative PPL.  V-INT4 is not advanced because it saves only 13.4%
+over the current policy while providing a small 0.188 percentage-point pilot
+quality advantage over the selected candidate.  Run `kv_policy_confirm_v2` once
+on offsets 40..79; only after reviewing that result may the 8K operational VRAM
+comparison be run.
+
+### K per-channel INT8 confirmation and operation
+
+The frozen 40-window confirmation produced `dNLL=+0.013580` and relative
+`dPPL=+1.367%` versus BF16 (`paired dNLL SE=0.001292`).  The current V-FP8
+policy produced `dNLL=+0.000397` / `dPPL=+0.040%`.  The selected candidate is
+therefore a statistically stable, modest quality-memory trade-off, not a
+near-lossless replacement for the current policy.  Its logical cache remains
+552 B/token/layer (`1.855x` vs BF16; 28.9% lower than current).
+
+At 8K, the candidate reduced logical cache by 49.00 MiB versus current V-FP8,
+but median peak allocated memory fell only 17.8 MiB; median reserved memory rose
+76.0 MiB and decode was 13.9% slower.  Prefill was unchanged (+0.4%).  It is
+therefore retained only as a negative/diagnostic ablation.
+
+### Recent-BF16 K residual follow-up
+
+Keeping 128 recent K tokens in BF16 improved the four-window pilot from
+`dPPL=+0.884%` to `+0.571%` at `1.809x` compression; residual 256 was dominated
+on both quality and storage.  A new, untouched 80..119 confirmation set removed
+the apparent gain: residual-128 produced `dNLL=+0.013270`, `dPPL=+1.336%`, and
+paired SE `0.001009`, essentially the same as the no-residual candidate on its
+independent set.  This demonstrates why the four-window pilot must not be used
+as final evidence.  Residual-128 was rejected without another 8K run.
+
+### Packed V-INT4 confirmation and operation
+
+The remaining mechanism keeps sensitive K entirely in BF16 and packs V as
+symmetric INT4 with per-token/per-head/group-32 scales.  Its independent 32-
+window confirmation used untouched offsets 4..35 and produced
+`dNLL=+0.009427`, relative `dPPL=+0.947%`, and paired SE `0.001018` versus BF16.
+It uses 672 B/token/layer (`1.524x` vs BF16; 13.4% below current V-FP8).
+
+On RTX 4060 8GB at 8K context, three rotated-order rounds produced:
+
+| Policy | Peak allocated | Peak reserved | Logical 8K KV | Prefill | Decode |
+|---|---:|---:|---:|---:|---:|
+| BF16 KV | 5.225 GiB | 7.123 GiB | 224.00 MiB | 3.03 s | 2.31 s |
+| Current V-FP8 | 5.146 GiB | 7.123 GiB | 169.75 MiB | 3.05 s | 2.97 s |
+| BF16-K + packed V-INT4 | 5.102 GiB | 7.125 GiB | 147.00 MiB | 3.05 s | 3.75 s |
+
+All policies were finite and token-stable across three repetitions.  Relative
+to current V-FP8, V-INT4 reduced peak allocated memory by 45.2 MiB and logical
+cache by 22.75 MiB; reserved memory changed by only +2.0 MiB and prefill by
++0.3%, but decode was 26.2% slower.
+
+### Final decision
+
+- Keep **K-BF16 + V-FP8** as the default: it remains essentially lossless and
+  has the best practical latency-quality balance in this eager engine.
+- Keep **K-BF16 + packed V-INT4 group32** as an optional memory-priority mode:
+  it gives the largest observed incremental peak-allocation reduction, at a
+  confirmed ~0.9% PPL and 26.2% decode cost versus current V-FP8.
+- Do not reduce pretrained GQA heads directly and do not promote either K-INT8
+  variant.  Further material peak reduction requires blockwise/fused consumption
+  of quantized KV rather than another head/group sweep; that execution work is
+  outside this completed probe.
+
 ## References
 
 - Ainslie et al., *GQA: Training Generalized Multi-Query Transformer Models from

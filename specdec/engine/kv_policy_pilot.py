@@ -120,6 +120,7 @@ def main() -> int:
     from transformers import AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(MODEL, trust_remote_code=True)
+    tokenizer.model_max_length = 10**9
     with open(ensure_data(), encoding="utf-8") as stream:
         all_ids = torch.tensor(tokenizer(stream.read())["input_ids"], dtype=torch.long)
     needed = (WINDOW_OFFSET + N_WINDOWS) * WINDOW
