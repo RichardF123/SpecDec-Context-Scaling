@@ -65,8 +65,10 @@ def kv_repeat(x: torch.Tensor, n_rep: int) -> torch.Tensor:
     return x.unsqueeze(2).expand(b, kv, n_rep, s, d).reshape(b, kv * n_rep, s, d)
 
 E4M3_MAX = 448.0
+INT8_MAX = 127.0
 GROUP_SIZE = 32      # full-FP8 ablation 默认组粒度
 GROUP_V = 128        # 正式 Asymmetric V-only: V 的 group size(=1 group/head)
+GROUP_K_INT8 = 128   # K-INT8 候选: per-token x per-head scale
 
 def quantize_kv_fp8(x: torch.Tensor, group_size: int = GROUP_SIZE):
     d = x.shape[-1]
@@ -86,6 +88,44 @@ def dequantize_kv_fp8(q: torch.Tensor, scale: torch.Tensor, dtype: torch.dtype =
     hat = qg * scale.unsqueeze(-1)
     return hat.reshape_as(q).to(dtype)
 
+def quantize_kv_int8(x: torch.Tensor, group_size: int = GROUP_K_INT8):
+    """Symmetric RTN INT8 for KV tensors, grouped along head_dim.
+
+    With group_size=head_dim this is per-token x per-KV-head scaling.  INT8 keeps
+    the same one-byte payload as FP8 but provides substantially finer resolution
+    around zero, which is the property under test for the K-sensitive path.
+    """
+    d = x.shape[-1]
+    assert d % group_size == 0, f"head_dim {d} % group_size {group_size} != 0"
+    g = d // group_size
+    xg = x.to(torch.float32).view(*x.shape[:-1], g, group_size)
+    m = xg.abs().amax(dim=-1, keepdim=True)
+    scale = m / INT8_MAX
+    scale = torch.where(scale == 0, torch.ones_like(scale), scale)
+    q = torch.round(xg / scale).clamp(-INT8_MAX, INT8_MAX).to(torch.int8)
+    return q.reshape_as(x), scale.squeeze(-1)
+
+def dequantize_kv_int8(q: torch.Tensor, scale: torch.Tensor,
+                       dtype: torch.dtype = torch.float16):
+    g = scale.shape[-1]
+    qg = q.to(torch.float32).view(*q.shape[:-1], g, q.shape[-1] // g)
+    return (qg * scale.unsqueeze(-1)).reshape_as(q).to(dtype)
+
+def reduce_kv_heads(x: torch.Tensor, target_heads: int) -> torch.Tensor:
+    """Mean-pool groups of KV heads for a diagnostic GQA->MQA ablation.
+
+    This changes the pretrained model function and is therefore never enabled by
+    default or treated as a drop-in compression method.  It exists only to answer
+    whether reducing Qwen2.5-1.5B's two native KV heads is viable without uptraining.
+    """
+    source_heads = x.shape[1]
+    assert 0 < target_heads <= source_heads, (source_heads, target_heads)
+    assert source_heads % target_heads == 0, (source_heads, target_heads)
+    if target_heads == source_heads:
+        return x
+    b, _, s, d = x.shape
+    return x.reshape(b, target_heads, source_heads // target_heads, s, d).mean(dim=2)
+
 class SelfAttention(nn.Module):
     def __init__(self, hidden: int, heads: int, kv_heads: int, head_dim:int, attn_bias: bool = False):
         super().__init__()
@@ -102,6 +142,10 @@ class SelfAttention(nn.Module):
         self.fp8_g_v = GROUP_SIZE
         self.fp8_k = True
         self.fp8_v = True
+        # Native by default.  Values below native kv_heads are diagnostic only:
+        # directly collapsing pretrained GQA heads changes model semantics.
+        self.cache_k_heads = kv_heads
+        self.cache_v_heads = kv_heads
 
     def forward(self, x: torch.Tensor, cos, sin, cache = None) -> torch.Tensor:
         b, s, _ = x.shape
@@ -110,23 +154,37 @@ class SelfAttention(nn.Module):
         v = self.v_proj(x).view(b, s, self.kv_heads, self.head_dim).transpose(1, 2)
         q = apply_rope(q, cos, sin)
         k = apply_rope(k, cos, sin)
+        k = reduce_kv_heads(k, self.cache_k_heads)
+        v = reduce_kv_heads(v, self.cache_v_heads)
         fmt = cache.get("fmt", self.kv_format) if cache is not None else self.kv_format
-        # 模式语义: 'fp16'=base(bf16 KV 计算); 'v_fp8'=正式 V-only(K bf16 + V FP8 GROUP_V);
-        #           'fp8'=full FP8 K/V(negative ablation, 粒度经 fp8_g_*/fp8_k/v 旋钮)
+        if cache is not None:
+            assert cache["k"].shape[1] == k.shape[1], \
+                "K head policy changed while a cache was live"
+            assert cache["v"].shape[1] == v.shape[1], \
+                "V head policy changed while a cache was live"
+        # 模式语义: 'fp16'=base(bf16 KV); 'v_fp8'=正式 V-only;
+        # 'k_int8_v_fp8'=候选(K INT8 + V FP8); 'fp8'=full FP8 negative ablation.
         if fmt == 'v_fp8':
-            k_on, v_on, gk, gv = False, True, GROUP_SIZE, GROUP_V
+            k_quant, v_quant, gk, gv = 'none', 'fp8', GROUP_SIZE, GROUP_V
+        elif fmt == 'k_int8_v_fp8':
+            k_quant, v_quant, gk, gv = 'int8', 'fp8', GROUP_K_INT8, GROUP_V
         elif fmt == 'fp8':
-            k_on, v_on, gk, gv = self.fp8_k, self.fp8_v, self.fp8_g_k, self.fp8_g_v
+            k_quant = 'fp8' if self.fp8_k else 'none'
+            v_quant = 'fp8' if self.fp8_v else 'none'
+            gk, gv = self.fp8_g_k, self.fp8_g_v
         else:
-            k_on = v_on = False
+            k_quant = v_quant = 'none'
             gk = gv = GROUP_SIZE
         qk_cur = qv_cur = ks_cur = vs_cur = None
-        if k_on:
+        if k_quant == 'fp8':
             qk_cur, ks_cur = quantize_kv_fp8(k, gk)
             k_cur16 = dequantize_kv_fp8(qk_cur, ks_cur, x.dtype)
+        elif k_quant == 'int8':
+            qk_cur, ks_cur = quantize_kv_int8(k, gk)
+            k_cur16 = dequantize_kv_int8(qk_cur, ks_cur, x.dtype)
         else:
             k_cur16 = k
-        if v_on:
+        if v_quant == 'fp8':
             qv_cur, vs_cur = quantize_kv_fp8(v, gv)
             v_cur16 = dequantize_kv_fp8(qv_cur, vs_cur, x.dtype)
         else:
@@ -140,10 +198,13 @@ class SelfAttention(nn.Module):
             cache["v"] = v
             k_all, v_all = k, v
         else:
-            # fp8 混合缓存读取: 有 *_scale 键 = fp8 payload(反量化), 否则 = bf16 全长历史
+            # 量化/混合缓存读取: scale 键表示一字节 payload; dtype 区分 INT8/FP8。
             if "k_scale" in cache:
-                k_all = torch.cat([dequantize_kv_fp8(cache["k"], cache["k_scale"],
-                                                     x.dtype), k_cur16], dim=2)
+                if cache["k"].dtype == torch.int8:
+                    k_hist = dequantize_kv_int8(cache["k"], cache["k_scale"], x.dtype)
+                else:
+                    k_hist = dequantize_kv_fp8(cache["k"], cache["k_scale"], x.dtype)
+                k_all = torch.cat([k_hist, k_cur16], dim=2)
             else:
                 k_all = torch.cat([cache["k"], k_cur16], dim=2)
                 cache["k"] = k_all                      # bf16 全长写回
@@ -153,8 +214,10 @@ class SelfAttention(nn.Module):
             else:
                 v_all = torch.cat([cache["v"], v_cur16], dim=2)
                 cache["v"] = v_all
-        k_rep = kv_repeat(k_all, self.heads // self.kv_heads)
-        v_rep = kv_repeat(v_all, self.heads // self.kv_heads)
+        assert self.heads % k_all.shape[1] == 0, (self.heads, k_all.shape[1])
+        assert self.heads % v_all.shape[1] == 0, (self.heads, v_all.shape[1])
+        k_rep = kv_repeat(k_all, self.heads // k_all.shape[1])
+        v_rep = kv_repeat(v_all, self.heads // v_all.shape[1])
         scores = torch.matmul(q, k_rep.transpose(-2, -1)) / (self.head_dim ** 0.5)
         T = k_all.shape[2] if cache is not None else s
         p = T - s
@@ -170,25 +233,25 @@ class SelfAttention(nn.Module):
         out = torch.matmul(attn, v_rep)
         out = out.transpose(1, 2).contiguous().view(b, s, self.heads * self.head_dim)
         if cache is None:
-            if fmt in ('fp8', 'v_fp8'):
+            if fmt in ('fp8', 'v_fp8', 'k_int8_v_fp8'):
                 nc = {"fmt": fmt}
-                if k_on:
+                if k_quant != 'none':
                     nc["k"], nc["k_scale"] = qk_cur, ks_cur
                 else:
                     nc["k"] = k_all                    # bf16(K 不量化)
-                if v_on:
+                if v_quant != 'none':
                     nc["v"], nc["v_scale"] = qv_cur, vs_cur
                 else:
                     nc["v"] = v_all
                 new_cache = nc
             else:
                 new_cache = {"k": k_all, "v": v_all}
-        elif fmt in ('fp8', 'v_fp8'):
-            if k_on:
+        elif fmt in ('fp8', 'v_fp8', 'k_int8_v_fp8'):
+            if k_quant != 'none':
                 cache["k"] = torch.cat([cache["k"], qk_cur], dim=2)
                 cache["k_scale"] = torch.cat([cache["k_scale"], ks_cur], dim=2)
             # else: K 已在读路径按 bf16 全长写回
-            if v_on:
+            if v_quant != 'none':
                 cache["v"] = torch.cat([cache["v"], qv_cur], dim=2)
                 cache["v_scale"] = torch.cat([cache["v_scale"], vs_cur], dim=2)
             new_cache = cache
@@ -263,20 +326,42 @@ class QwenLM(nn.Module):
     def set_kv_format(self, fmt: str) -> None:
         """缓存格式: 'fp16'=base(bf16 KV); 'v_fp8'=正式 Asymmetric V-only
         (K bf16 不量化 + V FP8 E4M3 group=GROUP_V=128, 每 head 1 group);
+        'k_int8_v_fp8'=候选(K INT8 RTN + V FP8, 均 per-token x per-head);
         'fp8'=full FP8 K/V(negative ablation; K/V 粒度可经 set_fp8_groups/matrices 调)。"""
-        assert fmt in ("fp16", "fp8", "v_fp8"), fmt
-        if fmt == "v_fp8":
+        assert fmt in ("fp16", "fp8", "v_fp8", "k_int8_v_fp8"), fmt
+        if fmt in ("v_fp8", "k_int8_v_fp8"):
             assert self.head_dim % GROUP_V == 0, f"head_dim {self.head_dim} % GROUP_V != 0"
+        if fmt == "k_int8_v_fp8":
+            assert self.head_dim % GROUP_K_INT8 == 0, \
+                f"head_dim {self.head_dim} % GROUP_K_INT8 != 0"
         self.kv_format = fmt
         for layer in self.layers:
             a = layer.self_attn
             a.kv_format = fmt
-            if fmt == "v_fp8":
+            if fmt in ("v_fp8", "k_int8_v_fp8"):
                 a.fp8_k, a.fp8_v, a.fp8_g_v = False, True, GROUP_V
             elif fmt == "fp8":
                 a.fp8_k, a.fp8_v = True, True
                 a.fp8_g_k, a.fp8_g_v = GROUP_SIZE, GROUP_SIZE
             # 'fp16': 仅记录格式; fp8 旋钮不影响 base 路径
+
+    def set_kv_head_policy(self, k_heads: int | None = None,
+                           v_heads: int | None = None) -> None:
+        """Set stored K/V head counts for a controlled diagnostic ablation.
+
+        None restores the checkpoint-native count.  Reducing heads applies a
+        deterministic mean merge and changes the pretrained model; such results
+        are screening evidence only unless an explicit training procedure exists.
+        Call only before starting a fresh cache.
+        """
+        native = self.layers[0].self_attn.kv_heads
+        kh = native if k_heads is None else int(k_heads)
+        vh = native if v_heads is None else int(v_heads)
+        assert native % kh == 0 and self.layers[0].self_attn.heads % kh == 0
+        assert native % vh == 0 and self.layers[0].self_attn.heads % vh == 0
+        for layer in self.layers:
+            layer.self_attn.cache_k_heads = kh
+            layer.self_attn.cache_v_heads = vh
 
     def set_fp8_groups(self, k_group: int | None = None, v_group: int | None = None) -> None:
         """诊断开关: K/V 各自 FP8 scale 分组粒度(须整除 head_dim)。默认 None=不动。
