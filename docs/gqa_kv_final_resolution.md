@@ -1,6 +1,6 @@
 # Final resolution: GQA-aware KV compression and fused consumption
 
-Status: **supporting investigation complete; no production-policy change**  
+Status: **supporting investigation complete; optional BF16 Triton backend validated**  
 Date: 2026-09-14
 
 ## 1. Question and scope
@@ -70,7 +70,7 @@ This result proves the mechanism: fused block consumption can remove nearly all
 of the temporary materialization and can accelerate the isolated attention core.
 It does not establish end-to-end model correctness or speedup.
 
-### 3.3 Isolated whole-model trial
+### 3.3 First V-FP8 fused whole-model trial (negative result)
 
 The production `model_self.py` remained unchanged. A runtime-only monkeypatch
 redirected native-head, cached, single-token V-FP8 decode to the Triton block-128
@@ -106,54 +106,113 @@ did not pass:
   autoregressive trajectories diverge, but the large pre-divergence drift is
   independently sufficient to fail the gate.
 
+### 3.4 From-scratch BF16 GQA FlashAttention follow-up
+
+The failed V-FP8 decode kernel established that an attention-core pass is not
+enough. A separate from-scratch BF16 GQA implementation therefore tested full
+causal prefill, cached/chunked prefill, and decode before any engine integration.
+The first one-pass online-softmax version passed random-tensor core thresholds,
+but small per-layer differences accumulated through the model and caused the
+8K greedy trajectory to diverge. Runtime KV strides were also initially marked
+as compile-time constants, causing repeated Triton compilation as cache length
+changed; making those strides runtime arguments removed the 30--47 second
+first-decode anomaly.
+
+The final kernel uses a two-pass, globally normalized design. Pass 1 stores one
+FP32 maximum and denominator per query row. Pass 2 recomputes tiled QK scores,
+normalizes against those global statistics, converts the final probability to
+BF16, and accumulates P @ V. It still never materializes the quadratic score or
+probability matrix and maps 12 query heads directly to 2 native KV heads. The
+extra storage is two FP32 scalars per query row. This is a correctness-focused
+two-pass FlashAttention variant, not a claim of bitwise identity with a
+canonical single-pass FlashAttention implementation.
+
+Against eager attention, the two-pass kernel reduced core relative-L2 error
+from 0.0048--0.0074 to 0.0000--0.000094 across full-prefill, cached-prefill, and
+8K decode cases. A 2K layer-growth diagnostic found maximum same-input local
+attention relative-L2 error 0.000108; later-layer amplification affected logits
+but did not indicate a layer-specific kernel discontinuity.
+
+Whole-model RTX 4060 results used Qwen2.5-1.5B, BF16 KV, chunk 2048, 64 greedy
+decode tokens, and four balanced-order rounds:
+
+| Context | Prefill speedup | Prefill peak allocated change | Decode speedup | Decode peak allocated change | Greedy tokens |
+|---:|---:|---:|---:|---:|---|
+| 2K | 1.567x | 0.0 MiB | 1.076x | -12.3 MiB | 64/64 identical |
+| 4K | 1.834x | -412.0 MiB | 1.244x | -24.6 MiB | 64/64 identical |
+| 8K | 2.299x | -1404.0 MiB | 1.021x | -48.5 MiB | 64/64 identical |
+
+The 2K repeated-text prompt exceeded the deliberately strict 0.02 last-logit
+relative-L2 gate (0.0491) while retaining the same argmax and all 64 generated
+tokens. The 4K and 8K cases passed that strict gate (0.0197 and 0.0159).
+Accordingly, quality was decided by a separately frozen corpus-level gate
+rather than by relaxing the prompt-specific threshold after observing it.
+
+On WikiText-2 windows 40..79 (40 paired non-overlapping windows, 81,880 scored
+tokens per backend, chunk 512), eager BF16 obtained NLL/PPL 2.312986/10.1046 and
+Triton obtained 2.312847/10.1031. Paired delta-NLL was -0.0001392 with SE
+0.0001837; the two-sided 95% equivalence bound was 0.0004992, below the frozen
+0.001 margin. Relative delta-PPL was -0.0139%. The quality gate therefore
+**passed**.
+
+Finally, the production selector itself was smoke-tested at 2K/chunk-512 with
+16 decode tokens: last-logit relative-L2 0.01594, same argmax, identical tokens,
+and `PASS_INTEGRATION_SMOKE`. The un-warmed smoke timing includes first-use JIT
+and is not a steady-state performance result.
+
 ## 4. Final engineering decision
 
-The project will **not integrate the current Triton kernel into the production
-engine**.
+The first V-FP8 fused decode kernel remains a negative result and is not
+integrated. The validated two-pass **BF16** kernel is integrated only as an
+explicit opt-in backend named `triton_bf16_two_pass`. The default remains
+`eager`, so existing CPU, native-Windows, quantized-KV, and formal experiments
+are unchanged. Triton is imported lazily only when the optional backend is
+selected. Unsupported combinations raise a clear error instead of silently
+falling back.
 
-The attention-core result is real, but system-level benefit is modest: 7.36%
-decode-latency reduction and 56.1 MiB lower allocated peak, with no reserved-memory
-or logical-cache reduction. More importantly, the kernel does not preserve the
-current engine's numerical behavior. Matching the eager BF16 score, probability,
-value, and accumulation semantics would require a more complex multi-stage
-kernel and another quality campaign; that effort is disproportionate to the
-observed whole-model gain and is outside the course project's core speculative-
-decoding question.
+The opt-in backend is intentionally restricted to CUDA BF16, head dimension
+128, checkpoint-native GQA heads, and `fmt="fp16"`. It does not fuse FP8 or INT4
+dequantization and must not be described as a result for compressed KV cache.
+This preserves the distinction between two conclusions: representation-level
+V-FP8 remains the default cache policy, while BF16 FlashAttention is a validated
+system-level memory/prefill optimization.
 
 The adopted policy remains:
 
 - default: **K-BF16 + V-FP8 in the validated eager engine**;
+- optional BF16 attention backend: **two-pass Triton GQA FlashAttention**;
 - optional memory-priority ablation: **K-BF16 + packed V-INT4 group-32**;
 - rejected: direct KV-head reduction, both K-INT8 variants, recent-BF16 residual,
-  Python blockwise attention, and the current Triton whole-model integration;
+  Python blockwise attention, and the first V-FP8 Triton whole-model integration;
 - frozen G3 and the formal 3 x 2 x 2 experimental design remain unchanged.
 
 ## 5. Answer to the original question
 
-GQA-aware quantization can reduce logical KV bytes further, and fused blockwise
-consumption can almost eliminate temporary attention allocation. However, among
-the tested methods, **none simultaneously improves whole-model memory, latency,
-and output fidelity enough to replace K-BF16 + V-FP8 as the default**. The
-remaining bottleneck is no longer merely how the cache is encoded; it is the
-interaction between kernel execution, allocator-visible peak memory, and the
-engine's numerical semantics.
+GQA-aware quantization can reduce logical KV bytes further, but none of the
+tested representation changes simultaneously improves quality, latency, and
+whole-model peak memory enough to replace K-BF16 + V-FP8 as the default. The
+first fused V-FP8 attempt also failed behavioral equivalence.
 
-This is a useful negative result rather than an absence of a solution: it closes
-unmotivated head/group sweeps, provides an optional V-INT4 trade-off, validates
-the fused-consumption mechanism, and supplies an evidence-based stopping rule.
+For uncompressed BF16 KV, however, the from-scratch two-pass Triton backend is a
+validated solution: it preserves frozen-window PPL and greedy output, reduces
+8K whole-model prefill peak allocation by 1404 MiB, and accelerates 8K prefill
+by 2.299x. This does not make KV compression unnecessary and does not establish
+a fused compressed-KV kernel; it is a separate, useful system optimization.
 
 ## 6. Project plan after closure
 
-1. Submit and review the existing GQA-aware policy PR without adding Triton code.
-2. Preserve the Triton files and whole-model harness only on the experimental
-   branch for reproducibility.
-3. Do not spend further project time on compatibility-kernel engineering unless
-   the team explicitly changes scope.
+1. Review the GQA-aware representation result and the BF16 FlashAttention result
+   as separate conclusions within this supporting PR.
+2. Keep `eager` as the default; use
+   `model.set_attention_backend("triton_bf16_two_pass")` only for the validated
+   BF16/native-GQA configuration.
+3. Do not claim that the BF16 kernel supports V-FP8 or V-INT4. A fused
+   quantized-KV backend would require a new implementation and validation gate.
 4. Return to the frozen main study: context length x KV representation x decoding
    method on RTX 4060 8GB, with speculative-decoding acceptance, latency,
    throughput, speedup, and peak VRAM as planned outcomes.
-5. In the report, present this investigation as supporting mechanism evidence,
-   not as the main contribution and not as a universal negative claim.
+5. Present this investigation as supporting system evidence rather than changing
+   the project's formal 3 x 2 x 2 design.
 
 ## 7. Evidence provenance
 
@@ -174,3 +233,15 @@ Contained evidence:
 
 Raw logs remain external run artifacts; repository documentation records only
 the reviewed summary and provenance hashes.
+
+The final BF16 FlashAttention evidence archive has SHA-256:
+
+`6c3c5aa1c5f9f57df6a088b6fbcb459bfac618a1d91dd1dfc946a1afc073e6e2`
+
+Key reviewed JSON hashes:
+
+| Artifact | SHA-256 |
+|---|---|
+| `flash_attention_two_pass_core_probe.json` | `9f5d3159d076cc27a7e44f3dd7a6c23eea502c57430358db9ac87cc067c8a62b` |
+| `flash_attention_two_pass_full_trial.json` | `c22c4ed951c071d151dcb1fee6a6f11836a9b1c5442f216c0c1126a98ef7d737` |
+| `flash_attention_two_pass_ppl_gate.json` | `0491d0fb74899fc7cc73db355e515096a54cd590433b828db23e7635f7ceabdf` |

@@ -241,6 +241,9 @@ class SelfAttention(nn.Module):
         self.kv_heads = kv_heads
         self.head_dim = head_dim
         self.kv_format = "fp16" 
+        # The validated Triton path is opt-in.  Keeping eager as the default
+        # preserves CPU/native-Windows support and all existing experiments.
+        self.attention_backend = "eager"
         # 策略旋钮: 'fp8'(full K/V ablation) 时生效; 'v_fp8'(正式) 时 V 固定 GROUP_V
         self.fp8_g_k = GROUP_SIZE
         self.fp8_g_v = GROUP_SIZE
@@ -354,21 +357,47 @@ class SelfAttention(nn.Module):
             v_all = torch.cat([cache["v"], v_cur16], dim=2)
         assert self.heads % k_all.shape[1] == 0, (self.heads, k_all.shape[1])
         assert self.heads % v_all.shape[1] == 0, (self.heads, v_all.shape[1])
-        k_rep = kv_repeat(k_all, self.heads // k_all.shape[1])
-        v_rep = kv_repeat(v_all, self.heads // v_all.shape[1])
-        scores = torch.matmul(q, k_rep.transpose(-2, -1)) / (self.head_dim ** 0.5)
-        T = k_all.shape[2] if cache is not None else s
-        p = T - s
-        if cache is None:
-            mask = torch.triu(torch.ones(s, s, device=x.device, dtype=torch.bool), diagonal=1)
-            scores = scores.masked_fill(mask, float('-inf'))
-        elif s == 1:
-            pass
+        if self.attention_backend == "triton_bf16_two_pass":
+            supported = (
+                fmt == "fp16"
+                and q.is_cuda
+                and q.dtype == torch.bfloat16
+                and self.head_dim == 128
+                and k_all.shape[1] == self.kv_heads
+                and v_all.shape[1] == self.kv_heads
+            )
+            if not supported:
+                raise RuntimeError(
+                    "triton_bf16_two_pass requires CUDA BF16, head_dim=128, "
+                    "fmt='fp16', and checkpoint-native KV heads"
+                )
+            # Lazy import keeps Triton optional for the default eager backend
+            # and for native Windows installations.
+            from .flash_attention_two_pass_triton import (
+                flash_attention_bf16_two_pass,
+            )
+            out = flash_attention_bf16_two_pass(
+                q.contiguous(),
+                k_all.contiguous(),
+                v_all.contiguous(),
+                causal=True,
+            )
         else:
-            mask = torch.triu(torch.ones(s, T, device=x.device, dtype=torch.bool), diagonal=p + 1)
-            scores = scores.masked_fill(mask, float('-inf'))
-        attn = torch.softmax(scores, dim=-1, dtype=torch.float32).to(q.dtype)
-        out = torch.matmul(attn, v_rep)
+            k_rep = kv_repeat(k_all, self.heads // k_all.shape[1])
+            v_rep = kv_repeat(v_all, self.heads // v_all.shape[1])
+            scores = torch.matmul(q, k_rep.transpose(-2, -1)) / (self.head_dim ** 0.5)
+            T = k_all.shape[2] if cache is not None else s
+            p = T - s
+            if cache is None:
+                mask = torch.triu(torch.ones(s, s, device=x.device, dtype=torch.bool), diagonal=1)
+                scores = scores.masked_fill(mask, float('-inf'))
+            elif s == 1:
+                pass
+            else:
+                mask = torch.triu(torch.ones(s, T, device=x.device, dtype=torch.bool), diagonal=p + 1)
+                scores = scores.masked_fill(mask, float('-inf'))
+            attn = torch.softmax(scores, dim=-1, dtype=torch.float32).to(q.dtype)
+            out = torch.matmul(attn, v_rep)
         out = out.transpose(1, 2).contiguous().view(b, s, self.heads * self.head_dim)
         quantized_formats = (
             'fp8', 'v_fp8', 'k_int8_v_fp8', 'v_int4', 'k_pc_int8_v_fp8',
@@ -502,6 +531,22 @@ class QwenLM(nn.Module):
                 a.fp8_k, a.fp8_v = True, True
                 a.fp8_g_k, a.fp8_g_v = GROUP_SIZE, GROUP_SIZE
             # 'fp16': 仅记录格式; fp8 旋钮不影响 base 路径
+
+    def set_attention_backend(self, backend: str = "eager") -> None:
+        """Select the attention implementation for subsequent fresh runs.
+
+        ``triton_bf16_two_pass`` is the validated RTX-4060 inference-only
+        backend.  It intentionally supports only the BF16/native-GQA baseline;
+        quantized KV formats remain on eager attention until a separately
+        validated fused dequantization kernel exists.
+        """
+        if backend not in ("eager", "triton_bf16_two_pass"):
+            raise ValueError(
+                "attention backend must be 'eager' or "
+                "'triton_bf16_two_pass'"
+            )
+        for layer in self.layers:
+            layer.self_attn.attention_backend = backend
 
     def set_kv_head_policy(self, k_heads: int | None = None,
                            v_heads: int | None = None) -> None:

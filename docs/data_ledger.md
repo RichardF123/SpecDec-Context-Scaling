@@ -169,6 +169,28 @@ g64−g32 paired ΔNLL = +0.005145，SE = 0.000968，单侧 95% upper = +0.00679
 
 **决策：保持当前 K-BF16 + V-FP8 为 eager 引擎默认；保留 K-BF16 + packed V-INT4 group32 为显存优先可选模式。** V-INT4 相对当前方案 peak alloc 少 45.2 MiB、逻辑 KV 少 22.75 MiB，reserved 基本不变（+2 MiB）、prefill基本不变（+0.3%），代价为正式 PPL +0.924%（相对当前）及 decode +26.2%。K-INT8 两版均不晋级；V-INT4 group64/group128 经独立尾部验证后也不晋级。后续若要获得更大整机峰值收益，需要 blockwise/fused quantized-KV attention；不再继续 head/group sweep。
 
+### 3.7 From-scratch BF16 GQA FlashAttention（supporting，2026-09-14）
+
+> 范围：这是独立的 BF16 attention 系统优化，不是 V-FP8/V-INT4 的 fused-dequantization 实现，不修改 §3.5 冻结的 G3 KV 表示。环境：NVIDIA GeForce RTX 4060 8GB；PyTorch 2.11.0+cu128；CUDA 12.8；Triton 3.6.0；Qwen2.5-1.5B；12 query heads / 2 native KV heads；head dim 128。
+
+第一版单遍 online-softmax Triton kernel 在随机张量 core gate 上通过，但整模型数值误差逐层累积，8K greedy generation 在第 16 个 token（zero-based index 15）分叉。另发现把 KV runtime strides 标成 `tl.constexpr` 会随 cache length 重复编译；改成 runtime arguments 后 30--47 s 的首次 decode 异常消失。该单遍版不进入生产路径。
+
+最终版采用两遍式全局归一化：pass 1 仅保存每个 query row 的 FP32 max/denominator；pass 2 重算分块 QK，在全局归一化后将 probability 转 BF16 再执行 P@V。全程不物化二次方 score/probability matrix，且直接完成 12Q→2KV 的 GQA 映射。它是 correctness-focused two-pass FlashAttention variant，不宣称与 canonical single-pass FlashAttention 位级相同。
+
+| 验证 | 结果 | 判定 |
+|---|---|---|
+| Core semantics | 单遍 relL2 0.0048--0.0074；两遍 relL2 0--0.000094；full/cached/decode 全 finite | PASS |
+| Layer growth（2K） | 同输入各层 local attention relL2 最大 0.000108；最终 hidden relL2 0.01265；末位 logits relL2 0.04911，argmax 相同 | 无 layer-specific kernel 跳变；记录深层放大 |
+| 2K whole model | prefill 1.567x；peak alloc 变化 0 MiB；decode 1.076x；decode peak -12.3 MiB；64/64 greedy tokens 相同 | 行为 PASS；旧 0.02 prompt-logit 门未过（0.0491） |
+| 4K whole model | prefill 1.834x；prefill peak -412.0 MiB；decode 1.244x；decode peak -24.6 MiB；64/64 tokens 相同；prefill logit relL2 0.01970 | 严格门 PASS |
+| 8K whole model | prefill 1.31 s vs eager 3.02 s（2.299x）；prefill peak 3.855 vs 5.226 GiB（-1404.0 MiB）；decode 1.021x；decode peak -48.5 MiB；64/64 tokens 相同；prefill logit relL2 0.01585 | 严格门 PASS |
+| WikiText-2 frozen PPL | windows 40..79，40×2048，chunk512，81,880 scored tokens/backend；eager NLL/PPL 2.312986/10.1046；Triton 2.312847/10.1031；paired ΔNLL -0.0001392，SE 0.0001837，95% equivalence bound 0.0004992 < margin 0.001；relative ΔPPL -0.0139% | **PPL EQUIVALENCE PASS** |
+| Production selector smoke | 2K/chunk512/decode16；last-logit relL2 0.01594；argmax 相同；16/16 tokens 相同 | **PASS_INTEGRATION_SMOKE** |
+
+工程决策：`model_self.py` 默认仍为 `eager`；仅显式调用 `model.set_attention_backend("triton_bf16_two_pass")` 时启用。该后端只允许 CUDA BF16 + `fmt="fp16"` + native KV heads + head_dim128；不支持的组合明确报错。默认 Windows/CPU/量化KV流程不导入 Triton、不受影响。
+
+最终原始证据包 SHA-256：`6c3c5aa1c5f9f57df6a088b6fbcb459bfac618a1d91dd1dfc946a1afc073e6e2`。原始日志不入源码仓库，正式摘要及 provenance 见 `gqa_kv_final_resolution.md`。
+
 
 
 ## 4. 性能基线（L2 朴素解码，正式协议前的初步数字）
@@ -269,3 +291,4 @@ g64−g32 paired ΔNLL = +0.005145，SE = 0.000968，单侧 95% upper = +0.00679
 - 2026-09-08（日终）：阶段 B 仅文档：`design_freeze_g4_specdec.md` v0.1 DRAFT（k=4/greedy/exact-equivalence/cache 不变式/B3 前置门）；B3–B6 未实现；日报 `daily_report_2026-09-08b_G1G2G3_FP8KV.md` §七 收尾归档。
 
 - 2026-09-14：登记 V-INT4 group64/group128 尾部验证（§3.6.1）；g64 fresh confirmation 未通过，保持 group32，关闭 scale-granularity sweep。
+- 2026-09-14：登记 from-scratch BF16 GQA FlashAttention（§3.7）；单遍版整模型等价失败，最终两遍式版本通过 core、2K/4K/8K greedy、40-window PPL equivalence 及 production-selector smoke；作为显式可选 BF16 后端，默认 eager 和冻结 G3 不变。
