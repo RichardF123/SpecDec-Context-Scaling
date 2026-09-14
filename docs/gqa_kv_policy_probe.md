@@ -161,6 +161,41 @@ to current V-FP8, V-INT4 reduced peak allocated memory by 45.2 MiB and logical
 cache by 22.75 MiB; reserved memory changed by only +2.0 MiB and prefill by
 +0.3%, but decode was 26.2% slower.
 
+### Bounded V-INT4 scale-granularity tail
+
+A final, mechanism-bounded follow-up tested whether V-INT4 scale metadata could
+be reduced by widening the head-dimension group from 32 to 64 or 128.  This was
+kept separate from production code: the harness temporarily selected the group
+only before starting a fresh cache.
+
+Screening on previously unused windows 36..39 produced:
+
+| Policy | Relative dPPL vs current V-FP8 | Logical bytes/token/layer | 8K logical KV | Screen decision |
+|---|---:|---:|---:|---|
+| V-INT4 g32 | +0.741% | 672 B | 147.00 MiB | Reference |
+| V-INT4 g64 | +0.940% | 656 B | 143.50 MiB | Single confirmation candidate |
+| V-INT4 g128 | +1.617% | 648 B | 141.75 MiB | Reject |
+
+Only g64 advanced.  Fresh confirmation used every remaining complete,
+non-overlapping WikiText-2 window, offsets 120..145 (26 windows), and reran BF16,
+current V-FP8, g32, and g64 in the same PyTorch 2.11.0+cu128 / CUDA 12.8
+environment:
+
+| Policy | dNLL vs BF16 | Relative dPPL vs current V-FP8 | Logical 8K KV |
+|---|---:|---:|---:|
+| V-INT4 g32 | +0.008728 | +0.789% | 147.00 MiB |
+| V-INT4 g64 | +0.013873 | +1.309% | 143.50 MiB |
+
+The paired g64-minus-g32 dNLL was +0.005145 (SE 0.000968); its one-sided
+95% upper bound was +0.006799, above the pre-registered 0.002 non-inferiority
+margin.  G64 also exceeded the 1.0% relative-PPL guardrail versus current
+V-FP8.  Therefore g64 failed confirmation, g128 remained rejected, and no 8K
+operational run was justified for either.  Group 32 remains the optional
+memory-priority V-INT4 setting.
+
+Evidence archive SHA-256:
+`82fdcf34ad8d0d23e40d1fff22fa71e7006086fe652a65c81a795a62f699c590`.
+
 ### Final decision
 
 - Keep **K-BF16 + V-FP8** as the default: it remains essentially lossless and

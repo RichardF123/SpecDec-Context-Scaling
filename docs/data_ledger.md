@@ -151,7 +151,23 @@ V-INT4 8K operational（同硬件/协议，3轮交错顺序、中位数）：
 | 当前 V-FP8 | 5.146 / 7.123 GiB | 169.75 MiB | 3.05 / 2.97 s | finite；3轮token一致 |
 | K-BF16 + packed V-INT4 g32 | 5.102 / 7.125 GiB | 147.00 MiB | 3.05 / 3.75 s | finite；3轮token一致 |
 
-**决策：保持当前 K-BF16 + V-FP8 为 eager 引擎默认；保留 K-BF16 + packed V-INT4 group32 为显存优先可选模式。** V-INT4 相对当前方案 peak alloc 少 45.2 MiB、逻辑 KV 少 22.75 MiB，reserved 基本不变（+2 MiB）、prefill基本不变（+0.3%），代价为正式 PPL +0.924%（相对当前）及 decode +26.2%。K-INT8 两版均不晋级。后续若要获得更大整机峰值收益，需要 blockwise/fused quantized-KV attention；不再做无机制依据的 head/group sweep。
+### 3.6.1 V-INT4 scale granularity 尾部验证（supporting，2026-09-14）
+
+> 目的：只回答 group32 的 scale metadata 是否可安全放宽到 group64/128；不修改生产 `model_self.py`，不改变冻结的 G3。环境：同型号 NVIDIA GeForce RTX 4060 8GB；PyTorch 2.11.0+cu128；CUDA 12.8；BF16；所有比较均在同次运行内配对，不与旧环境绝对时间交叉比较。
+
+| 阶段 / 方案 | 质量结果 | KV 逻辑存储 | 决策 |
+|---|---:|---:|---|
+| Screen g32，windows 36..39 | 相对 current ΔPPL +0.741% | 672 B/token/layer；147.00 MiB@8K | 参考 |
+| Screen g64，windows 36..39 | 相对 current ΔPPL +0.940%；相对 g32 ΔNLL +0.001974 | 656 B/token/layer；143.50 MiB@8K | 唯一确认候选 |
+| Screen g128，windows 36..39 | 相对 current ΔPPL +1.617% | 648 B/token/layer；141.75 MiB@8K | 排除 |
+| Fresh confirmation g32，windows 120..145（26窗） | ΔNLL +0.008728；相对 current ΔPPL +0.789% | 672 B/token/layer | 保持 |
+| Fresh confirmation g64，同上 | ΔNLL +0.013873；相对 current ΔPPL +1.309% | 656 B/token/layer | **未通过，排除** |
+
+g64−g32 paired ΔNLL = +0.005145，SE = 0.000968，单侧 95% upper = +0.006799，高于预注册 non-inferiority margin 0.002；同时 g64 相对 current ΔPPL 超过 1.0% 质量门。其理论收益仅为相对 g32 少 3.50 MiB logical KV，因此不再运行 8K operational。结论：**V-INT4 group32 保持显存优先可选设置；group64/group128 均排除，scale-granularity 尾部关闭。**
+
+原始证据包 SHA-256：`82fdcf34ad8d0d23e40d1fff22fa71e7006086fe652a65c81a795a62f699c590`。
+
+**决策：保持当前 K-BF16 + V-FP8 为 eager 引擎默认；保留 K-BF16 + packed V-INT4 group32 为显存优先可选模式。** V-INT4 相对当前方案 peak alloc 少 45.2 MiB、逻辑 KV 少 22.75 MiB，reserved 基本不变（+2 MiB）、prefill基本不变（+0.3%），代价为正式 PPL +0.924%（相对当前）及 decode +26.2%。K-INT8 两版均不晋级；V-INT4 group64/group128 经独立尾部验证后也不晋级。后续若要获得更大整机峰值收益，需要 blockwise/fused quantized-KV attention；不再继续 head/group sweep。
 
 
 
@@ -251,3 +267,5 @@ V-INT4 8K operational（同硬件/协议，3轮交错顺序、中位数）：
 - 2026-09-08（归档）：全流程日报 `daily_report_2026-09-08b_G1G2G3_FP8KV.md`；pilot 归因数据入 §3.5.4（`fp8_kv_group_probe`）；v_fp8 正式实现与测试入口就绪（`fp8_vonly_v1_roundtrip` / `fp8_vonly_8k_operational`）。
 - 2026-09-08（会话续，A4）：**V-only V1 实测 PASS**（fp8_vonly_v1_roundtrip [1]–[7] 全 True，含 current==stored 断言）→ **G3: PASS / FROZEN**（正式 = Asymmetric V-only FP8 KV；negative = K-FP8/full-FP8）。G4 尚未开始。
 - 2026-09-08（日终）：阶段 B 仅文档：`design_freeze_g4_specdec.md` v0.1 DRAFT（k=4/greedy/exact-equivalence/cache 不变式/B3 前置门）；B3–B6 未实现；日报 `daily_report_2026-09-08b_G1G2G3_FP8KV.md` §七 收尾归档。
+
+- 2026-09-14：登记 V-INT4 group64/group128 尾部验证（§3.6.1）；g64 fresh confirmation 未通过，保持 group32，关闭 scale-granularity sweep。
