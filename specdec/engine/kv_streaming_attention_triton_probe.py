@@ -309,33 +309,55 @@ def triton_vfp8_attention(
     return output
 
 
-def benchmark(function):
+def measure_latency(function):
+    """Measure steady-state call latency with the CUDA allocator warmed.
+
+    ``empty_cache`` must not appear in this loop: forcing fresh CUDA allocations
+    disproportionately penalizes the eager path, whose defining behavior is to
+    materialize much larger temporary tensors.
+    """
     for _ in range(WARMUP):
         output = function()
         del output
     torch.cuda.synchronize()
 
     latency_ms = []
-    peak_extra_mib = []
     for _ in range(REPETITIONS):
-        gc.collect()
-        torch.cuda.empty_cache()
         torch.cuda.synchronize()
-        floor = torch.cuda.memory_allocated()
-        torch.cuda.reset_peak_memory_stats()
         started = time.perf_counter()
         output = function()
         torch.cuda.synchronize()
         latency_ms.append((time.perf_counter() - started) * 1000.0)
-        peak = torch.cuda.max_memory_allocated()
-        peak_extra_mib.append((peak - floor) / 2**20)
         del output
+
+    return latency_ms
+
+
+def measure_peak_extra_mib(function):
+    """Measure peak allocated bytes in a separate clean-allocation run."""
+    gc.collect()
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize()
+    floor = torch.cuda.memory_allocated()
+    torch.cuda.reset_peak_memory_stats()
+    output = function()
+    torch.cuda.synchronize()
+    peak = torch.cuda.max_memory_allocated()
+    del output
+    return (peak - floor) / 2**20
+
+
+def benchmark(function):
+    latency_ms = measure_latency(function)
+    peak_extra_mib = measure_peak_extra_mib(function)
 
     return {
         "median_latency_ms": statistics.median(latency_ms),
         "latency_ms": latency_ms,
-        "median_peak_extra_mib": statistics.median(peak_extra_mib),
-        "peak_extra_mib": peak_extra_mib,
+        "median_peak_extra_mib": peak_extra_mib,
+        "peak_extra_mib": [peak_extra_mib],
+        "latency_method": "steady_state_allocator_warm_no_empty_cache_in_timing",
+        "memory_method": "separate_clean_allocation_peak",
     }
 
 
