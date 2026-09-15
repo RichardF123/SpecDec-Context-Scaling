@@ -1,78 +1,89 @@
-# G4 —— Fixed-chain Greedy SpecDec 设计冻结（DRAFT v0.1，2026-09-08，会话续）
+# G4 —— Fixed-chain Greedy SpecDec 设计冻结（DRAFT v0.2，2026-09-08 会话续）
 
-> 状态：**DRAFT，待实现前逐项批准**。范围：只做 **correctness**（exact greedy equivalence）；
-> 不运行 2K/4K/8K 正式矩阵、不宣称加速、不做 CUDA kernel/sampling/beam/INT 量化/改 k。
-> 本文件是 plan（意图/协议）；实测数据进 `data_ledger.md`。
+> 状态：**DRAFT v0.2**（Part-2 审查修正：取消 bonus、明确 logits 对齐规则、缓存/回滚/OOM 语义）。
+> 范围：只做 **correctness**（exact greedy equivalence）；不运行正式矩阵、不宣称加速、不做
+> kernel/sampling/beam/INT 量化/改 k/新模型。批准后 v1.0；批准前不实现主循环。
 
 ## 1. 冻结参数（第一版）
 | 项 | 值 |
 |---|---|
-| target | Qwen/Qwen2.5-1.5B-Instruct（engine OURS，bf16 GPU 计算）|
-| draft | Qwen/Qwen2.5-0.5B-Instruct（engine OURS，同词表 151936）|
-| proposal length | **k = 4**（by design，同 v7.1 冻结，本轮不变）|
-| decoding | greedy（temperature 0；argmax；无采样接受规则）|
+| target | Qwen/Qwen2.5-1.5B-Instruct（engine OURS，BF16 GPU 计算）|
+| draft | Qwen/Qwen2.5-0.5B-Instruct（engine OURS）|
+| proposal length | **k = 4（固定）**；**第一版无 bonus token**（全接受时本轮产出恰好 k 个，下一轮重新提议）|
+| decoding | greedy（argmax；无采样接受规则）|
 | batch | 1 |
-| KV 条件 | base/bf16（K/V bf16）与 v_fp8（K bf16 + V FP8 E4M3 gs128，G3 正式方案）|
-| 判定 | **SpecDec 输出 token ids 与 target-only greedy ids 完全一致（exact equality）** |
+| KV 条件 | `base_bf16`（K/V BF16）与 `v_fp8`（K BF16 + V FP8 E4M3 gs128）——同一份 SpecDec 逻辑，KV 条件仅作参数 |
+| 判定 | SpecDec ids == target-only greedy ids（exact equality；不只比较解码文本）|
 
-## 2. correctness 语义（单轮数据流）
-1. draft 从当前 prefix（其 cache 长度 = 已处理真实 token 数）自回归贪心提议至多 k 个 token；
-   - 遇 EOS 停提议；剩余预算 < k 时按实际剩余数；
-2. target 对 prefix+proposals 一次性前向 → 每位置 argmax = target-greedy；
-3. 逐位比较：接受**连续相等前缀**；首个不一致处取 target token；
-4. 全部相等：draft 同轮再提议 1 个（bonus 位置），target 验证 k+1 位；全同→接受 k+1
-   （含 bonus），否则接受 k 个 + bonus 位 target token；此后才进入下一轮新提议；
-5. EOS：若 target 确认位置含 EOS → 停生成（生成长度按冻结协议记录）；draft 提议内 EOS
-   不自动终止整轮，仍交给 target 验证（同 v7.1 §4.3 语义，实现前再与 target-only 对拍确认）。
+## 2. 输入一致性与词表（前置事实，测试须验证）
+- 0.5B draft 与 1.5B target 使用**同一个 tokenizer**：词表/特殊 token/raw-text 编码完全一致（两者都是 Qwen2.5，151936 词表）；
+- chat template / BOS / EOS / raw prompt 处理在两条生成路径（target-only 与 SpecDec）中**逐位一致**：以同一 tokenizer 默认策略编码同一 prompt，不额外加/去 BOS；
+- 因此 draft 的提议 token、target 的验证 token 都来自同一 id 空间，接受比较是**同 id 比较**。
 
-## 3. cache 不变式（本协议核心）
-- **cache 长度 ≡ 该模型已处理的"真实" token 数**（真实 = 已被 target 确认并加入输出的 token）。
-- 每轮结束时：
-  - target cache 长度 = 旧长 + (接受数 m) + (m<k ? 1 替换位 : bonus 位确认 ? 1 : 1)
-    —— 即 target 只保留"已验证为真实"的位置；mismatch 之后的假 draft 位置一律裁剪。
-  - draft cache 长度 = 旧长 + m（只含被接受的 draft token；替换/bonus token 由 target
-    产出，draft 未处理 → 下一轮 draft 第一步先消化该 token 再提议）。
-- 裁剪必须**沿 token 维 dim=2 一致**作用于该 cache 的全部张量：
-  - base：`k`、`v`（bf16）
-  - v_fp8：`k`（bf16）、`v`（fp8 payload）、`v_scale`（fp32）
-- 原因：注意力每步用 cache 做完整历史 K/V；若 cache 多含"从未确认的 token"，后续
-  softmax 会向它们分配概率 → 破坏与 target-only 的等价性（不止是性能问题，是正确性）。
-- 本轮不做 cache 克隆做"分支生成"；全接受路径用 bonus 规则直接推进，无分叉需回溯。
+## 3. correctness 语义与 logits 对齐（v0.2 修正后；off-by-one 必须按此实现与测试）
+设本轮开始时 prefix 已处理 L 个真实 token。
 
-## 4. cache API（实现目标；独立模块 `specdec/engine/spec_cache.py` 或等价，不入 model_self）
-- `cache_length(cache) -> int`：读 `cache[0]["k"].shape[2]`（base/v_fp8 通用）。
-- `trim_cache(cache, new_len) -> cache`：对每层、每张量 `t = t[:, :, :new_len]`
-  （v_scale 同样 dim=2）；`new_len < 0` 或 `> 当前` 抛错/钳制（越界保护）；
-  `None` cache 返回 None。
-- 独立测试覆盖：None/空、正常 trim、trim 到当前长度、v_fp8 的 v_scale 同步、
-  越界保护。
+1. **进入本轮前保存** target 最后位置的 logits：`target_next_logits`（预测 prefix 之后下一个 token，用于验证 d1）。
+2. draft 自回归提出至多 k=4 个 token：`d=[d1..dk']`（k'=min(k, budget)；draft cache 相应推进；遇 EOS 停提议）。
+3. target 对 `prefix + d` 做**一次 block forward**，得到 block logits 行 `b_0..b_{k'-1}`——**第 i 行预测"输入 d_i 之后"的下一 token**。
+4. **验证对齐（防 off-by-one）**：验证列表 = `[saved_target_next_logits, b_0, ..., b_{k'-2}]`：
+   - 第 j 个 logits（j=1..k'）判定 d_j → saved 判 d1，b_0 判 d2，…，b_{k'-2} 判 d_{k'}；
+   - 各 logits 的 argmax 构成 target-greedy 序列 `g1..gk'`。
+   - **红线：b_{k'-1} 不参与判定**（它预测 d_{k'} 之后，判 d_{k'} 会错位）。
+5. **接受/替换**：m = g 与 d 连续相等前缀长（0≤m≤k'）；
+   - m<k'：接受 d1..dm；输出 g_{m+1}（target token，本轮真实产出 m+1 个）；
+   - m=k'（全接受）：**第一版无 bonus**，本轮输出 k' 个（=d，已验证 g==d），结束本轮，下一轮重新提议。
+6. **EOS**：被输出/接受的 token 为 EOS → 输出后终止（记录生成长度）；draft 提议遇 EOS 停提议（k'<k）。
+7. **budget**：剩余 `max_new_tokens` 小于 k → k' = 剩余数。
+8. `b_{k'-1}` 仅当 m=k' 时才有意义（"继续下一个 token 的分布"）；第一版不消费它（无 bonus），下一轮用新提议覆盖。
 
-## 5. greedy SpecDec 主循环（独立模块，如 `specdec/engine/spec_dec.py`）
-每轮按 §2 走 1–5；记录并报告（behavioral，不作 correctness 判定）：
-proposed tokens、accepted draft tokens、acceptance rate、target verification rounds、
-rollback count（=mismatch/裁剪发生次数）、all-accepted rounds、mismatch rounds。
+## 4. cache 不变式与回滚（target/draft 各自维护）
+- **不变式：cache 长度 ≡ 该模型已处理的"真实" token 数**。
+- target：block forward 处理到 L+k'；真实产出段长度 = m+1（m<k'）或 k'（m=k'）；其 K/V 与 block 前段一致 → target cache **保留到 L+m+1 或 L+k'**；被拒尾部（m+1..k' 的假 draft）沿 dim=2 裁掉。
+- draft：真实前缀只到 L+m；替换位 g_{m+1} 由 target 产出 → draft cache **裁到 L+m**，下一轮先消化 g_{m+1}。
+- 裁剪作用于该 cache **全部 token 张量、同一 dim=2**：base_bf16 → `k`,`v`；v_fp8 → `k`,`v`,`v_scale`；三者 token 维任何时刻必须相等，否则判 bug。
+- 真实 token 永不被丢（长度单调不减）；rollback = 回到真实段。
+- m=0：target 保留 L+1，draft 仍 L。
 
-## 6. Correctness gate 测试（B6）
-- prompts：普通英文 / 数学 / 代码 / 短 prompt / 含 EOS 边界 / `max_new_tokens < k` /
-  多轮 mismatch 型文本；
-- 条件：base KV 与 v_fp8 KV 各跑；
-- 判据：`SpecDec ids == target-only greedy ids` **exact equality**；同时报告 §5 行为指标。
-- 说明：acceptance rate 只解释行为与（未来）速度，不参与 correctness。
+## 5. cache API（独立模块 `specdec/engine/spec_cache.py`，不并入 model_self）
+- `cache_length(cache)` → `cache[0]["k"].shape[2]`（两 KV 通用）。
+- `trim_cache(cache, new_len)`：每层每张量 `t[:, :, :new_len]`（v_scale 同 dim=2）；越界（new_len<0 或 >当前）抛 ValueError（不静默钳制，测试断言抛错）；None → None。
+- 独立测试（B4）覆盖：append 长度、trim 到 L、trim 1/多 token、trim 到 0（越界）、mismatch 第 1..4 位、base 与 v_fp8 都能 trim、v_scale 同步、token 维不一致即 fail。
 
-## 7. 前置门（实现前先做，未通过则停止并报 blocker）
-**B3 dual-model 8GB 最小可行性**（同机 RTX 4060 Laptop 8GB）：
-- target(1.5B) 与 draft(0.5B) 能否同时加载（bf16）；
-- 短 prompt 各自前向 OK；
-- base KV 与 v_fp8 KV 各自 decode 无 OOM；记录 peak allocated/reserved；
-- 若双模型放不下 → 停 G4 实现、报实际数字 blocker；**不**私自引入权重量化改协议。
+## 6. greedy SpecDec 主循环（独立模块 `specdec/engine/spec_dec.py`）
+每轮按 §3.1–§3.8；记录（behavioral）：proposed、accepted、target block calls、draft calls、mismatch 轮、全接受轮、rollback 次数。复用 OURS engine 双实例（target/draft）与 §5 cache API；不做无关重构。
 
-## 8. 范围排除（本轮禁止）
-3×2×2 正式性能矩阵 / "SpecDec 加速"宣称 / CUDA kernel / sampling/beam / 修改 k /
-INT8/INT4 权重量化 / 跨机器(4090D vs 4060)数据混合 / 概率式接受。
+## 7. 资源/OOM 纪律
+- 双模型实例创建后 `try/finally` 清理：异常路径 `del` 模型 + `torch.cuda.empty_cache()`；
+- 实现前先过 **B3 dual-model 8GB 可行性**（实测，不作理论断言）；放不下 → 停 G4 实现并报 blocker，不加权重量化改协议。
 
-## 9. 批准栏
-- [ ] 我审阅并理解 §1–§8 —— 批准为 v1.0（冻结）
-- [ ] 修改意见：＿＿＿＿＿＿＿＿
+## 8. 验证顺序与门槛
+- **G4-0**：0.5B draft correctness（full vs HF bf16 / cached vs full / greedy 生成一致 / finite / 权重 strict）——失败先定位，不进双模型。
+- **B3**：双模型 8GB 可行性（base 与 v_fp8、短+8K、decode smoke、峰值、3 轮稳定）。
+- **B4**：cache 操作测试（§5）。
+- **B5**：最小 greedy SpecDec（§6）。
+- **B6**：correctness gate——prompts：自然语言/数学/代码/短/长/全接受/首位拒绝/中途拒绝/EOS/非 4 倍数长度；条件 base_bf16 与 v_fp8；判据 exact ids equality + 全 finite + 多次确定性一致。**B6 未过禁止 acceptance 测量/pilot/final。**
+- （通过后的小规模预实验属 Part 4，先不启动。）
+
+### 8.1 G4-0 登记（2026-09-08，由 g4_0_drift_diag / g4_block_vs_serial 实测归因）
+**G4-0: CONDITIONAL PASS — BF16 shape drift characterized**
+- ENGINE BUG: no（OURS full == HF full、OURS cached == HF cached，max|Δ|=0 on tested cases）
+- NONDETERMINISM: no（所有路径重复运行确定一致）
+- 0.5B OURS full vs HF full: exact on tested cases；cached vs HF cached: exact on tested cases
+- BF16 cached vs full-recompute: 在 top-1/top-2 接近处可能改变 argmax（失败样本: "...history of artificial
+  intelligence..." 生成第 8 token cached=' for' / full=' since'）
+- FP32 control: cached/full equality restored
+- Target block-vs-serial probe: 被测验证位置 argmax 全一致、cache 终长一致、未发现 off-by-one；
+  **但 block-built 与 serial-built cache 数值不完全相同（max|Δ| 最高 ~2.0）** → 多轮仍可能因 BF16
+  cache 数值漂移翻 token ⇒ **B6 exact-token-id 门不可取消，且为 B6 保留风险**；不得写成"B6 已无风险"。
+- 原始失败数据保留于 ledger（不删除）。
+
+## 9. 范围排除（本轮禁止）
+正式 12-condition 矩阵 / "SpecDec 加速"宣称 / CUDA kernel / sampling/beam / 动态 k 或改 k / INT 权重量化 / K-FP8 / 跨机器数据混合 / bonus-token 状态（第一版）。
+
+## 10. 批准栏
+- [ ] 我审阅并理解 §1–§9 —— 批准 v0.2 为 v1.0（冻结）
+- [ ] 修改意见：＿＿＿＿＿＿
 
 ---
-*变更记录：v0.1（DRAFT，2026-09-08）：初稿（B1 讲解 + B2 冻结）。*
+*变更记录：v0.1（DRAFT，2026-09-08）：初稿（含 bonus）。v0.2（DRAFT，2026-09-08）：Part-2 审查修正——取消 bonus；明确 logits 对齐/off-by-one（saved target_next_logits 判 d1；验证列表 [saved, b_0..b_{k'-2}]；b_{k'-1} 不判定）；输入/template 一致性；cache trim/rollback 精确语义；越界抛错；OOM finally 清理；base 与 v_fp8 共用同一 SpecDec 逻辑。*

@@ -184,6 +184,30 @@ pilot NLL（4 窗；base 2.4118 / PPL 11.15；det=True 全部）：
 > **方法学教训（写进报告）**：首次跑出 6.83/7.62/7.63 GiB 的"峰值漂移"实为**测量伪影**——上一 run 的末块 logits（2048×151936×fp16 ≈ 0.62 GiB）跨 `empty_cache/reset_peak_memory_stats` 仍被变量引用而未释放；`del last_logits, cache` 后 3/3 稳定 6.83 GiB。峰值测量必须防跨 run 存留引用。
 > **另注**：`g2_peak_probe.py` 显示 torch reserved 池峰值 8.71 GiB > 物理 8 GiB（Windows WDDM 允许超订），nvidia-smi 实际占用峰值 ~7.70 GiB——无 OOM、无分页悬崖（时长稳定）；正式基准峰值列以 torch alloc 记 + smi used 参考。
 
+### 4.5.2 B3 双模型 8GB 可行性（G4，2026-09-08，`g4_b3_dual_model_feasibility.py`）
+条件：target=Qwen2.5-1.5B + draft=Qwen2.5-0.5B **同时常驻**，BF16 CUDA eager，batch=1；
+target KV ∈ {base_bf16, v_fp8}，draft 恒 base BF16；ctx ∈ {512, 8192}（chunked 2048）；3 轮稳定，decode smoke 5 tok。
+| 阶段/项 | 数值 | 备注 |
+|---|---|---|
+| 双模型权重常驻 | 加载后 free=2.00 GiB，smi used=5.76 GiB | target 后 free 0.81 GiB → draft 后 2.00 GiB |
+| ctx512 base_bf16 | alloc 4.34（3/3 同），resv 4.58，无 OOM，finite，smoke 稳定 | PASS |
+| ctx512 v_fp8 | alloc 4.336（3/3），resv 4.58，无 OOM，finite，smoke 稳定 | PASS（vs base −0.003 GiB 实测差）|
+| ctx8192 base_bf16 | alloc 6.16（3/3 同），resv 8.92，无 OOM，finite，smoke 稳定 | PASS（resv>8 GiB 物理：WDDM 池超订, 未 OOM）|
+| ctx8192 v_fp8 | alloc 6.16（3/3 同），resv 8.92，无 OOM，finite，smoke 稳定 | PASS（alloc 峰值与 base 相同——峰值被瞬态主导, 不宣称峰值收益；KV 逻辑差 54 MiB 见 §3.5.3）|
+| prefill 墙钟（参考, 非性能）| 512 ~0.1s；8192 tgt 8.2–8.5s / dft 8.5s | 可行性参考 |
+| decode smoke 5 tok | tgt ~0.2–0.8s；dft ~0.1–0.5s | 首 token tgt/dft 一致（512:' spans many de'; 8192:' of artificial'）|
+| 结论 | **B3: PASS（4/4 条件）**——双模型 8K 同驻可运行；不做跨实验显存比较（≠G2 fp16 单模型、≠G3 单模型 paired）| — |
+
+### 4.5.3 B4 cache 操作（G4，2026-09-08，`g4_b4_cache_tests.py` + 用户实现 `spec_cache.py`）
+| 项 | 结果 | 条件 |
+|---|---|---|
+| base_bf16（0.5B）| len=32 → append 35；trim→L0+1 / L0 正确；`raises=3/3`（超长/负数/0）；幂等；原 cache 不变 → **全 True** | 真 prefill(chunk16)+append+trim |
+| v_fp8（1.5B target）| len=32 → append 35；`v_scale-sync=True`；`raises=3/3`；`orig-unchanged=True` → **全 True** | 同上；`v_fp8` 为 target 专属（需 head_dim%128==0）|
+| 一致性守卫 | 人为裁短某层 `v` → `check_consistent` 抛 RuntimeError ✓ | — |
+| 结论 | **B4: PASS**（两模式，分进程运行以避免显存累积）| — |
+> 契约要点（按实现校正）：`trim_cache` 对**所有张量**沿 dim=2 裁（`v_scale` 同步）、返回浅拷贝不改入参、`new_len<=0` 或超长抛 `ValueError`、`trim_cache(None,0) is None`。
+> 环境经验：harness 的 `from_pretrained` 必须**本地优先**（`local_files_only=True`），否则 tokenizer 联网列模板会因网络抖动抛 `httpx.RemoteProtocolError`（曾被误判为"驱动静默杀进程"）。
+
 ## 5. 复现设置（每次记录必须带上）
 - seed=42（测试）；性能脚本 seed=0，3 reps 取最优 + warmup；
 - prompt 固定（bench_basic.PROMPT，38 tok）；decode 数 64；
@@ -223,3 +247,7 @@ pilot NLL（4 窗；base 2.4118 / PPL 11.15；det=True 全部）：
 - 2026-09-08（归档）：全流程日报 `daily_report_2026-09-08b_G1G2G3_FP8KV.md`；pilot 归因数据入 §3.5.4（`fp8_kv_group_probe`）；v_fp8 正式实现与测试入口就绪（`fp8_vonly_v1_roundtrip` / `fp8_vonly_8k_operational`）。
 - 2026-09-08（会话续，A4）：**V-only V1 实测 PASS**（fp8_vonly_v1_roundtrip [1]–[7] 全 True，含 current==stored 断言）→ **G3: PASS / FROZEN**（正式 = Asymmetric V-only FP8 KV；negative = K-FP8/full-FP8）。G4 尚未开始。
 - 2026-09-08（日终）：阶段 B 仅文档：`design_freeze_g4_specdec.md` v0.1 DRAFT（k=4/greedy/exact-equivalence/cache 不变式/B3 前置门）；B3–B6 未实现；日报 `daily_report_2026-09-08b_G1G2G3_FP8KV.md` §七 收尾归档。
+- 2026-09-08（协议修订 + G4 设计审查）：`plan_v7_1_protocol_freeze.md` 增 **Amendment v7.2（§0）**：Compute=BF16；KV 因子={base_bf16, v_fp8}；质量参考=uncompressed BF16；Δ 相对 base_bf16；AR/SpecDec 同档比较；full/K-FP8 仅 negative ablation 不入 factorial；正式=12 conditions（历史"18 格"=旧 bookkeeping）；带宽归因改"反量化开销>省内存潜在收益、未独立隔离带宽、不作更强归因"。`design_freeze_g4_specdec.md` → **v0.2**（取消 bonus；logits 对齐规则 [saved, b_0..b_{k'-2}] 判 d1..d_k'，b_{k'-1} 不判；输入/template 一致；trim/rollback 精确语义；越界抛错；OOM finally；base/v_fp8 共用逻辑）。新增 **G4-0 harness**（`g4_0_draft_correctness.py`，0.5B bf16 门槛，编译通过，**尚未 GPU 运行**）。
+- 2026-09-08（G4-0 归因，已实测）：**CONDITIONAL PASS — BF16 shape drift characterized**。OURS full==HF full（max|Δ|=0）、OURS cached==HF cached（=0）；HF cached/full 同处分歧；所有路径重复确定；FP32 四路径一致 → 非 ENGINE BUG/NONDETERMINISM。block-vs-serial：被测 argmax 一致、cache 终长一致、无 off-by-one；block/serial cache 数值差 max|Δ|≈2.0 → **B6 exact-id 门保留为风险**。失败样本（cached=' for' vs full=' since', 生成第 8 步）保留。新增诊断 harness `g4_0_drift_diag.py`、`g4_block_vs_serial.py`（已实现，GPU 运行结果已用于归因）；G4-0 全量生成 exact-id 等价仍由 B6 把关（未做）。B3 harness `g4_b3_dual_model_feasibility.py` 就绪待跑。
+- 2026-09-08（B3 实测）：**B3: PASS（4/4 条件）**——1.5B+0.5B 双模型同驻 BF16，ctx512/8192 × target-KV base_bf16/v_fp8 全部 prefill+decode smoke 无 OOM、finite、3 轮稳定；详见 §4.5.2。v_fp8 与 base 的 alloc 峰值在双模型 8K 下相同（6.16 GiB），不宣称峰值收益。
+- **日期更正 + 2026-09-15 登记**：§4.5.2（B3）与 §4.5.3（B4）实际运行于 **2026-09-15**（早前标签沿用会话内 09-08，特此更正，数据不变）。同日：协议 Amendment v7.2 写入 `plan_v7_1_protocol_freeze.md`；G4 设计文档升 v0.2（取消 bonus / logits 对齐规则 / cache 回滚语义）；G4-0 归因登记为 **CONDITIONAL PASS（BF16 shape drift）**；`spec_cache.py` 由用户实现并**通过 B4**；`spec_dec.py` 已建文件但**尚未实现**（B5/B6 harness 已就绪：`g4_b5_smoke.py` / `g4_b6_correctness.py`）。日报见 `daily_report_2026-09-15.md`。
