@@ -29,12 +29,11 @@ def check_rounds(trace) -> bool:
     ok = True
     for d in trace:
         pre, m, Kp = d["pre"], d["m"], d["Kp"]
-        exp_tgt = pre + (m + 1 if m < Kp else Kp)
-        exp_drf = pre + m
-        good = (d["tgt_len"] == exp_tgt and d["drf_len"] == exp_drf)
+        exp = pre + (m + 1 if m < Kp else Kp)
+        good = (d["tgt_len"] == exp and d["drf_len"] == exp)
         ok &= good
         print(f"  round{d['round']:2d}: Kp={Kp} m={m} pre={pre} "
-              f"tgt {d['tgt_len']}(exp {exp_tgt}) drf {d['drf_len']}(exp {exp_drf}) "
+              f"tgt {d['tgt_len']}(exp {exp}) drf {d['drf_len']}(exp {exp}) "
               f"{'ok' if good else 'MISMATCH'}")
     return ok
 
