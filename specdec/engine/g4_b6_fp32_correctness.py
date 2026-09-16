@@ -170,11 +170,17 @@ def main() -> int:
     ok &= (len(tiers) == 2)
     if len(tiers) != 2:
         print(f"NOTE: 只跑了 {len(tiers)}/2 个 KV 档 -> 不得判 PASS", flush=True)
+    ok &= (len(cases) == len(CASES))
+    if len(cases) != len(CASES):
+        print(f"NOTE: 只跑了 {len(cases)}/{len(CASES)} 个 case (B6F_LIMIT 小样)"
+              f" -> 不得判 PASS", flush=True)
 
     del tgt, drf
     gc.collect()
     print(f"\nB6-fp32: {'PASS' if ok else 'CHECK'} "
           f"(tiers={len(tiers)}/2, cases={len(cases)}/{len(CASES)}, k={K}, exact token-id)")
+    if not ok and len(cases) != len(CASES):
+        print("  (小样跑只用于验证环境/耗时; 正式判定必须跑全量 case)", flush=True)
     return 0 if ok else 1
 
 
