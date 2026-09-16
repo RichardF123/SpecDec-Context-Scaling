@@ -212,7 +212,7 @@ target KV ∈ {base_bf16, v_fp8}，draft 恒 base BF16；ctx ∈ {512, 8192}（c
 | 项 | 结果 | 条件 |
 |---|---|---|
 | 辅助函数单测 | **T1–T4 全 PASS** | T1 `_fmt`；T2 `_prefill`；T3 `_propose`（契约 `(cands, cache, lg)`）；T4 `_verify` 对齐：两条**独立** prefill，比较 `rows[j]` vs `serial[j]`（同一 row 索引），max\|Δ\| 0.12–0.30 |
-| 主循环 smoke | **PASS（真实投机发生）** | stats: rounds 8 / proposed 27 / accepted 11 / mismatch 5 / all_accept 3 / rollbacks 5 / target_block_calls 6 / draft_calls 27；重复运行一致 |
+| 主循环 smoke | **PASS（真实投机发生）** | stats: rounds 8 / proposed 27 / accepted 11 / mismatch 5 / all_accept 3 / rollbacks 5；`target_block_calls` 与 rounds 恒等（每轮恰好 1 次块前向）⇒ 8；`draft_calls` 与 proposed 恒等（每候选 1 次前向）⇒ 27；重复运行一致 |
 | cache 不变量 | 每轮 `tgt_len == drf_len == pre + (m+1 if m<Kp else Kp)` 全成立 | 覆盖 m=0 / m=1 / m=4 与 Kp=1/2/4 |
 | 结论 | **B5: PASS** | — |
 > **vacuity 教训（已修）**：主循环曾把 logits 保持为 `(1,V)` 且 `_propose` 用 `lg[0,-1]` 取到标量 → argmax 恒 0 → 候选恒为 token 0 → 接受率 0/58 的"空过 PASS"。现统一 logits 合同为 `(1,1,V)`（`_step` 返回 `lg[:, -1:]`），并在 B6 加 vacuity guard（`accepted==0` 时 verdict 降为 CHECK）。
