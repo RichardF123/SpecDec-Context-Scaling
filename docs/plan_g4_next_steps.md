@@ -16,8 +16,9 @@
 - 环境经验：harness 的 `from_pretrained` 必须**本地优先**（`local_files_only=True`），
   否则 tokenizer 联网列模板会因网络抖动抛 `httpx.RemoteProtocolError`（曾被误判为"驱动静默杀进程"）。
 
-## Phase 2 — B5：最小 greedy SpecDec 主循环（✅ 完成）
+## Phase 2 — B5：最小 greedy SpecDec 主循环（✅ 完成，修后已 GPU 复验）
 - **状态**：`spec_dec.py` 已实现，`g4_b5_helper_tests.py` T1–T4 全 PASS；`g4_b5_smoke.py` PASS（真实投机：rounds 8 / proposed 27 / accepted 11 / mismatch 5 / all_accept 3；cache 不变量 `tgt_len==drf_len==pre+(m+1 or Kp)` 全成立；重复运行一致）→ **B5: PASS**（详见 ledger §4.5.4）。
+- **修后复验（2026-09-15）**：EOS 修复（`f7097d4`）之后重跑 helper + smoke → **两档全 PASS**，逐轮 cache 账全 `ok`；`target_block_calls 8`、`draft_calls 27` 实测确认；新登记恒等式 `gen_len == accepted + mismatch_rounds`。**B5 记录已对应当前代码。**
 - 修正记录：vacuity bug（logits 合同 `(1,V)`→`(1,1,V)`，曾致接受率 0/58 的"空过 PASS"）；错配分支改为 `trim(pre+m)` + 替换 token **单步重算**（两个模型都做），废弃"复用 block 位置 L+m+1"的旧指导。
 - **风险**：off-by-one（用 `b_{k-1}` 误判第 k 个 proposal）；draft 漏裁替换位之前的位置；全接受写成 k+1（bonus 已取消）。
 

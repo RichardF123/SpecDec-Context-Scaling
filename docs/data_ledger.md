@@ -211,10 +211,18 @@ target KV ∈ {base_bf16, v_fp8}，draft 恒 base BF16；ctx ∈ {512, 8192}（c
 ### 4.5.4 B5 SpecDec 最小 greedy 主循环（G4，`g4_b5_helper_tests.py` + `g4_b5_smoke.py`，实现 `spec_dec.py`）
 | 项 | 结果 | 条件 |
 |---|---|---|
-| 辅助函数单测 | **T1–T4 全 PASS** | T1 `_fmt`；T2 `_prefill`；T3 `_propose`（契约 `(cands, cache, lg)`）；T4 `_verify` 对齐：两条**独立** prefill，比较 `rows[j]` vs `serial[j]`（同一 row 索引），max\|Δ\| 0.12–0.30 |
-| 主循环 smoke | **PASS（真实投机发生）** | stats: rounds 8 / proposed 27 / accepted 11 / mismatch 5 / all_accept 3 / rollbacks 5；`target_block_calls` 与 rounds 恒等（每轮恰好 1 次块前向）⇒ 8；`draft_calls` 与 proposed 恒等（每候选 1 次前向）⇒ 27；重复运行一致 |
+| 辅助函数单测 | **T1–T4 全 PASS** | T1 `_fmt`=True；T2 `_prefill`：shape `(1,5,151936)` finite、cache_len 5(exp 5)、**vs-forward max\|Δ\| = 0.000e+00**；T3 `_propose`：`cands == ref`（`[' Paris', '.', ' It', ' is']`）；T4 `_verify` 对齐：两条**独立** prefill 比较 `rows[j]` vs `serial[j]`（同一 row 索引），argmax-same `[True×4]`、block cache 9(exp 9)、same-context max\|Δ\| `[2.5e-01, 2.2e-01, 1.2e-01, 3.0e-01]` |
+| 主循环 smoke | **PASS（真实投机发生）** | stats（**实测**）：rounds 8 / proposed 27 / accepted 11 / mismatch 5 / all_accept 3 / rollbacks 5 / **`target_block_calls` 8（= rounds）** / **`draft_calls` 27（= proposed）**；`fields-complete=True sane=True gen_len=16`；重复运行一致 |
 | cache 不变量 | 每轮 `tgt_len == drf_len == pre + (m+1 if m<Kp else Kp)` 全成立 | 覆盖 m=0 / m=1 / m=4 与 Kp=1/2/4 |
-| 结论 | **B5: PASS** | — |
+| **修后 GPU 复验**（2026-09-15，EOS 修复 `f7097d4` 之后） | **PASS（两档，逐轮 trace 全 `ok`）** | 见下"逐轮 cache 账"；两档 trace 与 stats **完全相同**（V-FP8 未改变任何决策，与 §4.5.6 一致）|
+| **结构性恒等式**（新登记） | `gen_len == accepted + mismatch_rounds`（16 = 11 + 5） | 每个错配轮恰好贡献 1 个 target token、每个全接受轮贡献 `kp`（= 已计入 accepted）⇒ 可作为 G5 落盘的自动校验式 |
+| 结论 | **B5: PASS**（修后复验有效） | 改动仅 EOS 分支 |
+
+> **逐轮 cache 账（修后实测，两档相同）**：
+> `round0 Kp=4 m=1 pre=12→14` ｜ `round1 Kp=4 m=0 pre=14→15` ｜ `round2 Kp=4 m=0 pre=15→16` ｜
+> `round3 Kp=4 m=1 pre=16→18` ｜ `round4 Kp=4 m=4 pre=18→22` ｜ `round5 Kp=4 m=4 pre=22→26` ｜
+> `round6 Kp=2 m=0 pre=26→27` ｜ `round7 Kp=1 m=1 pre=27→28`
+> —— 错配轮 `tgt=drf=pre+m+1`（0/1/2/3/6/7），全接受轮 `=pre+kp`（4/5）；`k_eff = min(4, 预算)` 的递减在 round6(Kp=2)/round7(Kp=1) 可见；给定 `max_new_tokens=16` 恰好产出 16。
 > **vacuity 教训（已修）**：主循环曾把 logits 保持为 `(1,V)` 且 `_propose` 用 `lg[0,-1]` 取到标量 → argmax 恒 0 → 候选恒为 token 0 → 接受率 0/58 的"空过 PASS"。现统一 logits 合同为 `(1,1,V)`（`_step` 返回 `lg[:, -1:]`），并在 B6 加 vacuity guard（`accepted==0` 时 verdict 降为 CHECK）。
 > 设计校正（v0.3）：错配分支**不得**复用 block 位置 `L+m+1` 的 logits（那里是**被拒 draft token** 的 K/V）；正确做法是 `trim_cache(tgt, pre+m)` 后对替换 token 做**一次单 token 前向**重算，两个模型都要做。
 >
@@ -331,3 +339,4 @@ target KV ∈ {base_bf16, v_fp8}，draft 恒 base BF16；ctx ∈ {512, 8192}（c
 - 2026-09-15（B5/B6 实测）：**B5: PASS**（T1–T4 单测 + 真实投机 smoke；cache 不变量全成立；修掉 `(1,V)`→`(1,1,V)` 造成的 0/58 空过 PASS）；**B6: CHECK（19/20）**——base_bf16 档 9/10、v_fp8 档 10/10，唯一分歧 `natural-2` @7 经 `g4_b6_tie_diag.py` 归因为**bf16 数值不可判定位置**（signal 0.1491 ≤ noise 0.1491；fp32 真值 = spec 侧 token）；**用户裁决 A = 严格口径：不设例外、不放宽门，B6 记 CHECK**。同日修正 `spec_dec._verify` 的 `device="cuda"` 硬编码；详见 §4.5.4 / §4.5.5。
 - 2026-09-15（EOS 分支修复 + B6-fp32 预登记）：逐行评审 `spec_dec.py` 发现并修复 **EOS 全接受路径的 `trim_cache` 越界**（`_propose` 的 EOS break 位置 → draft cache 长度 `pre+kp-1`），改为"EOS 检查在推进之后"使不变量统一为 `pre+kp`；新增**纯逻辑回归测试** `g4_b5_eos_branch_tests.py`（CPU stub，含旧实现对照复现 ValueError，B5-EOS-branch: PASS，详见 §4.5.4）。同时新增并**预登记** `g4_b6_fp32_correctness.py`（B6-fp32：CPU/float32 下的实现正确性门；判据在运行前入库，仅当 case×两 KV 档全部逐 token 相等才 PASS），结果待跑。
 - 2026-09-15（B6-fp32 实测）：**B6-fp32: PASS** —— 10 case × 2 KV 档 = **20/20 组合逐 token id 全等**（参照 = 同引擎 cached AR），finite 全真、确定性通过、非空过（总 **216/348**，62.1%），两档逐 case 数字相同；运行于 EOS 修复之后，且修前小样数字逐字复现。**B6 门按两档并列登记：fp32 档 = 实现正确性证据；bf16 档 = 性能档行为 CHECK 19/20 + tie-collapse 归因（§4.5.5 原样保留）**。新增 RQ2 观察：bf16 档接受率 50.9% vs fp32 档 62.1%，且**接受率强依赖 prompt**（29.0%–100%）；差值属复合效应，单独归因需 tie 频率普查。详见 §4.5.6。
+- 2026-09-15（B5 修后 GPU 复验）：`g4_b5_helper_tests` + `g4_b5_smoke` 在 EOS 修复（`f7097d4`）**之后**重跑 → **两档全 PASS**，逐轮 cache 账全 `ok`；`target_block_calls 8`、`draft_calls 27` 由实测确认为推导值；新登记结构性恒等式 `gen_len == accepted + mismatch_rounds`。B5 的 PASS 记录现已对应当前代码（§4.5.4）。

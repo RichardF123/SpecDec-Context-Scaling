@@ -13,6 +13,7 @@
 |---|---|---|
 | **B5 辅助函数单测** | **PASS** | `g4_b5_helper_tests.py` T1 `_fmt` / T2 `_prefill` / T3 `_propose` / T4 `_verify` 对齐；T4 用两条**独立** prefill 比较 `rows[j]` vs `serial[j]`，max\|Δ\| 0.12–0.30 |
 | **B5 主循环 smoke** | **PASS（真实投机）** | rounds 8 / proposed 27 / accepted 11 / mismatch 5 / all_accept 3；每轮不变量 `tgt_len == drf_len == pre + (m+1 if m<Kp else Kp)` 全成立（覆盖 m=0/1/4、Kp=1/2/4）；重复运行一致。`target_block_calls` 与 rounds 恒等（每轮 1 次块前向）⇒ 8；`draft_calls` 与 proposed 恒等（每候选 1 次前向）⇒ 27 |
+| **B5 修后 GPU 复验** | **PASS（两档）** | EOS 修复（`f7097d4`）之后重跑 `g4_b5_helper_tests` + `g4_b5_smoke`：两档逐轮 trace 全 `ok`，stats 与修前一致；`target_block_calls` **8**、`draft_calls` **27** 由推导变**实测**；新登记结构性恒等式 **`gen_len == accepted + mismatch_rounds`**（16 = 11 + 5）⇒ B5 记录已对应当前代码 |
 | **B6-bf16** | **CHECK 19/20** | `g4_b6_correctness.py`：base_bf16 9/10、v_fp8 10/10；总 accepted/proposed = **194/381**；唯一分歧 `natural-2` @7。**用户裁决 A = 严格口径：不设平局例外、不放宽 exact-id 门、不替换参照**（→ §4.5.5） |
 | **tie-collapse 归因** | 完成 | `g4_b6_tie_diag.py`（同 prefix=ids+ref[:7]，len=14）：bf16 三路径（full / cached / AR-history）argmax **全 = `' use'`**，两候选**精确并列** 22.8750（`tied_at_max=2`）；fp32 三路径 **全 = `' convert'`**，gap **+0.1491**。`signal(0.1491) ≤ noise(0.1491)` ⇒ 该位置在 bf16 下**数值不可判定**；`spec[7]` 恰等于 fp32 真值。形状噪声实测：full-vs-cached 0.250、hist-vs-full 0.281（≈2–4 ULP，1 ULP=0.125）|
 | **B6-fp32 预登记** | 完成 | `g4_b6_fp32_correctness.py`：判据在**运行前**入库（`3f7fe6f` 预登记 + `9aa6b00` 补漏：小样跑不得判 PASS）；明确"被测对象是实现，dtype 不是被测对象" |
@@ -79,7 +80,7 @@
 
 ## 七、下一步（顺序）
 
-1. **B5 在 EOS 修复后的 GPU 复验**（`g4_b5_helper_tests` + `g4_b5_smoke`）——保持 B5 登记对应当前代码；
+1. ~~B5 在 EOS 修复后的 GPU 复验~~ **✅ 已完成**（本日，两档 PASS，见 §二）；
 2. **≥16 prompt families（2K⊂4K⊂8K）+ 版本化 manifest**（AI 起草、用户定稿）；
 3. **G5 instrumentation**（`results.jsonl` schema / config hash / resume）；
 4. **Part 4 测量 harness（含 AR 基线同档）+ 单次成本标定** → 据此定 final 规模；
@@ -87,4 +88,4 @@
 
 ## 八、提交状态
 
-本日两批提交（均含在 `main`）：`647eed1`（core: spec_dec B5 PASS）、`e448ab3`（B6 CHECK 与归因登记）、`3f7fe6f`（B6-fp32 预登记）、`9aa6b00`（预登记判据补漏）、`f7097d4`（EOS 修复 + 回归测试）、`56c87de`（B6-fp32 PASS 登记）。工作树干净，`main == origin/main`。
+本日提交（均含在 `main`）：`647eed1`（core: spec_dec B5 PASS）、`e448ab3`（B6 CHECK 与归因登记）、`3f7fe6f`（B6-fp32 预登记）、`9aa6b00`（预登记判据补漏）、`f7097d4`（EOS 修复 + 回归测试）、`56c87de`（B6-fp32 PASS 登记）、`5ea72a5`（本日报 + README 刷新）、`9f0c...`（B5 修后复验登记）。工作树干净，`main == origin/main`。

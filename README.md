@@ -16,7 +16,7 @@
 - ✅ **G4-0 — draft 正确性**：**CONDITIONAL PASS（BF16 shape drift 已表征）**——OURS full==HF full、OURS cached==HF cached；HF 自身 full/cached 亦同处分歧；FP32 恢复一致 ⇒ 非引擎 bug、非不确定性。block-vs-serial 被测 argmax 一致、cache 终长一致、**无 off-by-one**；但 cache 数值差 max\|Δ\|≈2.0 → exact-id 门保留为风险；
 - ✅ **G4-B3 — 双模型 8GB 可行性**：**PASS 4/4**（1.5B+0.5B 同驻 bf16；ctx512 alloc 4.34/4.336 GiB；ctx8192 alloc 6.16 GiB、resv 8.92 GiB；无 OOM、finite、3 轮稳定）；
 - ✅ **G4-B4 — cache 操作 API**：**PASS**（用户实现 `spec_cache.py`：`cache_length` / `trim_cache` / `check_consistent`；base 与 v_fp8 两档全 True）；
-- ✅ **G4-B5 — greedy SpecDec 主循环**：**PASS**（用户实现 `spec_dec.py`；T1–T4 单测 + 真实投机 smoke：rounds 8 / proposed 27 / accepted 11 / mismatch 5 / all_accept 3；每轮不变量 `tgt_len==drf_len==pre+(m+1 or Kp)` 全成立）；
+- ✅ **G4-B5 — greedy SpecDec 主循环**：**PASS**（用户实现 `spec_dec.py`；T1–T4 单测 + 真实投机 smoke：rounds 8 / proposed 27 / accepted 11 / mismatch 5 / all_accept 3；每轮不变量 `tgt_len==drf_len==pre+(m+1 or Kp)` 全成立；`target_block_calls` 8、`draft_calls` 27 实测）。**EOS 修复后已 GPU 复验**（两档逐轮 trace 全 `ok`，B5 记录对应当前代码）；另登记结构性恒等式 `gen_len == accepted + mismatch_rounds`；
 - ✅ **G4-B6 — correctness gate（两档并列登记）**：
   - **B6-fp32 = 实现正确性证据 → PASS**：10 case × 2 KV 档 = **20/20 组合逐 token id 全等**（CPU/float32，参照 = 同引擎 cached AR；总 216/348；finite、确定性、非空过、case 与档位跑满）。判据在运行前入库；"dtype 不是被测对象"已明确；
   - **B6-bf16 = 性能档行为 → CHECK 19/20**：唯一分歧 `natural-2@7` 经实测归因为 **bf16 数值不可判定位置**（候选对精确并列 22.8750；signal 0.1491 ≤ noise 0.1491），fp32 真值 = spec 侧 token。**严格口径：不设例外、不放宽 exact-id 门**，该记录原样保留并作为已知数值限制披露；
