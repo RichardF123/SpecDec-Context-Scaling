@@ -43,15 +43,19 @@ def target_ref(tgt, ids, n, eos):
 
 
 def divergence_diag(tgt, tok, ids, gen, ref, idx):
-    """在首个分歧前缀处打印 target 的 top-1/top-2 与 margin。"""
+    """在首个分歧前缀处打印 target 的 argmax(决策) 与 top-1/top-2 margin。
+    注意: 决策路径用 argmax; 并列时 topk 的返回顺序不等于 argmax(取最小 index)。"""
     prefix = torch.cat([ids, torch.tensor([gen[:idx]], device=ids.device)], dim=1)
     with torch.inference_mode():
         lg, _ = tgt._run(tgt.embed_tokens(prefix), None, need_logits=True)
-    v, i = lg[0, -1].topk(2)
-    print(f"    diag @prefix_len={prefix.shape[1]}: target top1={tok.decode([int(i[0])])!r}"
-          f"({v[0]:.3f}) top2={tok.decode([int(i[1])])!r}({v[1]:.3f}) "
-          f"margin={float(v[0]-v[1]):.3f} | spec picked "
-          f"{tok.decode([gen[idx]])!r} (ref {tok.decode([ref[idx]])!r})")
+    row = lg[0, -1]
+    am = int(row.argmax())
+    v, i = row.topk(2)
+    tied = int((row == row.max()).sum())
+    print(f"    diag @prefix_len={prefix.shape[1]}: argmax={tok.decode([am])!r} "
+          f"tied_at_max={tied} | top1={tok.decode([int(i[0])])!r}({v[0]:.3f}) "
+          f"top2={tok.decode([int(i[1])])!r}({v[1]:.3f}) margin={float(v[0]-v[1]):.3f} "
+          f"| spec picked {tok.decode([gen[idx]])!r} (ref {tok.decode([ref[idx]])!r})")
 
 
 def main() -> int:
@@ -109,11 +113,20 @@ def main() -> int:
             ok &= (a == b)
 
     print("\n== summary ==")
+    tot_acc = tot_prop = 0
     for kv, label, n, lg_, lr, same, acc, prop in rows:
+        tot_acc += acc or 0
+        tot_prop += prop or 0
         print(f"  {kv:9s} {label:10s} n={n:2d} gen={lg_:2d} ref={lr:2d} equal={same} "
               f"acc={acc}/{prop}")
     print(f"logits finite (all cases): {finite_ok}")
+    print(f"total accepted/proposed = {tot_acc}/{tot_prop}")
     ok &= finite_ok
+    vacuous = (tot_prop > 0 and tot_acc == 0)
+    if vacuous:
+        print("WARNING: vacuous — 没有任何候选被接受, 等价性未被真正检验 "
+              "(需先修 draft/align 后再判 B6)", flush=True)
+    ok &= (not vacuous)
 
     del tgt, drf
     gc.collect()

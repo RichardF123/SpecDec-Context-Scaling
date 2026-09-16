@@ -1,6 +1,6 @@
-# G4 —— Fixed-chain Greedy SpecDec 设计冻结（DRAFT v0.2，2026-09-08 会话续）
+# G4 —— Fixed-chain Greedy SpecDec 设计冻结（DRAFT v0.3，2026-09-15）
 
-> 状态：**DRAFT v0.2**（Part-2 审查修正：取消 bonus、明确 logits 对齐规则、缓存/回滚/OOM 语义）。
+> 状态：**DRAFT v0.3**（v0.2 基础上修正"替换位需单步重算"的回滚语义，见 §3.1）。
 > 范围：只做 **correctness**（exact greedy equivalence）；不运行正式矩阵、不宣称加速、不做
 > kernel/sampling/beam/INT 量化/改 k/新模型。批准后 v1.0；批准前不实现主循环。
 
@@ -31,19 +31,31 @@
    - 各 logits 的 argmax 构成 target-greedy 序列 `g1..gk'`。
    - **红线：b_{k'-1} 不参与判定**（它预测 d_{k'} 之后，判 d_{k'} 会错位）。
 5. **接受/替换**：m = g 与 d 连续相等前缀长（0≤m≤k'）；
-   - m<k'：接受 d1..dm；输出 g_{m+1}（target token，本轮真实产出 m+1 个）；
+   - m<k'：接受 d1..dm；替换 token `r = g_{m+1}`（target token，本轮真实产出 m+1 个）；
+     **替换位必须由 target 单步重算**（见 §4 修正）：block 里位置 m+1 的 K/V 是"被拒 draft token"的，
+     不能当作 r 的 K/V。
    - m=k'（全接受）：**第一版无 bonus**，本轮输出 k' 个（=d，已验证 g==d），结束本轮，下一轮重新提议。
 6. **EOS**：被输出/接受的 token 为 EOS → 输出后终止（记录生成长度）；draft 提议遇 EOS 停提议（k'<k）。
 7. **budget**：剩余 `max_new_tokens` 小于 k → k' = 剩余数。
 8. `b_{k'-1}` 仅当 m=k' 时才有意义（"继续下一个 token 的分布"）；第一版不消费它（无 bonus），下一轮用新提议覆盖。
 
-## 4. cache 不变式与回滚（target/draft 各自维护）
-- **不变式：cache 长度 ≡ 该模型已处理的"真实" token 数**。
-- target：block forward 处理到 L+k'；真实产出段长度 = m+1（m<k'）或 k'（m=k'）；其 K/V 与 block 前段一致 → target cache **保留到 L+m+1 或 L+k'**；被拒尾部（m+1..k' 的假 draft）沿 dim=2 裁掉。
-- draft：真实前缀只到 L+m；替换位 g_{m+1} 由 target 产出 → draft cache **裁到 L+m**，下一轮先消化 g_{m+1}。
-- 裁剪作用于该 cache **全部 token 张量、同一 dim=2**：base_bf16 → `k`,`v`；v_fp8 → `k`,`v`,`v_scale`；三者 token 维任何时刻必须相等，否则判 bug。
+### 3.1 替换位单步修正（v0.3，2026-09-15；修正 v0.2 的指导错误）
+- **问题**：block forward 的输入是 `[d1..dk']`，故 target cache 位置 `L+j` 存的是 `d_j`（draft 猜的 token）的 K/V。
+  若 `m<k'`，位置 `L+m+1` 存的是**被拒的 draft token** 的 K/V —— 直接保留到 `L+m+1` 会让这一格内容错配，
+  且 `b_m`（输入是被拒 token）预测的是"被拒 token 之后"，不能当下一轮的 `saved_next`。
+- **正确做法**（m<k'）：target `trim` 到 `L+m` → **单步前向吃替换 token r** → 该步同时(a)写入 r 的正确 K/V、
+  (b) 把长度推进到 `L+m+1`、(c) 产出"r 之后"的 logits 作为下一轮 `saved_next`。
+  draft 对称：`trim` 到 `L+m` → 单步吃 r（上下文与真实前缀一致，下一轮可直接提议）。
+- **每轮代价**：有拒绝轮 = 1 次 block + 1 次 target 单步 + k' 步 draft + 1 步 draft；全接受轮 = 1 次 block + k' 步 draft。
+
+## 4. cache 不变式与回滚（修正后）
+- **不变式：cache 长度 ≡ 该模型已处理的"真实" token 数**；每轮结束时 **target 长度 == draft 长度 ==**
+  `L + (m+1 if m<k' else k')`。
+- target：`m<k'` → `trim(tgt_blk, L+m)` + 单步吃 r（→ `L+m+1`）；`m==k'` → 保留 block 结果（`L+k'`，全是真实 token）。
+- draft：`m<k'` → `trim(drf, L+m)` + 单步吃 r（→ `L+m+1`）；`m==k'` → `trim(drf, L+k')`（= block 提议后长度，无操作）。
+- 裁剪作用于该 cache **全部 token 张量、同一 dim=2**：base_bf16 → `k`,`v`；v_fp8 → `k`,`v`,`v_scale`；任何时刻必须相等，否则判 bug。
 - 真实 token 永不被丢（长度单调不减）；rollback = 回到真实段。
-- m=0：target 保留 L+1，draft 仍 L。
+- `m=0`：target 裁到 `L` 后单步吃 r → `L+1`；draft 同样 `L` → `L+1`。
 
 ## 5. cache API（独立模块 `specdec/engine/spec_cache.py`，不并入 model_self）
 - `cache_length(cache)` → `cache[0]["k"].shape[2]`（两 KV 通用）。
@@ -86,4 +98,4 @@
 - [ ] 修改意见：＿＿＿＿＿＿
 
 ---
-*变更记录：v0.1（DRAFT，2026-09-08）：初稿（含 bonus）。v0.2（DRAFT，2026-09-08）：Part-2 审查修正——取消 bonus；明确 logits 对齐/off-by-one（saved target_next_logits 判 d1；验证列表 [saved, b_0..b_{k'-2}]；b_{k'-1} 不判定）；输入/template 一致性；cache trim/rollback 精确语义；越界抛错；OOM finally 清理；base 与 v_fp8 共用同一 SpecDec 逻辑。*
+*变更记录：v0.1（DRAFT，2026-09-08）：初稿（含 bonus）。v0.2（DRAFT，2026-09-08）：Part-2 审查修正——取消 bonus；明确 logits 对齐/off-by-one（saved target_next_logits 判 d1；验证列表 [saved, b_0..b_{k'-2}]；b_{k'-1} 不判定）；输入/template 一致性；cache trim/rollback 精确语义；越界抛错；OOM finally 清理；base 与 v_fp8 共用同一 SpecDec 逻辑。**v0.3（2026-09-15）：修正替换位回滚语义**——`m<k'` 时 target 必须 `trim` 到 `L+m` 再**单步重算替换 token r**（block 位置 L+m+1 的 K/V 属被拒 draft token，不能复用）；draft 对称裁到 `L+m` 后单步吃 r；每轮结束 **target 长度 == draft 长度 == L+(m+1 或 k')**。此修正替代 v0.2 中"保留到 L+m+1、saved_next=b_m"的写法。*

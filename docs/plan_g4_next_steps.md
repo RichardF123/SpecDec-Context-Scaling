@@ -16,22 +16,19 @@
 - 环境经验：harness 的 `from_pretrained` 必须**本地优先**（`local_files_only=True`），
   否则 tokenizer 联网列模板会因网络抖动抛 `httpx.RemoteProtocolError`（曾被误判为"驱动静默杀进程"）。
 
-## Phase 2 — B5：最小 greedy SpecDec 主循环（进行中：等你实现 `spec_dec.py`）
-- 测试已就绪：`g4_b5_smoke.py`（结构不变量+确定性）、`g4_b6_correctness.py`（exact-token-id 门）。
-- **目标**：fixed k=4、无 bonus、greedy；严格按 v0.2 §3 的 logits 对齐与 §4 的 cache 回滚语义。
-- **交付**：`specdec/engine/spec_dec.py`（用户）；AI 提供规格 + 评审 + 状态字段约定。
-- **通过标准（实现自检）**：m<k 与 m=k 两分支 cache 长度分别为 `pre+m+1` / `pre+k`；`check_consistent` 不报错；EOS/budget<k 符合协议。
+## Phase 2 — B5：最小 greedy SpecDec 主循环（✅ 完成）
+- **状态**：`spec_dec.py` 已实现，`g4_b5_helper_tests.py` T1–T4 全 PASS；`g4_b5_smoke.py` PASS（真实投机：rounds 8 / proposed 27 / accepted 11 / mismatch 5 / all_accept 3；cache 不变量 `tgt_len==drf_len==pre+(m+1 or Kp)` 全成立；重复运行一致）→ **B5: PASS**（详见 ledger §4.5.4）。
+- 修正记录：vacuity bug（logits 合同 `(1,V)`→`(1,1,V)`，曾致接受率 0/58 的"空过 PASS"）；错配分支改为 `trim(pre+m)` + 替换 token **单步重算**（两个模型都做），废弃"复用 block 位置 L+m+1"的旧指导。
 - **风险**：off-by-one（用 `b_{k-1}` 误判第 k 个 proposal）；draft 漏裁替换位之前的位置；全接受写成 k+1（bonus 已取消）。
 
-## Phase 3 — B6：correctness gate（AI 写测试 + 双方判定）
-- **目标**：SpecDec ids == target-only greedy ids（exact；不只比文本），base_bf16 与 v_fp8 两档；全 finite、重复确定。
-- **覆盖 prompts**：自然语言 / 数学 / 代码 / 短 / 长 / 全接受 / 首位拒绝 / 中途拒绝 / EOS / 生成长度非 4 倍数。
-- **交付**：`g4_b6_correctness.py`（AI）。
-- **通过标准**：全部 case 逐 token 全等 + finite + ≥2 次运行一致。**未过禁止测 acceptance/pilot/final。**
-- **估算**：测试编写 1–2h；运行 10–20 分钟。**依赖**：Phase 2。
-- **已知风险（必须保留）**：BF16 block-built 与 serial-built cache 数值差 ≈2.0 → 多轮累积可能翻 token；若出现不一致，先做 margin 诊断，区分 near-tie 与真实 bug，**不得改 baseline 或放宽门**。
+## Phase 3 — B6：correctness gate（⚠️ CHECK 19/20，用户裁决 A = 严格口径）
+- **状态**：`g4_b6_correctness.py` 实测 **19/20** —— base_bf16 档 9/10、v_fp8 档 10/10；唯一分歧 `natural-2` @7。
+- **归因（已实测，`g4_b6_tie_diag.py`）**：该位置 bf16 下候选对**精确并列**（22.8750 / 22.8750，gap 0）三路径 argmax 一致取 `' use'`；fp32 三路径一致给出真值 `' convert'`（gap **+0.1491**）。`signal(0.1491) ≤ noise(0.1491)` ⇒ **bf16 数值不可判定位置**；`spec[7]=' convert'` 恰为 fp32 真值。
+- **裁决（用户，2026-09-15）**：**A = 严格** —— 不设"平局例外"、不放宽 exact-id 门、不替换参照 ⇒ **B6 记 CHECK，不转 PASS**；该位置作为已知数值限制写入报告，并在 Method/Limitations 说明"接受判据 = argmax 相等性检验，其可靠性上限 = bf16 gap 符号可靠性"。
+- **后果（开放项）**：协议"B6 未过禁止测 acceptance/pilot/final"与"不得提出主循环性能声明"仍生效。Part 4 若启动，只能作为**工程观测**（标注"未通过正确性门"），不得作为已验证结论 —— 需用户明确同意后再做。
+- **保留风险**：BF16 block-built 与 serial-built cache 数值差（实测 max\|Δ\| 0.250–0.281 ≈2–4 ULP）> 部分位置的真实 gap → 多轮累积仍可能翻 token。
 
-## Phase 4 — Part 4：小规模测量（B6 通过后）
+## Phase 4 — Part 4：小规模测量（**被 Phase 3 门禁阻断**）
 - **目标**：少量 prompt 的预实验（非正式矩阵）：acceptance=accepted/proposed、每轮接受长度分布、target block calls、draft token calls、decode-only 与 e2e 延迟、tokens/s、peak alloc/reserved、base 与 v_fp8 差异。
 - **纪律**：含 CUDA sync、warm-up、≥3 次重复、报中位数与离散；**不只报最好一次**；不宣称加速（先出数）。
 - **交付**：`g4_part4_pilot_measure.py`（AI）。
