@@ -88,4 +88,4 @@
 
 ## 八、提交状态
 
-本日提交（均含在 `main`）：`647eed1`（core: spec_dec B5 PASS）、`e448ab3`（B6 CHECK 与归因登记）、`3f7fe6f`（B6-fp32 预登记）、`9aa6b00`（预登记判据补漏）、`f7097d4`（EOS 修复 + 回归测试）、`56c87de`（B6-fp32 PASS 登记）、`5ea72a5`（本日报 + README 刷新）、`9f0c...`（B5 修后复验登记）。工作树干净，`main == origin/main`。
+本日提交（均在 `main`，`git log` 为准）：`647eed1`（core: spec_dec B5 PASS）、`e448ab3`（B6 CHECK 与归因登记）、`3f7fe6f`（B6-fp32 预登记）、`9aa6b00`（预登记判据补漏）、`f7097d4`（EOS 修复 + 回归测试）、`56c87de`（B6-fp32 PASS 登记）、`5ea72a5`（本日报 + README 刷新）、`11a913c`（B5 修后复验登记）。工作树干净，`main == origin/main`。
