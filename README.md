@@ -94,6 +94,11 @@ python -m specdec.engine.g4_b6_tie_diag                 # 分歧位置的 signal
 
 `g4_b6_fp32_correctness` 支持 `set B6F_LIMIT=N` 跑小样（仅验证环境/耗时；**小样永远不会打印 PASS**）。设 `set HF_HUB_OFFLINE=1` 可避免 tokenizer 联网抖动。
 
+## 讲解文档（投机解码）
+
+- 📄 **`docs/pdf/specdec_speculative_decoding_explained.pdf`**（19 页）— **投机解码：原理、代码与实现细节**。八节：①原理（为什么 decode 慢、凭什么省、为什么 greedy 下输出不变）②一次生成的全景数据流（含真实轮次演算与 8 轮真实 trace）③逐行讲 `spec_dec.py`（每个输入/输出张量的形状/dtype/含义，每个 PyTorch 操作在算什么）④引擎侧 cache 与 FP8 量化算子逐行 ⑤逐行讲 `spec_cache.py` 与契约 ⑥正确性证据（两档门 + "差一个 token"案例的完整归因 + 三个真实 bug）⑦常见误解 Q&A ⑧速查表（形状/不变量/统计字段/命令）。
+- 源文件 `docs/specdec_explained.md`（可 diff、可评审）；重新生成：`python scripts/generate_specdec_explained_pdf.py`（需要 `reportlab`，见 `requirements-local.txt`）。
+
 ## 文档
 
 - `docs/plan_v7_1_protocol_freeze.md` — 实验协议冻结（v7.1 + §0 **Amendment v7.2**：Compute=BF16、KV 因子、12 conditions）
@@ -103,6 +108,7 @@ python -m specdec.engine.g4_b6_tie_diag                 # 分歧位置的 signal
 - `docs/design_freeze_fp8_kv.md` — FP8 KV 设计冻结（v1.0→v1.3）
 - `docs/design_freeze_g4_specdec.md` — G4 投机解码协议（v0.3：logits 对齐、回滚语义、`_propose` 出口不变量、EOS 规则）
 - `docs/design_g4_cache_api.md` — cache 接口契约；`docs/plan_g4_next_steps.md` — G4 七阶段规划与状态
+- `docs/specdec_explained.md` + `docs/pdf/specdec_speculative_decoding_explained.pdf` — 投机解码原理/代码/实现细节讲解（19 页）
 - `docs/daily_report_2026-09-15b_G4_B5B6_EOSfix.md` — 本日日报（B5/B6/EOS 修复）
 - `docs/daily_report_2026-09-15.md`、`docs/daily_report_2026-09-08b_G1G2G3_FP8KV.md` — 阶段归档日报
 - `docs/stage_report_l1_l2.md`、`docs/L1_code_teaching.md`、`docs/debug_lesson_alignment.md` — 阶段与教学文档
