@@ -248,6 +248,43 @@ target KV ∈ {base_bf16, v_fp8}，draft 恒 base BF16；ctx ∈ {512, 8192}（c
 > 仪器/判读教训：**`topk` 的返回顺序 ≠ 决策路径的 `argmax`**（并列时前者不保证取最小 index）。本 case 首次输出里 `top1=' convert'` 是 `topk` 假象，真实 argmax 三路径全为 `' use'`。B6 的 `divergence_diag` 与 tie diag 均改为打印 argmax/tied 数。
 > 设备契约：`spec_dec._verify` 曾写死 `device="cuda"`，已改为跟随 `cache[0]["k"].device`（CPU fp32 复算的前提）；fp32 阶段一律 CPU 单模型（8 GB 显存放不下 fp32 权重 6.2 GB + 临时拷贝）。
 
+### 4.5.6 B6-fp32 实现正确性门（高精度档，预登记后实测）→ **PASS**
+条件：同 §4.5.5 的 **10 个 case × 2 KV 档 = 20 组合**；**CPU / float32 / 双模型 eager / batch=1 / k=4 / greedy**（`g4_b6_fp32_correctness.py`）。判据与 §4.5.5 **逐字一致**（逐 token id 全等 vs 同引擎 cached AR；logits 全 finite；重复运行确定；vacuity guard；**case 与档位必须跑满**否则不得判 PASS）。判据在运行前入库（commit `3f7fe6f` 预登记 + `9aa6b00` 补漏），**脚本运行前后未做任何修改**；运行于 EOS 修复（`f7097d4`）**之后**。
+
+| case | n | base_bf16 acc/prop | v_fp8 acc/prop | rounds | 耗时 b/v (s) |
+|---|---|---|---|---|---|
+| natural-1 | 16 | 11/21 | 11/21 | 6 | 24.3 / 26.9 |
+| natural-2 | 16 | 16/16 | 16/16 | 4 | 16.9 / 20.6 |
+| math | 16 | 9/31 | 9/31 | 9 | 34.5 / 36.1 |
+| code | 16 | 14/19 | 14/19 | 5 | 22.3 / 24.6 |
+| short | 16 | 12/24 | 12/24 | 6 | 12.1 / 25.8 |
+| long | 16 | 12/25 | 12/25 | 7 | 13.6 / 26.8 |
+| len13 | 13 | 11/15 | 11/15 | 5 | 9.3 / 19.1 |
+| len5 | 5 | 5/5 | 5/5 | 2 | 4.0 / 8.3 |
+| len2 | 2 | 2/2 | 2/2 | 1 | 2.2 / 4.8 |
+| eos-prone | 16 | 16/16 | 16/16 | 4 | 8.9 / 20.0 |
+| **合计** | — | **216/348** | 逐组合相同 | — | 单 case 2.2–36.1 |
+
+- **20/20 组合 `equal=True`**（逐 token id）；`logits finite (all) = True`；`determinism[natural-1] = determinism[long] = True`（各 2 次，两档各测）；两档 `acc/prop` **逐 case 完全相同**（V-FP8 只改变数值、未改变任何决策 ⇒ 与 §3.5.3 的质量结论方向一致）。
+- 修后一致性核对：修前小样（`B6F_LIMIT=2`）的 `natural-1 = 11/21`、`natural-2 = 16/16` 在全量运行中**逐字复现** ⇒ EOS 修复（仅 EOS 分支）未扰动其他路径，与设计预期一致。
+
+**同 case 的 bf16 档 vs fp32 档对照（RQ2 用）**
+
+| 口径 | 总 accepted/proposed | 接受率 |
+|---|---|---|
+| B6-bf16（§4.5.5） | 194/381 | 50.9% |
+| B6-fp32（本节） | 216/348 | 62.1% |
+
+- `natural-2`：bf16 首个分歧 @7（tie-collapse）；**fp32 下 16/16 全接受且逐 token 全等** —— 即该 prompt 上 draft 与 target 的决策其实**完全一致**，bf16 的翻面同时污染了"输出 token"和"接受判定"两件事。
+- **解释边界（必须写明，不可越界归因）**：这 11.2 个百分点是**复合效应** —— bf16 下 draft 与 target 的 argmax 都会在近并列处翻面，既可能改变"提议了什么"，也可能改变"是否判为接受"，因此**不能**把差值单独归因于 tie-collapse。要归因需专门测量（统计验证位置上 bf16 top-2 gap ≤ 实测形状噪声带 0.25–0.281 的占比 = **tie 频率普查**），已列为 RQ2 的后续测量项。
+- **接受率强烈依赖 prompt**：同一档内从 `math` 9/31（29.0%）到 `natural-2`/`eos-prone` 16/16（100%）⇒ **接受率不可用单条 prompt 代表**；这正是协议要求 ≥16 个 prompt families 的实证理由（`math` 类低接受率形态必须被覆盖）。
+
+**门禁口径（防评审误读）**
+- **B6 门 = 两档并列登记**：**B6-fp32 = 实现正确性证据（PASS）**；**B6-bf16 = 性能档行为（CHECK 19/20 + 归因）**，其失败与归因原样保留在 §4.5.5，**不作任何修改或豁免**。
+- 本节**未放宽任何判据**：判据与 §4.5.5 逐字相同，差异仅在**被测量的配置**（dtype/设备）；"dtype 不是被测对象"已在本节头部（脚本 docstring）**运行前冻结**并入库。
+- 结论适用范围：`spec_decode_greedy` 的**控制流 / cache 语义（prefill-trim-rollback 与长度不变量）/ logits 对齐 / 替换 token 单步重算 / EOS 与 budget<k 边界**在良定义配置下逐 token 正确；**bf16 档的 tie-collapse 作为已知数值限制披露**，不构成对性能结论的豁免。
+- Phase 4 前提：本条 PASS 满足"实现正确性"门槛；测量仍须携带 §4.5.5 的数值限制说明。
+
 ## 5. 复现设置（每次记录必须带上）
 - seed=42（测试）；性能脚本 seed=0，3 reps 取最优 + warmup；
 - prompt 固定（bench_basic.PROMPT，38 tok）；decode 数 64；
@@ -293,3 +330,4 @@ target KV ∈ {base_bf16, v_fp8}，draft 恒 base BF16；ctx ∈ {512, 8192}（c
 - **日期更正 + 2026-09-15 登记**：§4.5.2（B3）与 §4.5.3（B4）实际运行于 **2026-09-15**（早前标签沿用会话内 09-08，特此更正，数据不变）。同日：协议 Amendment v7.2 写入 `plan_v7_1_protocol_freeze.md`；G4 设计文档升 v0.2（取消 bonus / logits 对齐规则 / cache 回滚语义）；G4-0 归因登记为 **CONDITIONAL PASS（BF16 shape drift）**；`spec_cache.py` 由用户实现并**通过 B4**；`spec_dec.py` 已建文件但**尚未实现**（B5/B6 harness 已就绪：`g4_b5_smoke.py` / `g4_b6_correctness.py`）。日报见 `daily_report_2026-09-15.md`。
 - 2026-09-15（B5/B6 实测）：**B5: PASS**（T1–T4 单测 + 真实投机 smoke；cache 不变量全成立；修掉 `(1,V)`→`(1,1,V)` 造成的 0/58 空过 PASS）；**B6: CHECK（19/20）**——base_bf16 档 9/10、v_fp8 档 10/10，唯一分歧 `natural-2` @7 经 `g4_b6_tie_diag.py` 归因为**bf16 数值不可判定位置**（signal 0.1491 ≤ noise 0.1491；fp32 真值 = spec 侧 token）；**用户裁决 A = 严格口径：不设例外、不放宽门，B6 记 CHECK**。同日修正 `spec_dec._verify` 的 `device="cuda"` 硬编码；详见 §4.5.4 / §4.5.5。
 - 2026-09-15（EOS 分支修复 + B6-fp32 预登记）：逐行评审 `spec_dec.py` 发现并修复 **EOS 全接受路径的 `trim_cache` 越界**（`_propose` 的 EOS break 位置 → draft cache 长度 `pre+kp-1`），改为"EOS 检查在推进之后"使不变量统一为 `pre+kp`；新增**纯逻辑回归测试** `g4_b5_eos_branch_tests.py`（CPU stub，含旧实现对照复现 ValueError，B5-EOS-branch: PASS，详见 §4.5.4）。同时新增并**预登记** `g4_b6_fp32_correctness.py`（B6-fp32：CPU/float32 下的实现正确性门；判据在运行前入库，仅当 case×两 KV 档全部逐 token 相等才 PASS），结果待跑。
+- 2026-09-15（B6-fp32 实测）：**B6-fp32: PASS** —— 10 case × 2 KV 档 = **20/20 组合逐 token id 全等**（参照 = 同引擎 cached AR），finite 全真、确定性通过、非空过（总 **216/348**，62.1%），两档逐 case 数字相同；运行于 EOS 修复之后，且修前小样数字逐字复现。**B6 门按两档并列登记：fp32 档 = 实现正确性证据；bf16 档 = 性能档行为 CHECK 19/20 + tie-collapse 归因（§4.5.5 原样保留）**。新增 RQ2 观察：bf16 档接受率 50.9% vs fp32 档 62.1%，且**接受率强依赖 prompt**（29.0%–100%）；差值属复合效应，单独归因需 tie 频率普查。详见 §4.5.6。

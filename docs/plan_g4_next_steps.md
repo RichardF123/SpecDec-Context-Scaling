@@ -21,14 +21,16 @@
 - 修正记录：vacuity bug（logits 合同 `(1,V)`→`(1,1,V)`，曾致接受率 0/58 的"空过 PASS"）；错配分支改为 `trim(pre+m)` + 替换 token **单步重算**（两个模型都做），废弃"复用 block 位置 L+m+1"的旧指导。
 - **风险**：off-by-one（用 `b_{k-1}` 误判第 k 个 proposal）；draft 漏裁替换位之前的位置；全接受写成 k+1（bonus 已取消）。
 
-## Phase 3 — B6：correctness gate（⚠️ CHECK 19/20，用户裁决 A = 严格口径）
-- **状态**：`g4_b6_correctness.py` 实测 **19/20** —— base_bf16 档 9/10、v_fp8 档 10/10；唯一分歧 `natural-2` @7。
-- **归因（已实测，`g4_b6_tie_diag.py`）**：该位置 bf16 下候选对**精确并列**（22.8750 / 22.8750，gap 0）三路径 argmax 一致取 `' use'`；fp32 三路径一致给出真值 `' convert'`（gap **+0.1491**）。`signal(0.1491) ≤ noise(0.1491)` ⇒ **bf16 数值不可判定位置**；`spec[7]=' convert'` 恰为 fp32 真值。
-- **裁决（用户，2026-09-15）**：**A = 严格** —— 不设"平局例外"、不放宽 exact-id 门、不替换参照 ⇒ **B6 记 CHECK，不转 PASS**；该位置作为已知数值限制写入报告，并在 Method/Limitations 说明"接受判据 = argmax 相等性检验，其可靠性上限 = bf16 gap 符号可靠性"。
-- **后果（开放项）**：协议"B6 未过禁止测 acceptance/pilot/final"与"不得提出主循环性能声明"仍生效。Part 4 若启动，只能作为**工程观测**（标注"未通过正确性门"），不得作为已验证结论 —— 需用户明确同意后再做。
-- **保留风险**：BF16 block-built 与 serial-built cache 数值差（实测 max\|Δ\| 0.250–0.281 ≈2–4 ULP）> 部分位置的真实 gap → 多轮累积仍可能翻 token。
+## Phase 3 — B6：correctness gate（✅ 门已建立：fp32 档 PASS / bf16 档 CHECK 已归因）
+- **状态（2026-09-15）**：
+  - **B6-fp32: PASS** —— 10 case × 2 KV 档 = **20/20 组合逐 token id 全等**（CPU/float32，参照 = 同引擎 cached AR；总 216/348；finite、确定性、非空过、case 与档位跑满）。判据运行前入库（`3f7fe6f`/`9aa6b00`），脚本未事后修改。**= 实现正确性证据**。
+  - **B6-bf16: CHECK 19/20** —— 唯一分歧 `natural-2 @7`，经 `g4_b6_tie_diag.py` 归因为 **bf16 数值不可判定位置**（signal 0.1491 ≤ noise 0.1491；fp32 真值 = spec 侧 token）。**用户裁决 A = 严格口径：不设例外、不放宽门**，该记录§4.5.5 原样保留。
+  - **两档并列登记**，差异仅在被测量配置（dtype/设备）；"dtype 不是被测对象"已在脚本头部冻结。
+- **附带修正**：EOS 全接受路径 `trim_cache` 越界（`_propose` 的 EOS break 位置）→ 已修；回归测试 `g4_b5_eos_branch_tests.py`（纯逻辑 CPU，含旧实现对照）PASS；`draft_calls` 记账由此精确。
+- **RQ2 观察**：bf16 接受率 50.9%（194/381）vs fp32 62.1%（216/348）；接受率强依赖 prompt（29.0%–100%）⇒ 必须用 multi-family，且"tie 频率普查"列为后续测量项。
+- **遗留风险**：BF16 block-built 与 serial-built cache 数值差（实测 max\|Δ\| 0.250–0.281 ≈2–4 ULP）> 部分位置的真实 gap → bf16 档仍可能翻 token（已归因、已披露）。
 
-## Phase 4 — Part 4：小规模测量（**被 Phase 3 门禁阻断**）
+## Phase 4 — Part 4：小规模测量（前提已满足，可启动；须携带 bf16 数值限制说明）
 - **目标**：少量 prompt 的预实验（非正式矩阵）：acceptance=accepted/proposed、每轮接受长度分布、target block calls、draft token calls、decode-only 与 e2e 延迟、tokens/s、peak alloc/reserved、base 与 v_fp8 差异。
 - **纪律**：含 CUDA sync、warm-up、≥3 次重复、报中位数与离散；**不只报最好一次**；不宣称加速（先出数）。
 - **交付**：`g4_part4_pilot_measure.py`（AI）。
