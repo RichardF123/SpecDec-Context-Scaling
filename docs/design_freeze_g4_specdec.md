@@ -25,6 +25,10 @@
 
 1. **进入本轮前保存** target 最后位置的 logits：`target_next_logits`（预测 prefix 之后下一个 token，用于验证 d1）。
 2. draft 自回归提出至多 k=4 个 token：`d=[d1..dk']`（k'=min(k, budget)；draft cache 相应推进；遇 EOS 停提议）。
+   **不变量（实现层，2026-09-15 修订）**：提议结束时 draft cache 长度**恒为 `L+k'`**——EOS
+   检查必须在"推进 cache"**之后**：若在之前 break，EOS 候选的 K/V 不写入，长度变成 `L+k'-1`，
+   则 m=k'（全接受，即生成正常以 EOS 收尾）时 §5 的 `trim_cache(drf, L+k')` 会越界抛
+   `ValueError`。同时 `draft_calls += k'` 才与实际 draft 前向次数精确相等。
 3. target 对 `prefix + d` 做**一次 block forward**，得到 block logits 行 `b_0..b_{k'-1}`——**第 i 行预测"输入 d_i 之后"的下一 token**。
 4. **验证对齐（防 off-by-one）**：验证列表 = `[saved_target_next_logits, b_0, ..., b_{k'-2}]`：
    - 第 j 个 logits（j=1..k'）判定 d_j → saved 判 d1，b_0 判 d2，…，b_{k'-2} 判 d_{k'}；
@@ -36,6 +40,8 @@
      不能当作 r 的 K/V。
    - m=k'（全接受）：**第一版无 bonus**，本轮输出 k' 个（=d，已验证 g==d），结束本轮，下一轮重新提议。
 6. **EOS**：被输出/接受的 token 为 EOS → 输出后终止（记录生成长度）；draft 提议遇 EOS 停提议（k'<k）。
+   EOS 候选本身照常写入 draft cache（不得破坏第 2 步的不变量）；若 m<k'（EOS 候选被拒），
+   走 §5 的错配分支，两版实现行为一致（已由 `g4_b5_eos_branch_tests.py` 对照验证）。
 7. **budget**：剩余 `max_new_tokens` 小于 k → k' = 剩余数。
 8. `b_{k'-1}` 仅当 m=k' 时才有意义（"继续下一个 token 的分布"）；第一版不消费它（无 bonus），下一轮用新提议覆盖。
 

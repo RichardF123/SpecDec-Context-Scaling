@@ -24,11 +24,11 @@ def _propose(draft, cache, lg, k_eff, eos_id):
         for _ in range(k_eff):
             t = int(lg.reshape(-1, lg.shape[-1])[-1].argmax())
             cands.append(t)
-            if t == eos_id:
-                break
             lg, cache = draft._run(
                 draft.embed_tokens(torch.tensor([[t]], device=lg.device)),
                 cache, need_logits=True)
+            if t == eos_id:
+                break
     return cands, cache, lg
 
 
