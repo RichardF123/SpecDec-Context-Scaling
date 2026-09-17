@@ -54,6 +54,23 @@ target prefixes through serial q_len=1 and block q_len=4 calls while screening
 small-query launch policies.  It is diagnostic-only and does not change the
 production selector.
 
+That launch-policy screen has now completed.  All eight candidates failed at
+the same first-round, third same-context output row, choosing token 1602 on the
+serial path and token 883 on the block path.  The candidates covered unified
+`BLOCK_M` values 8/16/32/64, `BLOCK_N` values 32/64/128, the retained mixed
+16/64 policy, and libdevice exponentiation.  The result was:
+
+```text
+decision=STOP_NO_BLOCK_SERIAL_CANDIDATE
+```
+
+Because the failure location and token pair were invariant across the bounded
+launch sweep, further tile-size tuning is not justified as a correctness fix.
+The next diagnostic isolates custom/eager attention on the serial and block
+paths, plus a serialized-custom q_len=4 upper bound, to distinguish an
+attention-kernel defect from numerical differences in the full-model block
+execution path.
+
 ## Correctness ladder
 
 ### Existing latest-main G4 regression
