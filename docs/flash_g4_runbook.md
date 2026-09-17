@@ -1,24 +1,29 @@
 # FlashAttention × G4 RTX-4060 runbook
 
-This runbook deliberately has stop gates.  Do not run tuning or the final
-systems ablation when an earlier correctness stage fails.
+This runbook deliberately has stop gates.  Correctness follows the unchanged
+latest-main G4 contract: SpecDec must equal target-only cached AR from the same
+target backend.  Cross-backend eager/Flash token, statistic, or trace equality
+is diagnostic evidence and is not a release gate.
 
 ## Recorded 2026-09-17 outcome
 
-Stage 0 and the isolated Flash core passed.  The 32-token real-prompt
-compatibility gate did not: AR output and/or the SpecDec trace diverged at
-512/2048 depending on launch configuration.  A bounded numerical screen of
-`BLOCK_N` 32/64/128, mixed prefill/decode tiles, and libdevice exponentiation
-found no candidate that preserved all 512-context greedy decisions.
+Stage 0 and the isolated Flash core passed.  An initial integration diagnostic
+then required eager and Flash to preserve identical AR output, acceptance
+statistics, and full SpecDec traces.  That cross-backend requirement was
+stricter than latest-main `g4_b6_correctness.py`, whose reference is same-engine
+target-only cached AR.  The old result remains useful numerical-sensitivity
+evidence, but it does not decide Flash G4 correctness.
 
-The stop rule is therefore active:
+The bounded launch/exp sweep result was:
 
 ```text
 decision=STOP_NO_NUMERIC_CANDIDATE
 ```
 
-Do not run Stages 2 or 3 for this recorded revision.  See
-`docs/flash_g4_latest_g4_results.md` for the evidence and scoped conclusion.
+This means only that no candidate preserved strict cross-backend identity.  It
+does not stop the corrected same-backend gate below.  Do not run Stages 2 or 3
+until that corrected gate passes.  PyTorch Flash SDPA was used only as a sanity
+reference and is not a repository backend or proposed implementation.
 
 ## Frozen references
 
@@ -78,7 +83,7 @@ FLASH_G4_COMPAT_MAXNEW=8 \
 python -m specdec.engine.flash_attention_g4_specdec_compat
 ```
 
-If it passes, run the full AR + SpecDec compatibility gate:
+If it passes, run the full AR + SpecDec same-backend correctness gate:
 
 ```bash
 FLASH_G4_COMPAT_CTX=512,2048,8192 \
@@ -90,11 +95,14 @@ python -m specdec.engine.flash_attention_g4_specdec_compat
 Required decision:
 
 ```text
-PASS_FLASH_G4_COMPATIBILITY
+PASS_FLASH_G4_SAME_BACKEND_CORRECTNESS
 ```
 
-The gate checks generated tokens, AR argmax, SpecDec statistics and trace,
-q_len=4 observation, cache invariants, and constructed m=0..4 rollback payloads.
+For each backend, the gate checks that SpecDec generated tokens equal that same
+backend's target-only cached AR tokens.  It also checks Flash determinism,
+finite values, non-vacuous acceptance, q_len=4 observation, cache invariants,
+and constructed m=0..4 rollback payloads.  Eager-versus-Flash output, stats,
+and traces are recorded but do not affect the decision.
 
 Finally re-run the frozen PPL equivalence gate through the integrated selector:
 
