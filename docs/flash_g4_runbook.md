@@ -3,6 +3,23 @@
 This runbook deliberately has stop gates.  Do not run tuning or the final
 systems ablation when an earlier correctness stage fails.
 
+## Recorded 2026-09-17 outcome
+
+Stage 0 and the isolated Flash core passed.  The 32-token real-prompt
+compatibility gate did not: AR output and/or the SpecDec trace diverged at
+512/2048 depending on launch configuration.  A bounded numerical screen of
+`BLOCK_N` 32/64/128, mixed prefill/decode tiles, and libdevice exponentiation
+found no candidate that preserved all 512-context greedy decisions.
+
+The stop rule is therefore active:
+
+```text
+decision=STOP_NO_NUMERIC_CANDIDATE
+```
+
+Do not run Stages 2 or 3 for this recorded revision.  See
+`docs/flash_g4_latest_g4_results.md` for the evidence and scoped conclusion.
+
 ## Frozen references
 
 - integration base: `main-fresh@d4eb38967f5f51e7b2cd5292e38b6a06f1d8f897`
@@ -66,6 +83,7 @@ If it passes, run the full AR + SpecDec compatibility gate:
 ```bash
 FLASH_G4_COMPAT_CTX=512,2048,8192 \
 FLASH_G4_COMPAT_MAXNEW=32 \
+FLASH_G4_COMPAT_CHUNK=512 \
 python -m specdec.engine.flash_attention_g4_specdec_compat
 ```
 
