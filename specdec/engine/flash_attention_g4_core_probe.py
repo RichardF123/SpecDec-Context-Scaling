@@ -107,6 +107,95 @@ def run_case(name: str, query_length: int, kv_length: int):
     }
 
 
+def run_rollback_reappend_cases(prefix_length: int = 37):
+    """Verify q=4, trim to L+m, append corrective KV, then run q=1."""
+    generator = torch.Generator(device="cuda").manual_seed(2026091704)
+    prefix_key = torch.randn(
+        1, KV_HEADS, prefix_length, HEAD_DIM,
+        generator=generator, device="cuda", dtype=DTYPE,
+    )
+    prefix_value = torch.randn(
+        1, KV_HEADS, prefix_length, HEAD_DIM,
+        generator=generator, device="cuda", dtype=DTYPE,
+    )
+    block_query = torch.randn(
+        1, Q_HEADS, 4, HEAD_DIM,
+        generator=generator, device="cuda", dtype=DTYPE,
+    )
+    block_key = torch.randn(
+        1, KV_HEADS, 4, HEAD_DIM,
+        generator=generator, device="cuda", dtype=DTYPE,
+    )
+    block_value = torch.randn(
+        1, KV_HEADS, 4, HEAD_DIM,
+        generator=generator, device="cuda", dtype=DTYPE,
+    )
+    full_key = torch.cat([prefix_key, block_key], dim=2)
+    full_value = torch.cat([prefix_value, block_value], dim=2)
+    block_reference = eager_reference(
+        block_query, full_key, full_value, causal=True,
+    )
+    block_candidate = flash_attention_bf16_two_pass(
+        block_query.contiguous(), full_key.contiguous(),
+        full_value.contiguous(), causal=True,
+    )
+    block_error = compare(block_reference, block_candidate)
+    records = [{
+        "name": "verify_q4_before_rollback",
+        "query_length": 4,
+        "kv_length": prefix_length + 4,
+        "query_start": prefix_length,
+        "cached": True,
+        "error": block_error,
+        "passed": bool(
+            block_error["finite"]
+            and block_error["max_abs"] <= MAX_ABS_GATE
+            and block_error["relative_l2"] <= REL_L2_GATE
+        ),
+    }]
+    for accepted in range(4):
+        corrective_query = torch.randn(
+            1, Q_HEADS, 1, HEAD_DIM,
+            generator=generator, device="cuda", dtype=DTYPE,
+        )
+        corrective_key = torch.randn(
+            1, KV_HEADS, 1, HEAD_DIM,
+            generator=generator, device="cuda", dtype=DTYPE,
+        )
+        corrective_value = torch.randn(
+            1, KV_HEADS, 1, HEAD_DIM,
+            generator=generator, device="cuda", dtype=DTYPE,
+        )
+        trimmed_key = full_key[:, :, :prefix_length + accepted]
+        trimmed_value = full_value[:, :, :prefix_length + accepted]
+        corrected_key = torch.cat([trimmed_key, corrective_key], dim=2)
+        corrected_value = torch.cat([trimmed_value, corrective_value], dim=2)
+        reference = eager_reference(
+            corrective_query, corrected_key, corrected_value, causal=True,
+        )
+        candidate = flash_attention_bf16_two_pass(
+            corrective_query.contiguous(), corrected_key.contiguous(),
+            corrected_value.contiguous(), causal=True,
+        )
+        error = compare(reference, candidate)
+        records.append({
+            "name": f"rollback_m{accepted}_corrective_q1",
+            "query_length": 1,
+            "kv_length": prefix_length + accepted + 1,
+            "query_start": prefix_length + accepted,
+            "cached": True,
+            "accepted_before_rollback": accepted,
+            "trimmed_length": prefix_length + accepted,
+            "error": error,
+            "passed": bool(
+                error["finite"]
+                and error["max_abs"] <= MAX_ABS_GATE
+                and error["relative_l2"] <= REL_L2_GATE
+            ),
+        })
+    return records
+
+
 def main() -> int:
     if not torch.cuda.is_available():
         print("CUDA required")
@@ -125,6 +214,7 @@ def main() -> int:
         ))
     records.append(run_case("cached_q4_long", 4, 2048 + 4))
     records.append(run_case("decode_q1_8k", 1, LONG_CONTEXT))
+    records.extend(run_rollback_reappend_cases())
 
     all_pass = all(row["passed"] for row in records)
     result = {
