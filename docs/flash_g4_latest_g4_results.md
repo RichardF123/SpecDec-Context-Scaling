@@ -1,6 +1,6 @@
 # FlashAttention × latest G4 integration result
 
-Status: **CHECK — corrected same-backend G4 gate pending**
+Status: **CHECK — Flash q_len=1 serial and q_len=4 block semantics differ**
 Run date: 2026-09-17  
 Base: `main-fresh@d4eb38967f5f51e7b2cd5292e38b6a06f1d8f897`  
 GPU: NVIDIA GeForce RTX 4060 8GB  
@@ -27,8 +27,32 @@ not changed.  `spec_dec.py` and `spec_cache.py` were not modified.
 | cached `q_len=4` causal correctness | **PASS** |
 | default backend | **eager (unchanged)** |
 
-PPL, production small-Q tuning, formal supporting ablation, and bottleneck
-claims remain blocked until the corrected same-backend gate passes.
+The corrected 512-token smoke gate has now run.  Eager SpecDec reproduced
+eager target-only AR, but Flash SpecDec did not reproduce Flash target-only
+AR.  Cross-backend SpecDec happened to agree in this run; that fact does not
+repair the same-backend failure.  PPL, production small-Q tuning, formal
+supporting ablation, and bottleneck claims remain blocked until this gate
+passes.
+
+Observed smoke result:
+
+```text
+ctx=512, max_new=8, K=4
+constructed rollback coverage m=0..4: PASS
+eager SpecDec == eager AR: PASS
+Flash SpecDec == Flash AR: CHECK
+Flash SpecDec repeat deterministic: PASS
+Flash/eager SpecDec diagnostic: tokens/stats/trace equal in this run
+decision=CHECK_FLASH_G4_SAME_BACKEND_CORRECTNESS
+```
+
+This localizes the next investigation to cached small-query behavior rather
+than the G4 state machine or rollback contract.  The production policy uses
+`BLOCK_M=16` for q_len=1 but `BLOCK_M=64` for q_len=4.  The new bounded
+`flash_attention_g4_block_serial_screen.py` therefore advances identical
+target prefixes through serial q_len=1 and block q_len=4 calls while screening
+small-query launch policies.  It is diagnostic-only and does not change the
+production selector.
 
 ## Correctness ladder
 
