@@ -109,6 +109,41 @@ failure was not limited to exact logit ties.  The decision was:
 STOP_NO_NUMERIC_CANDIDATE
 ```
 
+### Phase-isolation follow-up
+
+The next bounded diagnostic separated prompt prefill from online AR decode /
+SpecDec block verification.  It used a 512-token chunk, 32 generated tokens,
+and the same real nested WikiText prefixes.  `F` denotes the retained custom
+two-pass Flash kernel; `S` denotes PyTorch SDPA with `FLASH_ATTENTION` forced
+and no math fallback.
+
+| Context | Route | AR exact | SpecDec exact | First AR argmax difference |
+|---:|---|---:|---:|---:|
+| 512 | EE | PASS | PASS | none |
+| 512 | FE | CHECK | CHECK | 15 |
+| 512 | EF | CHECK | CHECK | 15 |
+| 512 | FF | CHECK | CHECK | 3 |
+| 512 | SS | PASS | CHECK | none |
+| 2048 | EE | PASS | PASS | none |
+| 2048 | FE | CHECK | CHECK | 2 |
+| 2048 | EF | CHECK | CHECK | 2 |
+| 2048 | FF | PASS | PASS | none |
+| 2048 | SS | CHECK | CHECK | 6 |
+
+The result was:
+
+```text
+NO_STRICT_PHASE_CANDIDATE
+```
+
+Both Flash-prefill/eager-online and eager-prefill/Flash-online routes diverged.
+At 2048, using the custom kernel in both phases happened to preserve the tested
+trace even though either hybrid diverged, showing context-dependent numerical
+interaction rather than a stable single-phase defect.  PyTorch's forced Flash
+SDPA reference also failed strict SpecDec trace equality.  A separate core
+sanity probe is required before using the SDPA result to judge whether strict
+token/trace identity is an appropriate cross-kernel contract.
+
 ## Interpretation
 
 The evidence separates three claims:
@@ -123,6 +158,9 @@ The evidence separates three claims:
 3. **Launch tuning is not a correctness fix.** Larger tiles and higher-accuracy
    exponentiation changed which prompts matched, but no tested configuration
    preserved all required behavior.
+4. **No simple phase hybrid fixes strict identity.** Prefill-only and
+   online-only substitution both changed behavior, while the full route could
+   pass or fail depending on context because its numerical errors interact.
 
 The old PR #2 positive results remain valid for their recorded prompts and
 environment.  This latest-G4 result narrows their scope: they do not establish
