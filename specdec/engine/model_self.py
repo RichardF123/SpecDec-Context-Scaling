@@ -97,6 +97,9 @@ class SelfAttention(nn.Module):
         self.kv_heads = kv_heads
         self.head_dim = head_dim
         self.kv_format = "fp16" 
+        # FlashAttention is opt-in.  The default path must remain importable on
+        # CPU and native Windows installations that do not provide Triton.
+        self.attention_backend = "eager"
         # 策略旋钮: 'fp8'(full K/V ablation) 时生效; 'v_fp8'(正式) 时 V 固定 GROUP_V
         self.fp8_g_k = GROUP_SIZE
         self.fp8_g_v = GROUP_SIZE
@@ -153,21 +156,48 @@ class SelfAttention(nn.Module):
             else:
                 v_all = torch.cat([cache["v"], v_cur16], dim=2)
                 cache["v"] = v_all
-        k_rep = kv_repeat(k_all, self.heads // self.kv_heads)
-        v_rep = kv_repeat(v_all, self.heads // self.kv_heads)
-        scores = torch.matmul(q, k_rep.transpose(-2, -1)) / (self.head_dim ** 0.5)
-        T = k_all.shape[2] if cache is not None else s
-        p = T - s
-        if cache is None:
-            mask = torch.triu(torch.ones(s, s, device=x.device, dtype=torch.bool), diagonal=1)
-            scores = scores.masked_fill(mask, float('-inf'))
-        elif s == 1:
-            pass
+        if self.attention_backend == "triton_bf16_two_pass":
+            supported = (
+                fmt == "fp16"
+                and q.is_cuda
+                and q.dtype == torch.bfloat16
+                and self.head_dim == 128
+                and k_all.shape[1] == self.kv_heads
+                and v_all.shape[1] == self.kv_heads
+            )
+            if not supported:
+                raise RuntimeError(
+                    "triton_bf16_two_pass requires CUDA BF16, head_dim=128, "
+                    "fmt='fp16', and checkpoint-native KV heads"
+                )
+            # Lazy import preserves the existing eager/CPU/Windows path.
+            from .flash_attention_two_pass_triton import (
+                flash_attention_bf16_two_pass,
+            )
+            out = flash_attention_bf16_two_pass(
+                q.contiguous(),
+                k_all.contiguous(),
+                v_all.contiguous(),
+                causal=True,
+            )
+        elif self.attention_backend == "eager":
+            k_rep = kv_repeat(k_all, self.heads // self.kv_heads)
+            v_rep = kv_repeat(v_all, self.heads // self.kv_heads)
+            scores = torch.matmul(q, k_rep.transpose(-2, -1)) / (self.head_dim ** 0.5)
+            T = k_all.shape[2] if cache is not None else s
+            p = T - s
+            if cache is None:
+                mask = torch.triu(torch.ones(s, s, device=x.device, dtype=torch.bool), diagonal=1)
+                scores = scores.masked_fill(mask, float('-inf'))
+            elif s == 1:
+                pass
+            else:
+                mask = torch.triu(torch.ones(s, T, device=x.device, dtype=torch.bool), diagonal=p + 1)
+                scores = scores.masked_fill(mask, float('-inf'))
+            attn = torch.softmax(scores, dim=-1, dtype=torch.float32).to(q.dtype)
+            out = torch.matmul(attn, v_rep)
         else:
-            mask = torch.triu(torch.ones(s, T, device=x.device, dtype=torch.bool), diagonal=p + 1)
-            scores = scores.masked_fill(mask, float('-inf'))
-        attn = torch.softmax(scores, dim=-1, dtype=torch.float32).to(q.dtype)
-        out = torch.matmul(attn, v_rep)
+            raise RuntimeError(f"unknown attention backend: {self.attention_backend!r}")
         out = out.transpose(1, 2).contiguous().view(b, s, self.heads * self.head_dim)
         if cache is None:
             if fmt in ('fp8', 'v_fp8'):
@@ -277,6 +307,21 @@ class QwenLM(nn.Module):
                 a.fp8_k, a.fp8_v = True, True
                 a.fp8_g_k, a.fp8_g_v = GROUP_SIZE, GROUP_SIZE
             # 'fp16': 仅记录格式; fp8 旋钮不影响 base 路径
+
+    def set_attention_backend(self, backend: str = "eager") -> None:
+        """Select eager or the validated opt-in BF16 Triton backend.
+
+        The Triton implementation deliberately does not accept compressed KV.
+        Call this only between fresh runs; do not change attention semantics
+        while a live cache is being consumed.
+        """
+        if backend not in ("eager", "triton_bf16_two_pass"):
+            raise ValueError(
+                "attention backend must be 'eager' or "
+                "'triton_bf16_two_pass'"
+            )
+        for layer in self.layers:
+            layer.self_attn.attention_backend = backend
 
     def set_fp8_groups(self, k_group: int | None = None, v_group: int | None = None) -> None:
         """诊断开关: K/V 各自 FP8 scale 分组粒度(须整除 head_dim)。默认 None=不动。
