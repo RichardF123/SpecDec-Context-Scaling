@@ -292,15 +292,38 @@ def constructed_m_coverage():
         def embed_tokens(self, ids):
             return ids
 
-    def make_cache(length):
-        return [{
-            "k": torch.zeros(1, 2, length, 4),
-            "v": torch.zeros(1, 2, length, 4),
-        }]
+    def make_cache(values):
+        values = torch.tensor(values, dtype=torch.float32).view(1, 1, -1, 1)
+        return [
+            {
+                "k": values.expand(1, 2, -1, 4).clone() + layer * 1000,
+                "v": values.expand(1, 2, -1, 4).clone() + layer * 1000 + 500,
+            }
+            for layer in range(2)
+        ]
 
-    def extend(cache, count):
-        length = spec_cache.cache_length(cache) + count
-        return make_cache(length)
+    def extend(cache, values):
+        addition = make_cache(values)
+        return [
+            {
+                key: torch.cat([old[key], new[key]], dim=2)
+                for key in ("k", "v")
+            }
+            for old, new in zip(cache, addition)
+        ]
+
+    def cache_payload_is(cache, expected):
+        expected = torch.tensor(expected, dtype=torch.float32)
+        spec_cache.check_consistent(cache)
+        if spec_cache.cache_length(cache) != len(expected):
+            return False
+        for layer_index, layer in enumerate(cache):
+            for key, offset in (("k", 0), ("v", 500)):
+                observed = layer[key][0, 0, :, 0]
+                wanted = expected + layer_index * 1000 + offset
+                if not torch.equal(observed, wanted):
+                    return False
+        return True
 
     def logits_for(token, rows=1):
         logits = torch.full((1, rows, vocabulary), -1000.0)
@@ -321,22 +344,28 @@ def constructed_m_coverage():
                 for index in range(K)
             ]
 
-            def fake_prefill(_model, _ids):
-                return logits_for(desired[0]), make_cache(prompt_length)
+            prefix = list(range(prompt_length))
 
-            def fake_propose(_draft, cache, _logits, k_eff, _eos):
+            def fake_prefill(model, _ids):
+                model.last_cache = make_cache(prefix)
+                return logits_for(desired[0]), model.last_cache
+
+            def fake_propose(draft_model, cache, _logits, k_eff, _eos):
                 proposed = candidates[:k_eff]
-                return proposed, extend(cache, len(proposed)), logits_for(1)
+                draft_model.last_cache = extend(cache, proposed)
+                return proposed, draft_model.last_cache, logits_for(1)
 
-            def fake_verify(_target, cache, proposed):
+            def fake_verify(target_model, cache, proposed):
                 rows = torch.full((len(proposed), vocabulary), -1000.0)
                 for index in range(len(proposed)):
                     token = desired[index + 1] if index + 1 < K else 1
                     rows[index, token] = 1000.0
-                return rows, extend(cache, len(proposed))
+                target_model.last_cache = extend(cache, proposed)
+                return rows, target_model.last_cache
 
-            def fake_step(_model, token, cache):
-                return logits_for(token), extend(cache, 1)
+            def fake_step(model, token, cache):
+                model.last_cache = extend(cache, [token])
+                return logits_for(token), model.last_cache
 
             spec_dec._prefill = fake_prefill
             spec_dec._propose = fake_propose
@@ -356,6 +385,9 @@ def constructed_m_coverage():
                 prompt_length + accepted + 1
                 if accepted < K else prompt_length + K
             )
+            expected_payload = prefix + candidates[:accepted]
+            if accepted < K:
+                expected_payload.append(corrective)
             row = trace[0]
             passed = bool(
                 len(trace) == 1
@@ -366,6 +398,8 @@ def constructed_m_coverage():
                 and result["stats"]["rollbacks"] == (accepted < K)
                 and result["stats"]["mismatch_rounds"] == (accepted < K)
                 and result["stats"]["all_accept_rounds"] == (accepted == K)
+                and cache_payload_is(target.last_cache, expected_payload)
+                and cache_payload_is(draft.last_cache, expected_payload)
             )
             records.append({
                 "m": accepted,
@@ -373,6 +407,13 @@ def constructed_m_coverage():
                 "target_length": row["tgt_len"],
                 "draft_length": row["drf_len"],
                 "expected_length": expected_length,
+                "expected_payload": expected_payload,
+                "target_payload_ok": cache_payload_is(
+                    target.last_cache, expected_payload,
+                ),
+                "draft_payload_ok": cache_payload_is(
+                    draft.last_cache, expected_payload,
+                ),
                 "rollbacks": result["stats"]["rollbacks"],
                 "passed": passed,
             })
