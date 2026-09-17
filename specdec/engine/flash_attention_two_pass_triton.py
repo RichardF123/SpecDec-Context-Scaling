@@ -15,6 +15,7 @@ attention as its default and imports this inference-only backend lazily.
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
 import math
 
 import torch
@@ -28,6 +29,37 @@ except ImportError as error:  # pragma: no cover - validated on the GPU host
 
 SUPPORTED_HEAD_DIM = 128
 KERNEL_REVISION = "v3_two_pass_global_probability_bf16"
+
+
+@dataclass(frozen=True)
+class FlashKernelConfig:
+    """Explicit launch configuration used by the bounded tuning harness."""
+
+    block_m: int
+    block_n: int
+    num_warps: int
+    num_stages: int
+
+
+def validated_pr2_config(query_length: int) -> FlashKernelConfig:
+    """Return the PR #2 launch policy retained as the production default."""
+    return FlashKernelConfig(
+        block_m=16 if query_length == 1 else 64,
+        block_n=64,
+        num_warps=4,
+        num_stages=2,
+    )
+
+
+def _validate_config(config: FlashKernelConfig) -> None:
+    if config.block_m not in (8, 16, 32, 64):
+        raise ValueError(f"unsupported BLOCK_M={config.block_m}")
+    if config.block_n not in (32, 64, 128):
+        raise ValueError(f"unsupported BLOCK_N={config.block_n}")
+    if config.num_warps not in (2, 4, 8):
+        raise ValueError(f"unsupported num_warps={config.num_warps}")
+    if config.num_stages not in (1, 2, 3):
+        raise ValueError(f"unsupported num_stages={config.num_stages}")
 
 
 @triton.jit
@@ -259,6 +291,7 @@ def flash_attention_bf16_two_pass(
     value: torch.Tensor,
     *,
     causal: bool = True,
+    config: FlashKernelConfig | None = None,
 ) -> torch.Tensor:
     """Run two-pass global-normalization BF16 GQA attention."""
     if query.ndim != 4 or key.ndim != 4 or value.ndim != 4:
@@ -285,8 +318,10 @@ def flash_attention_bf16_two_pass(
         if not tensor.is_contiguous():
             raise ValueError(f"{name} must be contiguous")
 
-    block_m = 16 if query_length == 1 else 64
-    block_n = 64
+    config = validated_pr2_config(query_length) if config is None else config
+    _validate_config(config)
+    block_m = config.block_m
+    block_n = config.block_n
     row_max = torch.empty(
         (batch, query_heads, query_length),
         device=query.device,
@@ -311,8 +346,8 @@ def flash_attention_bf16_two_pass(
         "BLOCK_M": block_m,
         "BLOCK_N": block_n,
         "CAUSAL": causal,
-        "num_warps": 4,
-        "num_stages": 2,
+        "num_warps": config.num_warps,
+        "num_stages": config.num_stages,
     }
     _softmax_stats_bf16[grid](
         query,
