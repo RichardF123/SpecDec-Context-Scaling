@@ -1,6 +1,6 @@
 # FlashAttention × G4 change ownership
 
-Status: pre-integration audit  
+Status: integration evaluated; end-to-end result CHECK
 Integration branch: `experiment/flash-g4-integration`
 
 ## Recorded topology
@@ -60,10 +60,11 @@ The integration must not modify `spec_dec.py` or `spec_cache.py` to accommodate
 Flash.  Compatibility is established by tests that exercise cached multi-token
 causal alignment and every feasible accept/rollback outcome.
 
-## Candidate-work note
+## Evaluation outcome
 
-Two early commits were created on the isolated integration branch before this
-corrected audit requirement arrived.  They are treated as candidates, not as
-accepted merge evidence.  No further optimization is allowed until their diffs
-are checked against this ownership map.  Neither `main-fresh` nor PR #2 was
-modified.
+The semantic merge preserved this ownership map, and neither `main-fresh` nor
+PR #2 was modified.  Isolated causal/cache tests passed, but the real-prompt
+end-to-end AR/SpecDec equality gate did not.  The backend therefore remains
+explicit experimental code on this branch; eager remains the only accepted G4
+backend.  See `docs/flash_g4_latest_g4_results.md` for the bounded follow-up and
+stop decision.
