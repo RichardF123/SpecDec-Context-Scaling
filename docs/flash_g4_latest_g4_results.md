@@ -1,6 +1,6 @@
 # FlashAttention × latest G4 integration result
 
-Status: **CHECK — experimental backend only; do not enable by default**  
+Status: **CHECK — corrected same-backend G4 gate pending**
 Run date: 2026-09-17  
 Base: `main-fresh@d4eb38967f5f51e7b2cd5292e38b6a06f1d8f897`  
 GPU: NVIDIA GeForce RTX 4060 8GB  
@@ -9,25 +9,26 @@ Runtime: PyTorch 2.11.0+cu128, CUDA runtime 12.8, Triton 3.6.0
 ## Decision
 
 The migrated two-pass BF16 GQA Triton backend passes isolated attention,
-cached multi-token causal alignment, and cache rollback tests.  It does **not**
-preserve greedy and speculative-decoding behavior for every tested real
-WikiText prompt.  It therefore remains opt-in research code and must not
-replace eager attention in the frozen G4 workflow.
+cached multi-token causal alignment, and cache rollback tests.  Early
+diagnostics found that it does not preserve eager backend tokens and traces for
+every real WikiText prompt.  That is cross-backend numerical evidence, not the
+latest-main correctness contract.  The authoritative G4 gate is instead:
+Flash-target SpecDec must equal Flash-target cached AR.
 
 No correctness threshold was relaxed.  The frozen G4 12-condition matrix was
 not changed.  `spec_dec.py` and `spec_cache.py` were not modified.
 
 | Required result | Outcome |
 |---|---|
-| latest main + Flash + AR | **CHECK** |
-| latest main + Flash + SpecDec | **CHECK** |
+| eager versus Flash exact AR identity | **CHECK (diagnostic only)** |
+| eager versus Flash exact SpecDec trace | **CHECK (diagnostic only)** |
+| Flash SpecDec versus Flash target-only AR | **pending corrected gate** |
 | cache rollback compatibility | **PASS** |
 | cached `q_len=4` causal correctness | **PASS** |
 | default backend | **eager (unchanged)** |
 
-Because end-to-end behavior did not pass, the PPL gate, production small-Q
-tuning, formal supporting ablation, and bottleneck claims are blocked by the
-pre-registered stop rule.
+PPL, production small-Q tuning, formal supporting ablation, and bottleneck
+claims remain blocked until the corrected same-backend gate passes.
 
 ## Correctness ladder
 
@@ -130,7 +131,7 @@ and no math fallback.
 | 2048 | FF | PASS | PASS | none |
 | 2048 | SS | CHECK | CHECK | 6 |
 
-The result was:
+The cross-backend diagnostic result was:
 
 ```text
 NO_STRICT_PHASE_CANDIDATE
@@ -142,7 +143,9 @@ trace even though either hybrid diverged, showing context-dependent numerical
 interaction rather than a stable single-phase defect.  PyTorch's forced Flash
 SDPA reference also failed strict SpecDec trace equality.  A separate core
 sanity probe is required before using the SDPA result to judge whether strict
-token/trace identity is an appropriate cross-kernel contract.
+token/trace identity is an appropriate cross-kernel contract.  The SDPA probe
+subsequently passed this core sanity check, but official SDPA remains reference
+evidence only and is not part of the implementation.
 
 ## Interpretation
 
@@ -158,9 +161,12 @@ The evidence separates three claims:
 3. **Launch tuning is not a correctness fix.** Larger tiles and higher-accuracy
    exponentiation changed which prompts matched, but no tested configuration
    preserved all required behavior.
-4. **No simple phase hybrid fixes strict identity.** Prefill-only and
+4. **No simple phase hybrid fixes cross-backend strict identity.** Prefill-only and
    online-only substitution both changed behavior, while the full route could
    pass or fail depending on context because its numerical errors interact.
+5. **Strict cross-backend identity is not the mainline G4 gate.** The mainline
+   reference compares SpecDec with target-only AR from the same engine/backend;
+   round statistics and traces need to be valid, not identical to eager.
 
 The old PR #2 positive results remain valid for their recorded prompts and
 environment.  This latest-G4 result narrows their scope: they do not establish
@@ -169,12 +175,12 @@ gate.
 
 ## Repository action
 
-- retain eager as the default and formal G4 backend;
+- retain eager as the default while the corrected same-backend gate is pending;
 - keep the Flash selector explicit and experimental only on this branch;
 - restore the validated PR #2 `BLOCK_N=64` launch instead of promoting the
   failed BN128 candidate;
 - preserve the numerical screens as negative-result diagnostics;
-- do not run or report the blocked tuning/ablation stages as if integration
-  had passed;
-- do not merge this branch as a production G4 optimization without changing
-  the stated correctness contract and re-reviewing that change explicitly.
+- rerun compatibility using same-backend SpecDec-versus-AR correctness;
+- do not run or report tuning/ablation stages as passed until that gate passes;
+- do not merge this branch as a production G4 optimization until the unchanged
+  mainline correctness contract passes and the result is reviewed.
