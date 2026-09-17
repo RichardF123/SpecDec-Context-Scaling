@@ -1,14 +1,19 @@
-"""End-to-end compatibility gate for FlashAttention on the latest G4 workflow.
+"""End-to-end correctness gate for FlashAttention on the latest G4 workflow.
 
-The test keeps the draft model eager and compares:
+The pass/fail contract mirrors ``g4_b6_correctness.py``: speculative decoding
+must reproduce target-only cached AR from the *same target backend*.  Therefore
+the test keeps the draft eager and checks:
 
-* eager BF16 target versus Flash BF16 target under cached AR;
-* eager-target SpecDec versus Flash-target SpecDec;
-* per-round acceptance and rollback state;
+* eager-target SpecDec equals eager-target AR;
+* Flash-target SpecDec equals Flash-target AR;
+* repeated Flash SpecDec is deterministic;
 * cache lengths/invariants after cached q_len=4 verification;
 * constructed one-round state-machine cases covering m=0..K.
 
-This is a correctness diagnostic, not a performance benchmark.
+Eager-versus-Flash logits, generated tokens, acceptance statistics, and traces
+are retained as numerical diagnostics, but they are not correctness gates.
+Different legal floating-point reduction orders may change those cross-backend
+quantities.  This is a correctness diagnostic, not a performance benchmark.
 """
 from __future__ import annotations
 
@@ -34,6 +39,11 @@ CONTEXTS = tuple(
 )
 MAX_NEW = int(os.environ.get("FLASH_G4_COMPAT_MAXNEW", "32"))
 CHUNK = int(os.environ.get("FLASH_G4_COMPAT_CHUNK", "2048"))
+DETERMINISM_CONTEXTS = tuple(
+    int(value) for value in os.environ.get(
+        "FLASH_G4_COMPAT_DETERMINISM_CTX", "512,2048"
+    ).split(",") if value.strip()
+)
 K = spec_dec.K
 BACKENDS = ("eager", "triton_bf16_two_pass")
 
@@ -477,6 +487,8 @@ def main() -> int:
     eos_id = tokenizer.eos_token_id
     context_results = {}
     overall = rollback_coverage["passed"]
+    accepted_totals = {backend: 0 for backend in BACKENDS}
+    proposed_totals = {backend: 0 for backend in BACKENDS}
 
     for context in CONTEXTS:
         ids = all_ids[:, :context].cuda()
@@ -494,22 +506,10 @@ def main() -> int:
             ar_records["eager"]["decision_logits"],
             ar_records["triton_bf16_two_pass"]["decision_logits"],
         )
-        ar_pass = bool(
-            ar_records["eager"]["tokens"]
-            == ar_records["triton_bf16_two_pass"]["tokens"]
-            and ar_records["eager"]["finite"]
-            and ar_records["triton_bf16_two_pass"]["finite"]
-            and ar_records["eager"]["prefill_cache_length"] == context
-            and ar_records["triton_bf16_two_pass"]["prefill_cache_length"] == context
-            and ar_records["eager"]["final_cache_length"]
-            == ar_records["triton_bf16_two_pass"]["final_cache_length"]
-            and ar_compare["same_length"]
-            and ar_compare["all_argmax_same"]
-        )
         print(
-            f"AR tokens_equal="
+            f"cross-backend AR diagnostic: tokens_equal="
             f"{ar_records['eager']['tokens'] == ar_records['triton_bf16_two_pass']['tokens']} "
-            f"worst_rel_l2={ar_compare['worst_relative_l2']:.6f} pass={ar_pass}"
+            f"worst_rel_l2={ar_compare['worst_relative_l2']:.6f}"
         )
 
         print(f"=== ctx={context} SpecDec ===", flush=True)
@@ -526,47 +526,106 @@ def main() -> int:
                 f"rollback={row['stats']['rollbacks']} "
                 f"q={row['monitor']['target_q_lengths']}"
             )
-        spec_compare = compare_specdec(
+            accepted_totals[backend] += row["stats"]["accepted"]
+            proposed_totals[backend] += row["stats"]["proposed"]
+
+        # Cross-backend equality is useful sensitivity evidence, but the
+        # latest-main G4 contract is same-backend SpecDec == same-backend AR.
+        cross_spec_compare = compare_specdec(
             spec_records["eager"], spec_records["triton_bf16_two_pass"],
         )
-        spec_pass = bool(
-            spec_compare["tokens_identical"]
-            and spec_compare["all_stats_equal"]
-            and spec_compare["trace_equal"]
-            and spec_compare["target_cache_length_equal"]
-            and spec_compare["draft_cache_length_equal"]
-            and spec_compare["both_finite"]
-            and spec_compare["both_cache_consistent"]
-            and all(1 <= q_len <= K for q_len in spec_compare["flash_q_lengths"])
-            and K in spec_compare["flash_q_lengths"]
+        same_backend = {}
+        for backend in BACKENDS:
+            ar_row = ar_records[backend]
+            spec_row = spec_records[backend]
+            q_lengths = spec_row["monitor"]["target_q_lengths"]
+            same_tokens = ar_row["tokens"] == spec_row["tokens"]
+            passed = bool(
+                same_tokens
+                and ar_row["finite"]
+                and ar_row["prefill_cache_length"] == context
+                and spec_row["monitor"]["finite"]
+                and spec_row["monitor"]["cache_consistent"]
+                and spec_row["monitor"]["round_cache_semantics"]
+                and q_lengths
+                and all(1 <= q_len <= K for q_len in q_lengths)
+                and K in q_lengths
+            )
+            same_backend[backend] = {
+                "specdec_equals_target_ar": same_tokens,
+                "ar_finite": ar_row["finite"],
+                "specdec_finite": spec_row["monitor"]["finite"],
+                "cache_consistent": (
+                    spec_row["monitor"]["cache_consistent"]
+                    and spec_row["monitor"]["round_cache_semantics"]
+                ),
+                "target_q_lengths": q_lengths,
+                "passed": passed,
+            }
+
+        # Match main-fresh B6's determinism rule without making eager/Flash
+        # traces equal.  Only the new Flash backend needs another run here;
+        # eager determinism is already owned by the unchanged mainline gate.
+        flash_deterministic = True
+        repeat_flash = None
+        if context in DETERMINISM_CONTEXTS:
+            repeat_flash = run_specdec(
+                target, draft, ids, eos_id, "triton_bf16_two_pass",
+            )
+            flash_deterministic = bool(
+                repeat_flash["tokens"]
+                == spec_records["triton_bf16_two_pass"]["tokens"]
+            )
+            same_backend["triton_bf16_two_pass"][
+                "deterministic_repeat"
+            ] = flash_deterministic
+            same_backend["triton_bf16_two_pass"]["passed"] &= (
+                flash_deterministic
+            )
+
+        print(
+            "same-backend correctness: "
+            f"eager={same_backend['eager']['passed']} "
+            f"flash={same_backend['triton_bf16_two_pass']['passed']} "
+            f"flash_deterministic={flash_deterministic}"
         )
         print(
-            f"SpecDec tokens_equal={spec_compare['tokens_identical']} "
-            f"stats_equal={spec_compare['all_stats_equal']} "
-            f"trace_equal={spec_compare['trace_equal']} "
-            f"cache_ok={spec_compare['both_cache_consistent']} pass={spec_pass}"
+            "cross-backend SpecDec diagnostic: "
+            f"tokens_equal={cross_spec_compare['tokens_identical']} "
+            f"stats_equal={cross_spec_compare['all_stats_equal']} "
+            f"trace_equal={cross_spec_compare['trace_equal']}"
         )
-        overall &= ar_pass and spec_pass
+        overall &= all(row["passed"] for row in same_backend.values())
         context_results[str(context)] = {
             "ar": {
                 "eager": strip_heavy(ar_records["eager"]),
                 "flash": strip_heavy(ar_records["triton_bf16_two_pass"]),
-                "comparison": ar_compare,
-                "passed": ar_pass,
+                "cross_backend_comparison": ar_compare,
+                "cross_backend_tokens_identical": (
+                    ar_records["eager"]["tokens"]
+                    == ar_records["triton_bf16_two_pass"]["tokens"]
+                ),
             },
             "specdec": {
                 "eager": spec_records["eager"],
                 "flash": spec_records["triton_bf16_two_pass"],
-                "comparison": spec_compare,
-                "passed": spec_pass,
+                "cross_backend_comparison": cross_spec_compare,
+                "flash_repeat": repeat_flash,
             },
+            "same_backend_correctness": same_backend,
         }
-        del ids, ar_records, spec_records
+        del ids, ar_records, spec_records, repeat_flash
         gc.collect()
         torch.cuda.empty_cache()
 
+    non_vacuous = {
+        backend: proposed_totals[backend] > 0 and accepted_totals[backend] > 0
+        for backend in BACKENDS
+    }
+    overall &= all(non_vacuous.values())
+
     result = {
-        "status": "latest_main_flash_g4_compatibility",
+        "status": "latest_main_flash_g4_same_backend_correctness",
         "main_fresh_start_sha": "d4eb38967f5f51e7b2cd5292e38b6a06f1d8f897",
         "torch": torch.__version__,
         "torch_cuda": torch.version.cuda,
@@ -577,12 +636,21 @@ def main() -> int:
         "max_new_tokens": MAX_NEW,
         "k": K,
         "chunk": CHUNK,
+        "determinism_contexts": DETERMINISM_CONTEXTS,
         "text_source": source,
         "constructed_rollback_coverage": rollback_coverage,
+        "acceptance_totals": {
+            backend: {
+                "accepted": accepted_totals[backend],
+                "proposed": proposed_totals[backend],
+                "non_vacuous": non_vacuous[backend],
+            }
+            for backend in BACKENDS
+        },
         "context_results": context_results,
         "decision": (
-            "PASS_FLASH_G4_COMPATIBILITY"
-            if overall else "CHECK_FLASH_G4_COMPATIBILITY"
+            "PASS_FLASH_G4_SAME_BACKEND_CORRECTNESS"
+            if overall else "CHECK_FLASH_G4_SAME_BACKEND_CORRECTNESS"
         ),
     }
     output = Path(os.environ.get(
