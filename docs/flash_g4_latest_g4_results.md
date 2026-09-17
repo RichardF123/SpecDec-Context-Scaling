@@ -80,6 +80,28 @@ documents BF16 block/serial shape drift.  Version 2 separates eager and custom
 prefill states and treats exact BF16 drift as behavior evidence requiring
 attribution, consistent with the repository protocol.
 
+Version 2 isolated the custom q_len=4 path:
+
+| Route | Outcome | First relevant observation |
+|---|---|---|
+| custom prefill + custom serial + custom block | CHECK | round 0 row 2, 1602 vs 883 |
+| custom prefill + custom serial + eager block | PASS | 16/16 tested positions |
+| custom prefill + eager serial + custom block | CHECK | round 3 row 2 |
+| custom prefill + eager serial + eager block | CHECK | BF16 shape drift |
+| eager prefill + eager serial + eager block | CHECK | BF16 shape drift |
+| custom serial + serialized-custom block API | PASS | exact zero error |
+
+The decision was `CUSTOM_Q4_ATTENTION_SUSPECT`.  This does not establish that
+every eager q_len=4 block is exact in BF16; it shows that, from the identical
+custom-prefill state used in the failing route, replacing only custom q_len=4
+attention with the repository eager expression removed the tested divergence.
+
+The next bounded candidate is therefore an explicit runtime-only hybrid:
+custom Triton for prefill and q_len=1, repository eager attention for cached
+q_len=2..4.  It is named and tested explicitly, uses no official FlashAttention,
+and does not change production dispatch.  Only after full-context correctness
+and performance measurement will it be considered as an integration boundary.
+
 ## Correctness ladder
 
 ### Existing latest-main G4 regression
