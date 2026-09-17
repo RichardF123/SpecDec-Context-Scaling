@@ -1,9 +1,13 @@
 # FlashAttention × G4 RTX-4060 runbook
 
-This runbook deliberately has stop gates.  Correctness follows the unchanged
-latest-main G4 contract: SpecDec must equal target-only cached AR from the same
-target backend.  Cross-backend eager/Flash token, statistic, or trace equality
-is diagnostic evidence and is not a release gate.
+This runbook deliberately follows the unchanged latest-main G4 evidence
+protocol.  The repository records exact same-backend BF16 SpecDec-versus-AR
+behavior, but it does not treat a BF16 near-tie as standalone implementation
+evidence: latest main reports the BF16 behavior (documented as 19/20), uses
+`g4_b6_tie_diag.py` for signal-versus-noise attribution, and uses
+`g4_b6_fp32_correctness.py` as the high-precision implementation gate.
+Cross-backend eager/Flash token, statistic, or trace equality remains
+diagnostic evidence only.
 
 ## Recorded 2026-09-17 outcome
 
@@ -21,9 +25,9 @@ decision=STOP_NO_NUMERIC_CANDIDATE
 ```
 
 This means only that no candidate preserved strict cross-backend identity.  It
-does not stop the corrected same-backend gate below.  Do not run Stages 2 or 3
-until that corrected gate passes.  PyTorch Flash SDPA was used only as a sanity
-reference and is not a repository backend or proposed implementation.
+does not alter the latest-main BF16-attribution/high-precision protocol below.
+PyTorch Flash SDPA was used only as a sanity reference and is not a repository
+backend or proposed implementation.
 
 ## Frozen references
 
@@ -83,7 +87,7 @@ FLASH_G4_COMPAT_MAXNEW=8 \
 python -m specdec.engine.flash_attention_g4_specdec_compat
 ```
 
-If it passes, run the full AR + SpecDec same-backend correctness gate:
+Then run the full AR + SpecDec same-backend BF16 behavior diagnostic:
 
 ```bash
 FLASH_G4_COMPAT_CTX=512,2048,8192 \
@@ -92,17 +96,25 @@ FLASH_G4_COMPAT_CHUNK=512 \
 python -m specdec.engine.flash_attention_g4_specdec_compat
 ```
 
-Required decision:
+An exact result is recorded as:
 
 ```text
 PASS_FLASH_G4_SAME_BACKEND_CORRECTNESS
 ```
 
-For each backend, the gate checks that SpecDec generated tokens equal that same
-backend's target-only cached AR tokens.  It also checks Flash determinism,
-finite values, non-vacuous acceptance, q_len=4 observation, cache invariants,
-and constructed m=0..4 rollback payloads.  Eager-versus-Flash output, stats,
-and traces are recorded but do not affect the decision.
+For each backend, the diagnostic records whether SpecDec generated tokens equal
+that same backend's target-only cached AR tokens.  It also checks Flash
+determinism, finite values, non-vacuous acceptance, q_len=4 observation, cache
+invariants, and constructed m=0..4 rollback payloads.  Eager-versus-Flash
+output, stats, and traces do not affect the result.
+
+A BF16 token mismatch is not automatically relabelled PASS, but neither is it
+automatically an implementation failure.  Apply the same repository-owned
+classification used by `g4_b6_tie_diag.py`: record the exact BF16 outcome and
+compare decision signal with observed shape/path noise.  The unchanged
+`g4_b6_fp32_correctness.py` remains the state-machine implementation evidence.
+Any non-near-tie mismatch, non-finite result, cache failure, nondeterminism, or
+causal-alignment failure remains a blocker.
 
 Finally re-run the frozen PPL equivalence gate through the integrated selector:
 
@@ -116,7 +128,8 @@ Required decision:
 PASS_FLASHATTENTION_PPL_EQUIVALENCE
 ```
 
-Stop and report the JSON immediately if any Stage 1 command does not pass.
+Stop and inspect the JSON immediately for any hard failure above.  Do not turn
+a BF16 mismatch into a pass without the repository's attribution evidence.
 
 ## Stage 2 — bounded small-query tuning
 
