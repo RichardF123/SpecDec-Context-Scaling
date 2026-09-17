@@ -23,6 +23,7 @@ import torch
 try:
     import triton
     import triton.language as tl
+    from triton.language.extra import libdevice
 except ImportError as error:  # pragma: no cover - validated on the GPU host
     raise RuntimeError("Triton is required for the two-pass backend") from error
 
@@ -39,6 +40,7 @@ class FlashKernelConfig:
     block_n: int
     num_warps: int
     num_stages: int
+    accurate_exp: bool = False
 
 
 def validated_pr2_config(query_length: int) -> FlashKernelConfig:
@@ -89,6 +91,7 @@ def _softmax_stats_bf16(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     CAUSAL: tl.constexpr,
+    ACCURATE_EXP: tl.constexpr,
 ):
     """Pass 1: compute global FP32 softmax statistics for each query row."""
     query_block = tl.program_id(0)
@@ -146,9 +149,15 @@ def _softmax_stats_bf16(
 
         block_max = tl.max(scores, axis=1)
         next_max = tl.maximum(running_max, block_max)
-        block_exp = tl.exp2((scores - next_max[:, None]) * LOG2_E)
+        if ACCURATE_EXP:
+            block_exp = libdevice.exp(scores - next_max[:, None])
+        else:
+            block_exp = tl.exp2((scores - next_max[:, None]) * LOG2_E)
         block_exp = tl.where(allowed, block_exp, 0.0)
-        old_weight = tl.exp2((running_max - next_max) * LOG2_E)
+        if ACCURATE_EXP:
+            old_weight = libdevice.exp(running_max - next_max)
+        else:
+            old_weight = tl.exp2((running_max - next_max) * LOG2_E)
         running_sum = running_sum * old_weight + tl.sum(block_exp, axis=1)
         running_max = next_max
 
@@ -198,6 +207,7 @@ def _globally_normalized_output_bf16(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     CAUSAL: tl.constexpr,
+    ACCURATE_EXP: tl.constexpr,
 ):
     """Pass 2: cast globally normalized probabilities before P @ V."""
     query_block = tl.program_id(0)
@@ -257,7 +267,10 @@ def _globally_normalized_output_bf16(
             )
 
         scores = tl.where(allowed, scores, -float("inf"))
-        numerator = tl.exp2((scores - global_max[:, None]) * LOG2_E)
+        if ACCURATE_EXP:
+            numerator = libdevice.exp(scores - global_max[:, None])
+        else:
+            numerator = tl.exp2((scores - global_max[:, None]) * LOG2_E)
         probability = tl.where(
             allowed,
             numerator / global_sum[:, None],
@@ -346,6 +359,7 @@ def flash_attention_bf16_two_pass(
         "BLOCK_M": block_m,
         "BLOCK_N": block_n,
         "CAUSAL": causal,
+        "ACCURATE_EXP": config.accurate_exp,
         "num_warps": config.num_warps,
         "num_stages": config.num_stages,
     }
