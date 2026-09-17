@@ -1,13 +1,14 @@
 """Isolate the source of custom-Flash q_len=1 versus q_len=4 drift.
 
 This target-only diagnostic runs identical forced token prefixes through
-serial cached q_len=1 and block cached q_len=4 paths.  It varies only the
-attention backend used after a shared custom-Flash prefill:
+serial cached q_len=1 and block cached q_len=4 paths.  It varies the prefill
+and online attention routes explicitly:
 
 * CC: custom serial, custom block (current experimental backend);
 * CE: custom serial, eager block;
 * EC: eager serial, custom block;
-* EE: eager serial, eager block (latest-main control);
+* XE: custom prefill, eager serial, eager block;
+* EE: eager prefill, eager serial, eager block (BF16 reference behavior);
 * CS: custom serial, custom block API implemented as four full-model q_len=1
   calls (diagnostic upper bound, not a performance implementation).
 
@@ -37,31 +38,43 @@ K = 4
 
 ROUTES = (
     {
-        "name": "CC_custom_serial_custom_block",
+        "name": "CC_custom_prefill_custom_serial_custom_block",
+        "prefill_backend": "triton_bf16_two_pass",
         "serial_backend": "triton_bf16_two_pass",
         "block_backend": "triton_bf16_two_pass",
         "serialize_block": False,
     },
     {
-        "name": "CE_custom_serial_eager_block",
+        "name": "CE_custom_prefill_custom_serial_eager_block",
+        "prefill_backend": "triton_bf16_two_pass",
         "serial_backend": "triton_bf16_two_pass",
         "block_backend": "eager",
         "serialize_block": False,
     },
     {
-        "name": "EC_eager_serial_custom_block",
+        "name": "EC_custom_prefill_eager_serial_custom_block",
+        "prefill_backend": "triton_bf16_two_pass",
         "serial_backend": "eager",
         "block_backend": "triton_bf16_two_pass",
         "serialize_block": False,
     },
     {
-        "name": "EE_eager_serial_eager_block",
+        "name": "XE_custom_prefill_eager_serial_eager_block",
+        "prefill_backend": "triton_bf16_two_pass",
         "serial_backend": "eager",
         "block_backend": "eager",
         "serialize_block": False,
     },
     {
-        "name": "CS_custom_serial_serialized_custom_block",
+        "name": "EE_eager_prefill_eager_serial_eager_block",
+        "prefill_backend": "eager",
+        "serial_backend": "eager",
+        "block_backend": "eager",
+        "serialize_block": False,
+    },
+    {
+        "name": "CS_custom_prefill_custom_serial_serialized_custom_block",
+        "prefill_backend": "triton_bf16_two_pass",
         "serial_backend": "triton_bf16_two_pass",
         "block_backend": "triton_bf16_two_pass",
         "serialize_block": True,
@@ -251,22 +264,37 @@ def run_route(model, base_logits, base_cache, route):
 
 def classify(results):
     by_name = {row["name"]: row for row in results}
-    cc = by_name["CC_custom_serial_custom_block"]["passed"]
-    ce = by_name["CE_custom_serial_eager_block"]["passed"]
-    ec = by_name["EC_eager_serial_custom_block"]["passed"]
-    ee = by_name["EE_eager_serial_eager_block"]["passed"]
-    cs = by_name["CS_custom_serial_serialized_custom_block"]["passed"]
-    if not ee:
-        return "CHECK_MAINLINE_CONTROL"
+    cc = by_name[
+        "CC_custom_prefill_custom_serial_custom_block"
+    ]["passed"]
+    ce = by_name[
+        "CE_custom_prefill_custom_serial_eager_block"
+    ]["passed"]
+    ec = by_name[
+        "EC_custom_prefill_eager_serial_custom_block"
+    ]["passed"]
+    xe = by_name[
+        "XE_custom_prefill_eager_serial_eager_block"
+    ]["passed"]
+    ee = by_name[
+        "EE_eager_prefill_eager_serial_eager_block"
+    ]["passed"]
+    cs = by_name[
+        "CS_custom_prefill_custom_serial_serialized_custom_block"
+    ]["passed"]
+    if not cs:
+        return "CHECK_SERIALIZED_CONTROL_OR_HARNESS"
     if cc:
         return "CUSTOM_BLOCK_SEMANTICS_PASS"
     if ce:
         return "CUSTOM_Q4_ATTENTION_SUSPECT"
     if ec:
         return "CUSTOM_Q1_ATTENTION_SUSPECT"
-    if cs:
-        return "BLOCK_PARALLEL_NUMERICAL_PATH_SUSPECT"
-    return "CHECK_NON_ATTENTION_OR_HARNESS"
+    if not ee:
+        return "BF16_BLOCK_SHAPE_DRIFT_PRESENT_IN_EAGER_REFERENCE"
+    if not xe:
+        return "CUSTOM_PREFILL_AMPLIFIES_BLOCK_SHAPE_DRIFT"
+    return "CUSTOM_ATTENTION_INTERACTION_SUSPECT"
 
 
 def main() -> int:
@@ -295,14 +323,18 @@ def main() -> int:
         raise RuntimeError(f"corpus only provided {ids.shape[1]} tokens")
 
     model.set_kv_format("fp16")
-    model.set_attention_backend("triton_bf16_two_pass")
-    base_logits, base_cache = chunked_prefill(model, ids)
-    if spec_cache.cache_length(base_cache) != CONTEXT:
-        raise RuntimeError("prefill cache length mismatch")
+    base_states = {}
+    for backend in ("triton_bf16_two_pass", "eager"):
+        model.set_attention_backend(backend)
+        base_logits, base_cache = chunked_prefill(model, ids)
+        if spec_cache.cache_length(base_cache) != CONTEXT:
+            raise RuntimeError(f"{backend} prefill cache length mismatch")
+        base_states[backend] = (base_logits, base_cache)
 
     results = []
     for route in ROUTES:
         torch.cuda.empty_cache()
+        base_logits, base_cache = base_states[route["prefill_backend"]]
         row = run_route(model, base_logits, base_cache, route)
         results.append(row)
         failure = row["first_failure"]
@@ -337,6 +369,11 @@ def main() -> int:
         "chunk": CHUNK,
         "text_source": source,
         "production_dispatch_unchanged": True,
+        "interpretation_note": (
+            "BF16 block-vs-serial exact-token drift is behavior evidence, not "
+            "by itself a mainline implementation failure; classify with the "
+            "repository's tie/noise and high-precision correctness protocol."
+        ),
         "routes": results,
         "decision": decision,
     }
@@ -347,10 +384,10 @@ def main() -> int:
     output.write_text(json.dumps(result, indent=2), encoding="utf-8")
     print(f"decision={decision}\nJSON={output}", flush=True)
 
-    del model, ids, base_logits, base_cache
+    del model, ids, base_states, base_logits, base_cache
     gc.collect()
     torch.cuda.empty_cache()
-    return 0 if decision != "CHECK_MAINLINE_CONTROL" else 1
+    return 0 if decision != "CHECK_SERIALIZED_CONTROL_OR_HARNESS" else 1
 
 
 if __name__ == "__main__":
