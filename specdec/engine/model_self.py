@@ -156,42 +156,12 @@ class SelfAttention(nn.Module):
             else:
                 v_all = torch.cat([cache["v"], v_cur16], dim=2)
                 cache["v"] = v_all
-        triton_backend = self.attention_backend in (
-            "triton_bf16_two_pass", "triton_bf16_g4_hybrid",
-        )
-        if triton_backend:
-            supported = (
-                fmt == "fp16"
-                and q.is_cuda
-                and q.dtype == torch.bfloat16
-                and self.head_dim == 128
-                and k_all.shape[1] == self.kv_heads
-                and v_all.shape[1] == self.kv_heads
-            )
-            if not supported:
-                raise RuntimeError(
-                    f"{self.attention_backend} requires CUDA BF16, head_dim=128, "
-                    "fmt='fp16', and checkpoint-native KV heads"
-                )
-        use_triton = triton_backend and not (
+        hybrid_eager = (
             self.attention_backend == "triton_bf16_g4_hybrid"
             and cache is not None
             and 2 <= s <= 4
         )
-        if use_triton:
-            # Lazy import preserves the existing eager/CPU/Windows path.
-            from .flash_attention_two_pass_triton import (
-                flash_attention_bf16_two_pass,
-            )
-            out = flash_attention_bf16_two_pass(
-                q.contiguous(),
-                k_all.contiguous(),
-                v_all.contiguous(),
-                causal=True,
-            )
-        elif self.attention_backend in (
-            "eager", "triton_bf16_g4_hybrid",
-        ):
+        if self.attention_backend == "eager" or hybrid_eager:
             k_rep = kv_repeat(k_all, self.heads // self.kv_heads)
             v_rep = kv_repeat(v_all, self.heads // self.kv_heads)
             scores = torch.matmul(q, k_rep.transpose(-2, -1)) / (self.head_dim ** 0.5)
@@ -207,6 +177,32 @@ class SelfAttention(nn.Module):
                 scores = scores.masked_fill(mask, float('-inf'))
             attn = torch.softmax(scores, dim=-1, dtype=torch.float32).to(q.dtype)
             out = torch.matmul(attn, v_rep)
+        elif self.attention_backend in (
+            "triton_bf16_two_pass", "triton_bf16_g4_hybrid",
+        ):
+            supported = (
+                fmt == "fp16"
+                and q.is_cuda
+                and q.dtype == torch.bfloat16
+                and self.head_dim == 128
+                and k_all.shape[1] == self.kv_heads
+                and v_all.shape[1] == self.kv_heads
+            )
+            if not supported:
+                raise RuntimeError(
+                    f"{self.attention_backend} requires CUDA BF16, head_dim=128, "
+                    "fmt='fp16', and checkpoint-native KV heads"
+                )
+            # Lazy import preserves the existing eager/CPU/Windows path.
+            from .flash_attention_two_pass_triton import (
+                flash_attention_bf16_two_pass,
+            )
+            out = flash_attention_bf16_two_pass(
+                q.contiguous(),
+                k_all.contiguous(),
+                v_all.contiguous(),
+                causal=True,
+            )
         else:
             raise RuntimeError(f"unknown attention backend: {self.attention_backend!r}")
         out = out.transpose(1, 2).contiguous().view(b, s, self.heads * self.head_dim)
