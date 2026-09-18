@@ -1,4 +1,4 @@
-"""Frozen-window PPL gate for the integrated G4 two-pass Flash backend.
+"""Frozen-window PPL gate for the integrated G4 hybrid backend.
 
 The kernel and its block size were selected without consulting these data.
 This script reuses the project's pre-existing frozen WikiText-2 windows 40..79
@@ -22,6 +22,7 @@ from .g4_b4_cache_tests import load_ours
 
 
 MODEL = "Qwen/Qwen2.5-1.5B-Instruct"
+FLASH_BACKEND = "triton_bf16_g4_hybrid"
 
 
 DTYPE = torch.bfloat16
@@ -34,13 +35,13 @@ N_WINDOWS = 40
 DNLL_EQUIVALENCE_MARGIN = 0.001
 OUTPUT = os.path.join(
     os.environ.get("SPECDEC_RUN_LOG_DIR", "run_logs/flash_attention"),
-    "flash_attention_two_pass_ppl_gate.json",
+    "flash_attention_g4_hybrid_ppl_gate.json",
 )
 
 
 def window_nll(model, ids: torch.Tensor, backend: str) -> tuple[float, int, bool]:
     model.set_attention_backend(
-        "eager" if backend == "eager_bf16" else "triton_bf16_two_pass"
+        "eager" if backend == "eager_bf16" else FLASH_BACKEND
     )
     model.set_kv_format("fp16")
     cache = None
@@ -100,14 +101,15 @@ def main() -> int:
     model, _ = load_ours(MODEL)
 
     print(
-        "two-pass FlashAttention frozen PPL gate: "
+        "G4 hybrid FlashAttention frozen PPL gate: "
         f"gpu={torch.cuda.get_device_name(0)} model=1.5B "
         f"windows={WINDOW_OFFSET}..{WINDOW_OFFSET + N_WINDOWS - 1} "
         f"W={WINDOW} chunk={CHUNK} revision={KERNEL_REVISION}",
         flush=True,
     )
     print(
-        "paired BF16 eager vs BF16 Triton; kernel was selected without these windows\n",
+        "paired BF16 eager vs BF16 G4 hybrid; "
+        "kernel was selected without these windows\n",
         flush=True,
     )
 
@@ -193,8 +195,9 @@ def main() -> int:
         "max_abs_window_delta_nll": max_abs_window_delta,
     }
     result = {
-        "status": "latest_main_g4_two_pass_flashattention_ppl_gate",
+        "status": "latest_main_g4_hybrid_flashattention_ppl_gate",
         "kernel_revision": KERNEL_REVISION,
+        "flash_backend": FLASH_BACKEND,
         "model": MODEL,
         "gpu": torch.cuda.get_device_name(0),
         "torch": torch.__version__,
@@ -238,4 +241,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

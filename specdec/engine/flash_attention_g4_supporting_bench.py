@@ -21,7 +21,6 @@ chunked 8K prefill, configuration hash, and reproducible JSON output.
 """
 from __future__ import annotations
 
-from contextlib import contextmanager
 import gc
 import hashlib
 import json
@@ -32,9 +31,7 @@ import time
 
 import torch
 
-from . import flash_attention_two_pass_triton as flash_impl
 from . import spec_cache, spec_dec
-from .flash_attention_g4_core_probe import eager_reference
 from .g4_b4_cache_tests import _from_pretrained, load_ours
 from .g4_part4_pilot_measure import load_text
 
@@ -68,27 +65,9 @@ def set_target_backend(model, backend):
     if backend == "eager_bf16":
         model.set_attention_backend("eager")
     elif backend == "hybrid_bf16":
-        model.set_attention_backend("triton_bf16_two_pass")
+        model.set_attention_backend("triton_bf16_g4_hybrid")
     else:
         raise ValueError(f"unknown backend: {backend}")
-
-
-@contextmanager
-def hybrid_scope():
-    original = flash_impl.flash_attention_bf16_two_pass
-
-    def explicit_hybrid(query, key, value, *, causal=True, config=None):
-        if 2 <= int(query.shape[2]) <= K:
-            return eager_reference(query, key, value, causal=causal)
-        return original(
-            query, key, value, causal=causal, config=config,
-        )
-
-    flash_impl.flash_attention_bf16_two_pass = explicit_hybrid
-    try:
-        yield
-    finally:
-        flash_impl.flash_attention_bf16_two_pass = original
 
 
 def chunked_prefill(model, ids):
@@ -420,6 +399,7 @@ def main():
         "max_new_tokens": MAX_NEW, "chunk": CHUNK, "k": K,
         "target": TARGET, "draft": DRAFT, "dtype": "torch.bfloat16",
         "kv_format": "fp16", "text_source": source,
+        "hybrid_backend": "triton_bf16_g4_hybrid",
         "nested_real_text_prefixes": True,
         "formal_g4_matrix_modified": False,
         "measurement": "controlled replay of eager natural reference",
@@ -439,7 +419,7 @@ def main():
     summaries = {}
     comparisons = {}
     all_runs = []
-    with hybrid_scope():
+    with torch.inference_mode():
         for context in CONTEXTS:
             ids = all_ids[:, :context].cuda()
             print(f"\n=== ctx={context} natural validation ===", flush=True)
@@ -543,7 +523,9 @@ def main():
             "q_len_1": "custom_triton_two_pass",
             "cached_q_len_2_to_4": "repository_eager_expression",
             "official_flash_used": False,
-            "production_selector_modified": False,
+            "model_selector": "triton_bf16_g4_hybrid",
+            "runtime_monkeypatch": False,
+            "default_backend": "eager",
         },
         "natural_validation": validations,
         "summaries": summaries, "comparisons": comparisons,

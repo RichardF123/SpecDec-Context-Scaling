@@ -28,7 +28,6 @@ from . import spec_cache, spec_dec
 from .flash_attention_g4_supporting_bench import (
     BACKENDS,
     chunked_prefill,
-    hybrid_scope,
     set_target_backend,
     validate_natural,
 )
@@ -379,7 +378,7 @@ def main():
         f"maxnew={MAX_NEW} reps={REPS}", flush=True,
     )
 
-    with hybrid_scope():
+    with torch.inference_mode():
         validation = validate_natural(target, draft, ids, eos_id)
         reference = validation["reference"]
         # Unrecorded warm-up covers Triton compilation and hook registration.

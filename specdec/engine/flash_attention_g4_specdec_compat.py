@@ -45,7 +45,10 @@ DETERMINISM_CONTEXTS = tuple(
     ).split(",") if value.strip()
 )
 K = spec_dec.K
-BACKENDS = ("eager", "triton_bf16_two_pass")
+FLASH_BACKEND = os.environ.get(
+    "FLASH_G4_COMPAT_BACKEND", "triton_bf16_two_pass",
+)
+BACKENDS = ("eager", FLASH_BACKEND)
 
 
 def synchronize():
@@ -504,11 +507,11 @@ def main() -> int:
             )
         ar_compare = logits_comparison(
             ar_records["eager"]["decision_logits"],
-            ar_records["triton_bf16_two_pass"]["decision_logits"],
+            ar_records[FLASH_BACKEND]["decision_logits"],
         )
         print(
             f"cross-backend AR diagnostic: tokens_equal="
-            f"{ar_records['eager']['tokens'] == ar_records['triton_bf16_two_pass']['tokens']} "
+            f"{ar_records['eager']['tokens'] == ar_records[FLASH_BACKEND]['tokens']} "
             f"worst_rel_l2={ar_compare['worst_relative_l2']:.6f}"
         )
 
@@ -532,7 +535,7 @@ def main() -> int:
         # Cross-backend equality is useful sensitivity evidence, but the
         # latest-main G4 contract is same-backend SpecDec == same-backend AR.
         cross_spec_compare = compare_specdec(
-            spec_records["eager"], spec_records["triton_bf16_two_pass"],
+            spec_records["eager"], spec_records[FLASH_BACKEND],
         )
         same_backend = {}
         for backend in BACKENDS:
@@ -570,23 +573,23 @@ def main() -> int:
         repeat_flash = None
         if context in DETERMINISM_CONTEXTS:
             repeat_flash = run_specdec(
-                target, draft, ids, eos_id, "triton_bf16_two_pass",
+                target, draft, ids, eos_id, FLASH_BACKEND,
             )
             flash_deterministic = bool(
                 repeat_flash["tokens"]
-                == spec_records["triton_bf16_two_pass"]["tokens"]
+                == spec_records[FLASH_BACKEND]["tokens"]
             )
-            same_backend["triton_bf16_two_pass"][
+            same_backend[FLASH_BACKEND][
                 "deterministic_repeat"
             ] = flash_deterministic
-            same_backend["triton_bf16_two_pass"]["passed"] &= (
+            same_backend[FLASH_BACKEND]["passed"] &= (
                 flash_deterministic
             )
 
         print(
             "same-backend correctness: "
             f"eager={same_backend['eager']['passed']} "
-            f"flash={same_backend['triton_bf16_two_pass']['passed']} "
+            f"flash={same_backend[FLASH_BACKEND]['passed']} "
             f"flash_deterministic={flash_deterministic}"
         )
         print(
@@ -599,16 +602,16 @@ def main() -> int:
         context_results[str(context)] = {
             "ar": {
                 "eager": strip_heavy(ar_records["eager"]),
-                "flash": strip_heavy(ar_records["triton_bf16_two_pass"]),
+                "flash": strip_heavy(ar_records[FLASH_BACKEND]),
                 "cross_backend_comparison": ar_compare,
                 "cross_backend_tokens_identical": (
                     ar_records["eager"]["tokens"]
-                    == ar_records["triton_bf16_two_pass"]["tokens"]
+                    == ar_records[FLASH_BACKEND]["tokens"]
                 ),
             },
             "specdec": {
                 "eager": spec_records["eager"],
-                "flash": spec_records["triton_bf16_two_pass"],
+                "flash": spec_records[FLASH_BACKEND],
                 "cross_backend_comparison": cross_spec_compare,
                 "flash_repeat": repeat_flash,
             },
@@ -636,6 +639,7 @@ def main() -> int:
         "max_new_tokens": MAX_NEW,
         "k": K,
         "chunk": CHUNK,
+        "flash_backend": FLASH_BACKEND,
         "determinism_contexts": DETERMINISM_CONTEXTS,
         "text_source": source,
         "constructed_rollback_coverage": rollback_coverage,

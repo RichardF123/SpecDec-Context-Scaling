@@ -1,4 +1,4 @@
-"""Runtime-only compatibility gate for an explicit small-block hybrid.
+"""Compatibility gate for the explicit G4 hybrid attention backend.
 
 Evidence from ``flash_attention_g4_operator_isolation.py`` shows that the
 custom q_len=4 Triton attention is the source of the tested serial/block
@@ -8,11 +8,9 @@ decision split, while this explicit route passed the bounded screen:
 * cached AR decode (q_len == 1): custom two-pass Triton;
 * cached SpecDec verification (2 <= q_len <= 4): repository eager expression.
 
-This is not a silent production fallback and is not an official FlashAttention
-implementation.  It is a runtime-only candidate used to decide whether a
-correct integration boundary exists before any selector or production code is
-changed.  The unchanged same-backend G4 diagnostic supplies cache, rollback,
-determinism, and output evidence.
+This is not a silent fallback and is not an official FlashAttention
+implementation. The unchanged same-backend G4 diagnostic supplies cache,
+rollback, determinism, and output evidence.
 """
 from __future__ import annotations
 
@@ -21,36 +19,25 @@ import os
 from pathlib import Path
 
 from . import flash_attention_g4_specdec_compat as compat
-from . import flash_attention_two_pass_triton as flash_impl
-from .flash_attention_g4_core_probe import eager_reference
 
 
+HYBRID_BACKEND = "triton_bf16_g4_hybrid"
 POLICY = {
     "name": "custom_prefill_q1_eager_q2_to_q4",
     "prefill": "custom_triton_two_pass",
     "q_len_1": "custom_triton_two_pass",
     "q_len_2_to_4": "repository_eager_expression",
     "official_flash_used": False,
-    "production_selector_modified": False,
+    "model_selector": HYBRID_BACKEND,
+    "runtime_monkeypatch": False,
+    "default_backend": "eager",
 }
 
 
 def main() -> int:
-    original = flash_impl.flash_attention_bf16_two_pass
-
-    def explicit_hybrid(query, key, value, *, causal=True, config=None):
-        query_length = int(query.shape[2])
-        if 2 <= query_length <= compat.K:
-            return eager_reference(query, key, value, causal=causal)
-        return original(
-            query, key, value, causal=causal, config=config,
-        )
-
-    flash_impl.flash_attention_bf16_two_pass = explicit_hybrid
-    try:
-        return_code = compat.main()
-    finally:
-        flash_impl.flash_attention_bf16_two_pass = original
+    compat.FLASH_BACKEND = HYBRID_BACKEND
+    compat.BACKENDS = ("eager", HYBRID_BACKEND)
+    return_code = compat.main()
 
     output_dir = Path(os.environ.get(
         "SPECDEC_FLASH_G4_OUTDIR", "output/flash_g4",
@@ -59,13 +46,13 @@ def main() -> int:
     if not source.exists():
         raise RuntimeError(f"compatibility JSON missing: {source}")
     result = json.loads(source.read_text(encoding="utf-8"))
-    result["status"] = "latest_main_flash_g4_explicit_hybrid_compatibility"
-    result["runtime_policy"] = POLICY
+    result["status"] = "latest_main_flash_g4_backend_compatibility"
+    result["hybrid_policy"] = POLICY
     result["underlying_compatibility_decision"] = result["decision"]
     result["underlying_compatibility_return_code"] = return_code
 
     # The repository's unchanged eager B6 behavior is reference evidence, not
-    # a property introduced by this runtime-only candidate.  In particular,
+    # a property introduced by this hybrid backend. In particular,
     # latest main records BF16 SpecDec-vs-AR mismatches separately and owns
     # their signal/noise plus FP32 attribution.  Do not let such an eager
     # observation silently decide whether the *new* hybrid backend satisfied
@@ -76,11 +63,11 @@ def main() -> int:
         context_gates[context] = {
             "mainline_eager_observation": same_backend["eager"],
             "hybrid_candidate_gate": same_backend[
-                "triton_bf16_two_pass"
+                HYBRID_BACKEND
             ],
         }
     rollback_ok = bool(result["constructed_rollback_coverage"]["passed"])
-    flash_acceptance = result["acceptance_totals"]["triton_bf16_two_pass"]
+    flash_acceptance = result["acceptance_totals"][HYBRID_BACKEND]
     non_vacuous = bool(flash_acceptance["non_vacuous"])
     candidate_ok = bool(
         rollback_ok
@@ -97,7 +84,7 @@ def main() -> int:
         "passed": candidate_ok,
         "note": (
             "Unchanged eager BF16 behavior is recorded but does not gate the "
-            "runtime-only hybrid candidate; attribution remains owned by "
+            "hybrid backend; attribution remains owned by "
             "main-fresh B6 diagnostics."
         ),
     }

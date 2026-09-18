@@ -156,7 +156,10 @@ class SelfAttention(nn.Module):
             else:
                 v_all = torch.cat([cache["v"], v_cur16], dim=2)
                 cache["v"] = v_all
-        if self.attention_backend == "triton_bf16_two_pass":
+        triton_backend = self.attention_backend in (
+            "triton_bf16_two_pass", "triton_bf16_g4_hybrid",
+        )
+        if triton_backend:
             supported = (
                 fmt == "fp16"
                 and q.is_cuda
@@ -167,9 +170,15 @@ class SelfAttention(nn.Module):
             )
             if not supported:
                 raise RuntimeError(
-                    "triton_bf16_two_pass requires CUDA BF16, head_dim=128, "
+                    f"{self.attention_backend} requires CUDA BF16, head_dim=128, "
                     "fmt='fp16', and checkpoint-native KV heads"
                 )
+        use_triton = triton_backend and not (
+            self.attention_backend == "triton_bf16_g4_hybrid"
+            and cache is not None
+            and 2 <= s <= 4
+        )
+        if use_triton:
             # Lazy import preserves the existing eager/CPU/Windows path.
             from .flash_attention_two_pass_triton import (
                 flash_attention_bf16_two_pass,
@@ -180,7 +189,9 @@ class SelfAttention(nn.Module):
                 v_all.contiguous(),
                 causal=True,
             )
-        elif self.attention_backend == "eager":
+        elif self.attention_backend in (
+            "eager", "triton_bf16_g4_hybrid",
+        ):
             k_rep = kv_repeat(k_all, self.heads // self.kv_heads)
             v_rep = kv_repeat(v_all, self.heads // self.kv_heads)
             scores = torch.matmul(q, k_rep.transpose(-2, -1)) / (self.head_dim ** 0.5)
@@ -309,16 +320,22 @@ class QwenLM(nn.Module):
             # 'fp16': 仅记录格式; fp8 旋钮不影响 base 路径
 
     def set_attention_backend(self, backend: str = "eager") -> None:
-        """Select eager or the validated opt-in BF16 Triton backend.
+        """Select eager, pure Triton, or the G4-compatible hybrid backend.
 
-        The Triton implementation deliberately does not accept compressed KV.
-        Call this only between fresh runs; do not change attention semantics
-        while a live cache is being consumed.
+        The hybrid uses Triton for prompt prefill and cached q_len=1, and the
+        existing eager expression for cached q_len=2..4 verification. Triton
+        deliberately does not accept compressed KV. Call this only between
+        fresh runs; do not change attention semantics while consuming a cache.
         """
-        if backend not in ("eager", "triton_bf16_two_pass"):
+        if backend not in (
+            "eager",
+            "triton_bf16_two_pass",
+            "triton_bf16_g4_hybrid",
+        ):
             raise ValueError(
-                "attention backend must be 'eager' or "
-                "'triton_bf16_two_pass'"
+                "attention backend must be 'eager', "
+                "'triton_bf16_two_pass', or "
+                "'triton_bf16_g4_hybrid'"
             )
         for layer in self.layers:
             layer.self_attn.attention_backend = backend
