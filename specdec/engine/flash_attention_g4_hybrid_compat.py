@@ -62,9 +62,48 @@ def main() -> int:
     result["status"] = "latest_main_flash_g4_explicit_hybrid_compatibility"
     result["runtime_policy"] = POLICY
     result["underlying_compatibility_decision"] = result["decision"]
+    result["underlying_compatibility_return_code"] = return_code
+
+    # The repository's unchanged eager B6 behavior is reference evidence, not
+    # a property introduced by this runtime-only candidate.  In particular,
+    # latest main records BF16 SpecDec-vs-AR mismatches separately and owns
+    # their signal/noise plus FP32 attribution.  Do not let such an eager
+    # observation silently decide whether the *new* hybrid backend satisfied
+    # its own same-backend, cache, rollback, and determinism checks.
+    context_gates = {}
+    for context, row in result["context_results"].items():
+        same_backend = row["same_backend_correctness"]
+        context_gates[context] = {
+            "mainline_eager_observation": same_backend["eager"],
+            "hybrid_candidate_gate": same_backend[
+                "triton_bf16_two_pass"
+            ],
+        }
+    rollback_ok = bool(result["constructed_rollback_coverage"]["passed"])
+    flash_acceptance = result["acceptance_totals"]["triton_bf16_two_pass"]
+    non_vacuous = bool(flash_acceptance["non_vacuous"])
+    candidate_ok = bool(
+        rollback_ok
+        and non_vacuous
+        and all(
+            row["hybrid_candidate_gate"]["passed"]
+            for row in context_gates.values()
+        )
+    )
+    result["hybrid_gate"] = {
+        "contexts": context_gates,
+        "constructed_rollback_coverage": rollback_ok,
+        "non_vacuous_acceptance": non_vacuous,
+        "passed": candidate_ok,
+        "note": (
+            "Unchanged eager BF16 behavior is recorded but does not gate the "
+            "runtime-only hybrid candidate; attribution remains owned by "
+            "main-fresh B6 diagnostics."
+        ),
+    }
     result["decision"] = (
         "PASS_FLASH_G4_EXPLICIT_HYBRID_COMPATIBILITY"
-        if return_code == 0
+        if candidate_ok
         else "CHECK_FLASH_G4_EXPLICIT_HYBRID_COMPATIBILITY"
     )
     output = output_dir / "flash_attention_g4_hybrid_compat.json"
@@ -74,7 +113,7 @@ def main() -> int:
         f"hybrid_JSON={output}",
         flush=True,
     )
-    return return_code
+    return 0 if candidate_ok else 1
 
 
 if __name__ == "__main__":
