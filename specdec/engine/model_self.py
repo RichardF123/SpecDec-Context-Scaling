@@ -65,8 +65,13 @@ def kv_repeat(x: torch.Tensor, n_rep: int) -> torch.Tensor:
     return x.unsqueeze(2).expand(b, kv, n_rep, s, d).reshape(b, kv * n_rep, s, d)
 
 E4M3_MAX = 448.0
+INT8_MAX = 127.0
+INT4_MAX = 7.0
 GROUP_SIZE = 32      # full-FP8 ablation 默认组粒度
 GROUP_V = 128        # 正式 Asymmetric V-only: V 的 group size(=1 group/head)
+GROUP_K_INT8 = 128   # K-INT8 候选: per-token x per-head scale
+GROUP_V_INT4 = 32    # V-INT4 候选: per-token x per-head-dim group
+K_CHANNEL_BLOCK = 32 # K-INT8 候选: per-channel scale over completed token blocks
 
 def quantize_kv_fp8(x: torch.Tensor, group_size: int = GROUP_SIZE):
     d = x.shape[-1]
@@ -85,6 +90,145 @@ def dequantize_kv_fp8(q: torch.Tensor, scale: torch.Tensor, dtype: torch.dtype =
     qg = q.to(torch.float32).view(*q.shape[:-1], g, q.shape[-1] // g)
     hat = qg * scale.unsqueeze(-1)
     return hat.reshape_as(q).to(dtype)
+
+def quantize_kv_int8(x: torch.Tensor, group_size: int = GROUP_K_INT8):
+    """Symmetric RTN INT8 for KV tensors, grouped along head_dim.
+
+    With group_size=head_dim this is per-token x per-KV-head scaling.  INT8 keeps
+    the same one-byte payload as FP8 but provides substantially finer resolution
+    around zero, which is the property under test for the K-sensitive path.
+    """
+    d = x.shape[-1]
+    assert d % group_size == 0, f"head_dim {d} % group_size {group_size} != 0"
+    g = d // group_size
+    xg = x.to(torch.float32).view(*x.shape[:-1], g, group_size)
+    m = xg.abs().amax(dim=-1, keepdim=True)
+    scale = m / INT8_MAX
+    scale = torch.where(scale == 0, torch.ones_like(scale), scale)
+    q = torch.round(xg / scale).clamp(-INT8_MAX, INT8_MAX).to(torch.int8)
+    return q.reshape_as(x), scale.squeeze(-1)
+
+def dequantize_kv_int8(q: torch.Tensor, scale: torch.Tensor,
+                       dtype: torch.dtype = torch.float16):
+    g = scale.shape[-1]
+    qg = q.to(torch.float32).view(*q.shape[:-1], g, q.shape[-1] // g)
+    return (qg * scale.unsqueeze(-1)).reshape_as(q).to(dtype)
+
+def quantize_kv_int4_packed(x: torch.Tensor, group_size: int = GROUP_V_INT4):
+    """Symmetric signed INT4 with two head-dimension values packed per byte."""
+    d = x.shape[-1]
+    assert d % group_size == 0, f"head_dim {d} % group_size {group_size} != 0"
+    assert d % 2 == 0, f"head_dim {d} must be even for INT4 packing"
+    groups = d // group_size
+    xg = x.to(torch.float32).view(*x.shape[:-1], groups, group_size)
+    maximum = xg.abs().amax(dim=-1, keepdim=True)
+    scale = maximum / INT4_MAX
+    scale = torch.where(scale == 0, torch.ones_like(scale), scale)
+    signed = torch.round(xg / scale).clamp(-INT4_MAX, INT4_MAX).to(torch.int16)
+    signed = signed.reshape_as(x)
+    biased = (signed + 8).to(torch.uint8)
+    packed = biased[..., 0::2] | (biased[..., 1::2] << 4)
+    return packed, scale.squeeze(-1)
+
+def dequantize_kv_int4_packed(packed: torch.Tensor, scale: torch.Tensor,
+                              dtype: torch.dtype = torch.float16):
+    d = packed.shape[-1] * 2
+    low = (packed & 0x0F).to(torch.int16) - 8
+    high = (packed >> 4).to(torch.int16) - 8
+    signed = torch.stack((low, high), dim=-1).reshape(*packed.shape[:-1], d)
+    groups = scale.shape[-1]
+    qg = signed.to(torch.float32).view(*signed.shape[:-1], groups, d // groups)
+    return (qg * scale.unsqueeze(-1)).reshape_as(signed).to(dtype)
+
+def quantize_kv_int8_channel_blocks(x: torch.Tensor,
+                                    block_size: int = K_CHANNEL_BLOCK):
+    """Quantize complete token blocks with one INT8 scale per K channel.
+
+    ``x`` is (batch, kv_heads, tokens, head_dim), and tokens must be a whole
+    number of blocks.  Scales are (batch, kv_heads, blocks, head_dim).  The
+    caller retains an incomplete tail in BF16, matching the residual-cache idea
+    used by practical asymmetric KV quantizers.
+    """
+    b, h, tokens, d = x.shape
+    assert tokens % block_size == 0, (tokens, block_size)
+    blocks = tokens // block_size
+    xb = x.to(torch.float32).view(b, h, blocks, block_size, d)
+    maximum = xb.abs().amax(dim=3)
+    scale = maximum / INT8_MAX
+    scale = torch.where(scale == 0, torch.ones_like(scale), scale)
+    q = torch.round(xb / scale.unsqueeze(3)).clamp(
+        -INT8_MAX, INT8_MAX,
+    ).to(torch.int8)
+    return q.reshape_as(x), scale
+
+def dequantize_kv_int8_channel_blocks(q: torch.Tensor, scale: torch.Tensor,
+                                      dtype: torch.dtype = torch.float16,
+                                      block_size: int = K_CHANNEL_BLOCK):
+    b, h, tokens, d = q.shape
+    assert tokens % block_size == 0, (tokens, block_size)
+    blocks = tokens // block_size
+    qb = q.to(torch.float32).view(b, h, blocks, block_size, d)
+    return (qb * scale.unsqueeze(3)).reshape_as(q).to(dtype)
+
+def append_kv_int8_channel_cache(
+    q_cache: torch.Tensor | None,
+    scale_cache: torch.Tensor | None,
+    residual: torch.Tensor | None,
+    current: torch.Tensor,
+    block_size: int = K_CHANNEL_BLOCK,
+    residual_length: int = 0,
+):
+    """Append K values while retaining a recent BF16 residual window.
+
+    Older values are quantized only in complete ``block_size`` groups.  Once the
+    cache is long enough, the residual therefore stays in
+    ``[residual_length, residual_length + block_size)``.  A nonzero recent
+    residual follows the mechanism used by practical KV quantizers: recent K
+    values remain exact while their memory cost is amortized over long context.
+    """
+    assert residual_length >= 0
+    pending = current if residual is None else torch.cat([residual, current], dim=2)
+    quantizable = max(0, pending.shape[2] - residual_length)
+    full_tokens = (quantizable // block_size) * block_size
+    full = pending[:, :, :full_tokens]
+    new_residual = pending[:, :, full_tokens:]
+    if full_tokens:
+        q_new, scale_new = quantize_kv_int8_channel_blocks(full, block_size)
+        q_cache = q_new if q_cache is None else torch.cat([q_cache, q_new], dim=2)
+        scale_cache = (
+            scale_new if scale_cache is None
+            else torch.cat([scale_cache, scale_new], dim=2)
+        )
+    if q_cache is None:
+        b, h, _, d = current.shape
+        q_cache = torch.empty((b, h, 0, d), device=current.device, dtype=torch.int8)
+        scale_cache = torch.empty(
+            (b, h, 0, d), device=current.device, dtype=torch.float32,
+        )
+    return q_cache, scale_cache, new_residual
+
+def read_kv_int8_channel_cache(q_cache: torch.Tensor, scale_cache: torch.Tensor,
+                               residual: torch.Tensor, dtype: torch.dtype,
+                               block_size: int = K_CHANNEL_BLOCK):
+    completed = dequantize_kv_int8_channel_blocks(
+        q_cache, scale_cache, dtype, block_size,
+    )
+    return torch.cat([completed, residual], dim=2)
+
+def reduce_kv_heads(x: torch.Tensor, target_heads: int) -> torch.Tensor:
+    """Mean-pool groups of KV heads for a diagnostic GQA->MQA ablation.
+
+    This changes the pretrained model function and is therefore never enabled by
+    default or treated as a drop-in compression method.  It exists only to answer
+    whether reducing Qwen2.5-1.5B's two native KV heads is viable without uptraining.
+    """
+    source_heads = x.shape[1]
+    assert 0 < target_heads <= source_heads, (source_heads, target_heads)
+    assert source_heads % target_heads == 0, (source_heads, target_heads)
+    if target_heads == source_heads:
+        return x
+    b, _, s, d = x.shape
+    return x.reshape(b, target_heads, source_heads // target_heads, s, d).mean(dim=2)
 
 class SelfAttention(nn.Module):
     def __init__(self, hidden: int, heads: int, kv_heads: int, head_dim:int, attn_bias: bool = False):
@@ -105,6 +249,11 @@ class SelfAttention(nn.Module):
         self.fp8_g_v = GROUP_SIZE
         self.fp8_k = True
         self.fp8_v = True
+        # Native by default.  Values below native kv_heads are diagnostic only:
+        # directly collapsing pretrained GQA heads changes model semantics.
+        self.cache_k_heads = kv_heads
+        self.cache_v_heads = kv_heads
+        self.k_residual_length = 0
 
     def forward(self, x: torch.Tensor, cos, sin, cache = None) -> torch.Tensor:
         b, s, _ = x.shape
@@ -113,40 +262,78 @@ class SelfAttention(nn.Module):
         v = self.v_proj(x).view(b, s, self.kv_heads, self.head_dim).transpose(1, 2)
         q = apply_rope(q, cos, sin)
         k = apply_rope(k, cos, sin)
+        k = reduce_kv_heads(k, self.cache_k_heads)
+        v = reduce_kv_heads(v, self.cache_v_heads)
         fmt = cache.get("fmt", self.kv_format) if cache is not None else self.kv_format
-        # 模式语义: 'fp16'=base(bf16 KV 计算); 'v_fp8'=正式 V-only(K bf16 + V FP8 GROUP_V);
-        #           'fp8'=full FP8 K/V(negative ablation, 粒度经 fp8_g_*/fp8_k/v 旋钮)
+        if cache is not None:
+            assert cache["k"].shape[1] == k.shape[1], \
+                "K head policy changed while a cache was live"
+            assert cache["v"].shape[1] == v.shape[1], \
+                "V head policy changed while a cache was live"
+        # 模式语义: 'fp16'=base(bf16 KV); 'v_fp8'=正式 V-only;
+        # 其余格式仅为候选/消融，不改变默认正式路径。
         if fmt == 'v_fp8':
-            k_on, v_on, gk, gv = False, True, GROUP_SIZE, GROUP_V
+            k_quant, v_quant, gk, gv = 'none', 'fp8', GROUP_SIZE, GROUP_V
+        elif fmt == 'k_int8_v_fp8':
+            k_quant, v_quant, gk, gv = 'int8', 'fp8', GROUP_K_INT8, GROUP_V
+        elif fmt == 'v_int4':
+            k_quant, v_quant, gk, gv = 'none', 'int4', GROUP_SIZE, GROUP_V_INT4
+        elif fmt == 'k_pc_int8_v_fp8':
+            k_quant, v_quant, gk, gv = 'pc_int8', 'fp8', K_CHANNEL_BLOCK, GROUP_V
         elif fmt == 'fp8':
-            k_on, v_on, gk, gv = self.fp8_k, self.fp8_v, self.fp8_g_k, self.fp8_g_v
+            k_quant = 'fp8' if self.fp8_k else 'none'
+            v_quant = 'fp8' if self.fp8_v else 'none'
+            gk, gv = self.fp8_g_k, self.fp8_g_v
         else:
-            k_on = v_on = False
+            k_quant = v_quant = 'none'
             gk = gv = GROUP_SIZE
         qk_cur = qv_cur = ks_cur = vs_cur = None
-        if k_on:
+        if k_quant == 'fp8':
             qk_cur, ks_cur = quantize_kv_fp8(k, gk)
             k_cur16 = dequantize_kv_fp8(qk_cur, ks_cur, x.dtype)
+        elif k_quant == 'int8':
+            qk_cur, ks_cur = quantize_kv_int8(k, gk)
+            k_cur16 = dequantize_kv_int8(qk_cur, ks_cur, x.dtype)
         else:
             k_cur16 = k
-        if v_on:
+        if v_quant == 'fp8':
             qv_cur, vs_cur = quantize_kv_fp8(v, gv)
             v_cur16 = dequantize_kv_fp8(qv_cur, vs_cur, x.dtype)
+        elif v_quant == 'int4':
+            qv_cur, vs_cur = quantize_kv_int4_packed(v, gv)
+            v_cur16 = dequantize_kv_int4_packed(qv_cur, vs_cur, x.dtype)
         else:
             v_cur16 = v
-        if cache is None:
-            k_all, v_all = k_cur16, v_cur16
+
+        # K cache/read.  The per-channel candidate quantizes completed token
+        # blocks and retains an incomplete tail in BF16; all other formats keep
+        # the original append behavior.
+        if k_quant == 'pc_int8':
+            q_hist = None if cache is None else cache['k']
+            s_hist = None if cache is None else cache['k_scale']
+            residual = None if cache is None else cache['k_residual']
+            residual_length = (
+                self.k_residual_length if cache is None
+                else int(cache.get('k_residual_length', 0))
+            )
+            qk_store, ks_store, k_residual = append_kv_int8_channel_cache(
+                q_hist, s_hist, residual, k, K_CHANNEL_BLOCK, residual_length,
+            )
+            k_all = read_kv_int8_channel_cache(
+                qk_store, ks_store, k_residual, x.dtype, K_CHANNEL_BLOCK,
+            )
+        elif cache is None:
+            k_all = k_cur16
         elif fmt == 'fp16':
             k = torch.cat([cache["k"], k], dim=2)
-            v = torch.cat([cache["v"], v], dim=2)
-            cache["k"] = k
-            cache["v"] = v
-            k_all, v_all = k, v
+            k_all = k
         else:
-            # fp8 混合缓存读取: 有 *_scale 键 = fp8 payload(反量化), 否则 = bf16 全长历史
             if "k_scale" in cache:
-                k_all = torch.cat([dequantize_kv_fp8(cache["k"], cache["k_scale"],
-                                                     x.dtype), k_cur16], dim=2)
+                if cache["k"].dtype == torch.int8:
+                    k_hist = dequantize_kv_int8(cache["k"], cache["k_scale"], x.dtype)
+                else:
+                    k_hist = dequantize_kv_fp8(cache["k"], cache["k_scale"], x.dtype)
+                k_all = torch.cat([k_hist, k_cur16], dim=2)
             else:
                 k_all = torch.cat([cache["k"], k_cur16], dim=2)
                 cache["k"] = k_all                      # bf16 全长写回
@@ -199,31 +386,40 @@ class SelfAttention(nn.Module):
         else:
             raise RuntimeError(f"unknown attention backend: {self.attention_backend!r}")
         out = out.transpose(1, 2).contiguous().view(b, s, self.heads * self.head_dim)
-        if cache is None:
-            if fmt in ('fp8', 'v_fp8'):
-                nc = {"fmt": fmt}
-                if k_on:
-                    nc["k"], nc["k_scale"] = qk_cur, ks_cur
-                else:
-                    nc["k"] = k_all                    # bf16(K 不量化)
-                if v_on:
-                    nc["v"], nc["v_scale"] = qv_cur, vs_cur
-                else:
-                    nc["v"] = v_all
-                new_cache = nc
+        quantized_formats = (
+            'fp8', 'v_fp8', 'k_int8_v_fp8', 'v_int4', 'k_pc_int8_v_fp8',
+        )
+        if fmt in quantized_formats:
+            new_cache = {"fmt": fmt}
+            if k_quant == 'pc_int8':
+                new_cache["k"] = qk_store
+                new_cache["k_scale"] = ks_store
+                new_cache["k_residual"] = k_residual
+                new_cache["k_residual_length"] = residual_length
+            elif k_quant != 'none':
+                new_cache["k"] = (
+                    qk_cur if cache is None
+                    else torch.cat([cache["k"], qk_cur], dim=2)
+                )
+                new_cache["k_scale"] = (
+                    ks_cur if cache is None
+                    else torch.cat([cache["k_scale"], ks_cur], dim=2)
+                )
             else:
-                new_cache = {"k": k_all, "v": v_all}
-        elif fmt in ('fp8', 'v_fp8'):
-            if k_on:
-                cache["k"] = torch.cat([cache["k"], qk_cur], dim=2)
-                cache["k_scale"] = torch.cat([cache["k_scale"], ks_cur], dim=2)
-            # else: K 已在读路径按 bf16 全长写回
-            if v_on:
-                cache["v"] = torch.cat([cache["v"], qv_cur], dim=2)
-                cache["v_scale"] = torch.cat([cache["v_scale"], vs_cur], dim=2)
-            new_cache = cache
+                new_cache["k"] = k_all
+            if v_quant != 'none':
+                new_cache["v"] = (
+                    qv_cur if cache is None
+                    else torch.cat([cache["v"], qv_cur], dim=2)
+                )
+                new_cache["v_scale"] = (
+                    vs_cur if cache is None
+                    else torch.cat([cache["v_scale"], vs_cur], dim=2)
+                )
+            else:
+                new_cache["v"] = v_all
         else:
-            new_cache = cache
+            new_cache = {"k": k_all, "v": v_all}
         return self.o_proj(out), new_cache
     
     
@@ -254,7 +450,10 @@ class QwenLM(nn.Module):
     def _run(self,x, cache_list = None, need_logits = True):  
         start_pos = 0
         if cache_list is not None and cache_list[0] is not None:
-            start_pos = cache_list[0]["k"].shape[2]
+            first_cache = cache_list[0]
+            start_pos = first_cache["k"].shape[2]
+            if "k_residual" in first_cache:
+                start_pos += first_cache["k_residual"].shape[2]
         cos, sin = Build_Rope_cache(self.head_dim, seq_len=x.size(1), theta=self.rope_theta, device=x.device, dtype=x.dtype, start_pos=start_pos)
         new_cache_list = []
         for i, layer in enumerate(self.layers):
@@ -293,15 +492,27 @@ class QwenLM(nn.Module):
     def set_kv_format(self, fmt: str) -> None:
         """缓存格式: 'fp16'=base(bf16 KV); 'v_fp8'=正式 Asymmetric V-only
         (K bf16 不量化 + V FP8 E4M3 group=GROUP_V=128, 每 head 1 group);
+        'k_int8_v_fp8'=候选(K INT8 RTN + V FP8, 均 per-token x per-head);
+        'v_int4'=候选(K bf16 + packed V INT4 group32);
+        'k_pc_int8_v_fp8'=候选(K token-block/per-channel INT8 + V FP8);
         'fp8'=full FP8 K/V(negative ablation; K/V 粒度可经 set_fp8_groups/matrices 调)。"""
-        assert fmt in ("fp16", "fp8", "v_fp8"), fmt
-        if fmt == "v_fp8":
+        assert fmt in (
+            "fp16", "fp8", "v_fp8", "k_int8_v_fp8", "v_int4",
+            "k_pc_int8_v_fp8",
+        ), fmt
+        if fmt in ("v_fp8", "k_int8_v_fp8", "k_pc_int8_v_fp8"):
             assert self.head_dim % GROUP_V == 0, f"head_dim {self.head_dim} % GROUP_V != 0"
+        if fmt == "k_int8_v_fp8":
+            assert self.head_dim % GROUP_K_INT8 == 0, \
+                f"head_dim {self.head_dim} % GROUP_K_INT8 != 0"
+        if fmt == "v_int4":
+            assert self.head_dim % GROUP_V_INT4 == 0, \
+                f"head_dim {self.head_dim} % GROUP_V_INT4 != 0"
         self.kv_format = fmt
         for layer in self.layers:
             a = layer.self_attn
             a.kv_format = fmt
-            if fmt == "v_fp8":
+            if fmt in ("v_fp8", "k_int8_v_fp8", "k_pc_int8_v_fp8"):
                 a.fp8_k, a.fp8_v, a.fp8_g_v = False, True, GROUP_V
             elif fmt == "fp8":
                 a.fp8_k, a.fp8_v = True, True
