@@ -1,33 +1,40 @@
 # FlashAttention × latest G4 integration result
 
-Status: **CHECK — Flash q_len=1 serial and q_len=4 block semantics differ**
-Run date: 2026-09-17  
+Status: **SUPPORTING RESULT COMPLETE — useful long-context prefill optimization; experimental only**
+Run dates: 2026-09-17--18
 Base: `main-fresh@d4eb38967f5f51e7b2cd5292e38b6a06f1d8f897`  
 GPU: NVIDIA GeForce RTX 4060 8GB  
 Runtime: PyTorch 2.11.0+cu128, CUDA runtime 12.8, Triton 3.6.0
 
 ## Decision
 
-The migrated two-pass BF16 GQA Triton backend passes isolated attention,
-cached multi-token causal alignment, and cache rollback tests.  Early
-diagnostics found that it does not preserve eager backend tokens and traces for
-every real WikiText prompt.  Cross-backend equality is not a latest-main gate.
-For same-backend behavior, latest main records exact BF16 SpecDec-versus-AR
-results but explicitly treats its own 19/20 BF16 outcome through
-signal-versus-noise attribution and a separate exact FP32 implementation gate.
+The migrated two-pass BF16 GQA Triton backend is compatible with the latest G4
+cache contract at the operator and state-machine levels.  Pure custom
+`q_len=4` verification was numerically fragile, so the final bounded candidate
+is an **explicit hybrid**: custom Triton for prompt prefill and `q_len=1`, and
+the repository eager attention expression for cached `q_len=2..4`.  This is a
+named experimental policy, not a silent fallback and not official
+FlashAttention.
 
 No correctness threshold was relaxed.  The frozen G4 12-condition matrix was
-not changed.  `spec_dec.py` and `spec_cache.py` were not modified.
+not changed, `spec_dec.py` and `spec_cache.py` were not modified, and eager
+remains the default backend.
 
 | Required result | Outcome |
 |---|---|
-| eager versus Flash exact AR identity | **CHECK (diagnostic only)** |
-| eager versus Flash exact SpecDec trace | **CHECK (diagnostic only)** |
-| Flash SpecDec versus Flash target-only AR (BF16 behavior) | **CHECK; attribution in progress** |
-| latest-main FP32 SpecDec implementation gate | **unchanged reference** |
-| cache rollback compatibility | **PASS** |
-| cached `q_len=4` causal correctness | **PASS** |
-| default backend | **eager (unchanged)** |
+| isolated cached causal alignment, `q_len=1/2/4/8` | **PASS** |
+| constructed rollback payload/length coverage, `m=0..4` | **PASS** |
+| frozen WikiText-2 PPL equivalence | **PASS** |
+| 8K, 64-token same-backend SpecDec versus AR | **PASS** |
+| 512/2K, 64-token exact BF16 behavior | **CHECK; path-sensitive numerical decisions** |
+| 2K FP32 attribution | **BF16_PATH_UNDECIDABLE; FP32 paths consistent** |
+| cross-backend exact token/trace identity | **diagnostic only; not a mainline gate** |
+| production selector/default backend | **unchanged (`eager`)** |
+
+The candidate is therefore suitable as a **supporting systems ablation and
+reviewable prototype**, but not as a production-default replacement.  Its
+reportable result is strongest at 8K: it materially improves prefill while
+leaving SpecDec decode essentially unchanged.
 
 The corrected 512-token smoke gate has now run.  Eager SpecDec reproduced
 eager target-only AR, but Flash SpecDec did not reproduce Flash target-only
@@ -96,11 +103,12 @@ every eager q_len=4 block is exact in BF16; it shows that, from the identical
 custom-prefill state used in the failing route, replacing only custom q_len=4
 attention with the repository eager expression removed the tested divergence.
 
-The next bounded candidate is therefore an explicit runtime-only hybrid:
+The next bounded candidate was therefore an explicit runtime-only hybrid:
 custom Triton for prefill and q_len=1, repository eager attention for cached
 q_len=2..4.  It is named and tested explicitly, uses no official FlashAttention,
-and does not change production dispatch.  Only after full-context correctness
-and performance measurement will it be considered as an integration boundary.
+and does not change production dispatch. Full-context correctness,
+quality, performance, and profiling results for that boundary are recorded
+below.
 
 ## Correctness ladder
 
@@ -219,40 +227,130 @@ token/trace identity is an appropriate cross-kernel contract.  The SDPA probe
 subsequently passed this core sanity check, but official SDPA remains reference
 evidence only and is not part of the implementation.
 
+## Final explicit-hybrid correctness evidence
+
+The operator-isolation result justified one bounded integration boundary:
+custom Triton for prefill and `q_len=1`, repository eager attention for cached
+`q_len=2..4`. The hybrid preserves the latest G4 cache API and uses the
+unchanged target/draft state machine.
+
+At 2K/32 generated tokens, one BF16 decision differed between SpecDec and AR.
+The repository-style attribution found:
+
+```text
+first difference=29, SpecDec=264, AR=22844
+BF16 gaps: AR=-0.125000, SpecDec=+0.125000
+FP32 signal=+0.409622, observed BF16 path noise=0.534622
+FP32 paths consistent=True
+decision=BF16_PATH_UNDECIDABLE
+```
+
+Thus the high-precision implementation evidence is consistent, while the BF16
+decision is smaller than the measured path noise. This is recorded as CHECK,
+not relabelled as exact equivalence. At 8K/64 tokens, both eager and hybrid
+SpecDec matched their same-backend AR result, and the eager/hybrid tokens,
+statistics, and traces also matched for that tested prompt.
+
+The frozen quality gate on WikiText-2 windows 40..79 passed:
+
+| Backend | NLL | PPL |
+|---|---:|---:|
+| eager BF16 | 2.312986 | 10.1046 |
+| hybrid Flash BF16 | 2.312847 | 10.1031 |
+
+Paired `dNLL=-0.0001392`, one-sided 95% bound `0.0004992`, below the frozen
+`0.001` margin; relative PPL delta was `-0.0139%`.
+
+## Supporting performance ablation
+
+The final measurement used an RTX 4060 8GB, real nested WikiText prompts,
+both Qwen2.5-1.5B target and Qwen2.5-0.5B draft resident, one discarded warm-up,
+three measured repetitions, CUDA synchronization, rotated order, and
+controlled replay of the same workload. Configuration hash:
+`94fc2fb08e3e`.
+
+| Context | Mode | Prefill speedup | Decode speedup | Total speedup | Peak allocated delta | Peak reserved delta |
+|---:|---|---:|---:|---:|---:|---:|
+| 512 | AR | 1.053x | 1.019x | 1.018x | -1.5 MiB | -26 MiB |
+| 512 | SpecDec | 1.081x | 0.988x | 0.989x | +0.0 MiB | -8 MiB |
+| 2048 | AR | 1.338x | 1.030x | 1.061x | -10.2 MiB | -242 MiB |
+| 2048 | SpecDec | 1.202x | 1.085x | 1.091x | +0.0 MiB | -72 MiB |
+| 8192 | AR | 2.064x | 1.055x | 1.336x | -380.6 MiB | -2836 MiB |
+| 8192 | SpecDec | 1.408x | 0.991x | 1.145x | +1.0 MiB | +64 MiB |
+
+Peak allocated is the primary memory statistic; reserved deltas are allocator
+state and are reported separately. The 512/2K controlled-replay timings are
+valid performance comparisons, but their natural 64-token BF16 paths did not
+remain exactly equal and must not be presented as end-to-end equality results.
+The 8K natural validation did remain equal.
+
+## 8K decode bottleneck diagnosis
+
+The final profiler used three repetitions and CUDA events. It also calculated
+the exact bytes written by the current full-cache `torch.cat` append contract.
+
+| Workload/backend | Median decode | Target attention + KV | Draft layers | Cache-cat output written |
+|---|---:|---:|---:|---:|
+| AR eager | 3707.02 ms | 1282.63 ms | 0 | 13.84 GiB |
+| AR hybrid | 3634.26 ms | 991.93 ms | 0 | 13.84 GiB |
+| SpecDec eager | 6290.21 ms | 664.07 ms | 4112.07 ms | 14.06 GiB |
+| SpecDec hybrid | 6425.66 ms | 766.72 ms | 4164.24 ms | 14.06 GiB |
+
+For AR, the hybrid reduced the target attention-plus-KV segment by about
+`290.7 ms` (`22.7%`), but QKV projection, RoPE, MLP, logits, and full-cache
+copying remained. That is why the end-to-end decode gain was only about 2% in
+this instrumented run (and 5.5% in the lower-overhead supporting benchmark).
+
+For SpecDec, draft-model layers consumed about 65% of decode time. Across
+target and draft, cache append materialized `14.06 GiB` of K/V outputs over one
+64-token workload (`6.15 GiB` target plus `7.91 GiB` draft). Flash does not
+change either cost, and the custom path does not improve the eager `q_len=2..4`
+verification boundary. SpecDec bookkeeping itself was only 11--12 ms and is
+not the bottleneck.
+
+This supports a concrete next-stage design: preallocated K/V storage with a
+logical cache length, in-place append, and logical rollback compatible with
+`spec_cache.trim_cache()`. Paged KV is a later option. Such work should be a
+separate prototype and must not rewrite the frozen G4 cache contract in this
+Flash PR.
+
 ## Interpretation
 
-The evidence separates three claims:
+The evidence supports six scoped claims:
 
 1. **Attention/cache semantics are correct.** Cached multi-token masking,
-   native GQA mapping, trim/rollback, and corrective append all pass isolated
-   and constructed tests.
-2. **The kernel is numerically close but not behaviorally identical.** Small
-   per-layer differences from exponential approximation and reduction order
-   accumulate through 28 transformer layers and can change greedy argmax and
-   speculative acceptance.
-3. **Launch tuning is not a correctness fix.** Larger tiles and higher-accuracy
-   exponentiation changed which prompts matched, but no tested configuration
-   preserved all required behavior.
-4. **No simple phase hybrid fixes cross-backend strict identity.** Prefill-only and
-   online-only substitution both changed behavior, while the full route could
-   pass or fail depending on context because its numerical errors interact.
-5. **Strict cross-backend identity is not the mainline G4 gate.** The mainline
-   reference compares SpecDec with target-only AR from the same engine/backend;
-   round statistics and traces need to be valid, not identical to eager.
+   native GQA mapping, trim/rollback, and corrective append pass isolated and
+   constructed tests.
+2. **Pure custom q_len=4 is not ready.** Its small numerical differences can
+   change a BF16 greedy decision. Tile and exponent sweeps did not provide a
+   stable correctness fix.
+3. **The explicit hybrid is the defensible boundary.** It retains custom
+   long-prefill and q_len=1 paths while using the repository expression for
+   G4 block verification. It does not change cache or SpecDec semantics.
+4. **Quality equivalence passed.** The frozen PPL gate is comfortably within
+   its predeclared margin.
+5. **The useful performance result is long-context prefill.** At 8K, AR total
+   improved 1.336x and SpecDec total 1.145x, driven by 2.064x/1.408x prefill.
+   Decode gains were small or absent.
+6. **The next bottleneck is outside Flash attention.** SpecDec is dominated by
+   draft-model execution and repeated full-cache movement; bookkeeping is
+   negligible. A rollback-aware preallocated cache is the evidence-based next
+   prototype.
 
 The old PR #2 positive results remain valid for their recorded prompts and
-environment.  This latest-G4 result narrows their scope: they do not establish
-universal generated-token or SpecDec-trace equivalence on the new real-prompt
-gate.
+environment. This latest-G4 study adds block-verification/rollback evidence,
+documents the pure-custom q4 negative result, and narrows the implementation to
+an explicit hybrid supporting ablation.
 
 ## Repository action
 
-- retain eager as the default while the corrected same-backend gate is pending;
-- keep the Flash selector explicit and experimental only on this branch;
-- restore the validated PR #2 `BLOCK_N=64` launch instead of promoting the
-  failed BN128 candidate;
-- preserve the numerical screens as negative-result diagnostics;
-- rerun compatibility using same-backend SpecDec-versus-AR correctness;
-- do not run or report tuning/ablation stages as passed until that gate passes;
-- do not merge this branch as a production G4 optimization until the unchanged
-  mainline correctness contract passes and the result is reviewed.
+- keep eager as the production default;
+- keep the hybrid selector explicit and experimental;
+- preserve pure-custom q4 and numerical-sweep failures as negative results;
+- present the final table only as a supporting systems ablation, never as a
+  fourth factor in the frozen G4 experiment;
+- keep 512/2K long-horizon token differences labelled CHECK and retain the FP32
+  attribution evidence;
+- open this work as a draft/review PR rather than silently merging it;
+- pursue preallocated/logical-length KV cache work on a separate branch and
+  re-run rollback, AR, SpecDec, PPL, memory, and latency gates before adoption.

@@ -29,6 +29,12 @@ does not alter the latest-main BF16-attribution/high-precision protocol below.
 PyTorch Flash SDPA was used only as a sanity reference and is not a repository
 backend or proposed implementation.
 
+The follow-up operator isolation selected an explicit hybrid boundary: custom
+Triton for prompt prefill and cached `q_len=1`, repository eager attention for
+cached `q_len=2..4`. The frozen PPL gate passed. Final RTX-4060 supporting
+measurements and the 8K bottleneck profile completed on 2026-09-18; their
+reviewed summary is in `docs/flash_g4_latest_g4_results.md`.
+
 ## Frozen references
 
 - integration base: `main-fresh@d4eb38967f5f51e7b2cd5292e38b6a06f1d8f897`
@@ -131,31 +137,42 @@ PASS_FLASHATTENTION_PPL_EQUIVALENCE
 Stop and inspect the JSON immediately for any hard failure above.  Do not turn
 a BF16 mismatch into a pass without the repository's attribution evidence.
 
-## Stage 2 — bounded small-query tuning
+## Stage 2 — bounded small-query decision
 
-Only after Stage 1 passes:
+The original tile/exp sweep and block-versus-serial screen found no pure-custom
+`q_len=4` candidate that preserved the tested decisions. Do not continue an
+unbounded launch-parameter search. The selected experimental boundary is the
+explicit hybrid, exercised through:
 
 ```bash
-FLASH_TUNE_WARMUP=3 \
-FLASH_TUNE_REPS=9 \
-python -m specdec.engine.flash_attention_small_q_tune
+SPECDEC_FLASH_G4_OUTDIR=output/flash_g4_hybrid \
+FLASH_G4_COMPAT_CTX=512,2048,8192 \
+FLASH_G4_COMPAT_MAXNEW=32 \
+FLASH_G4_COMPAT_CHUNK=512 \
+python -m specdec.engine.flash_attention_g4_hybrid_compat
 ```
 
-This does not alter production dispatch.  Send the resulting
-`flash_attention_small_q_tune_*.json` for review.  The selected q=1, q=4, and
-large-prefill configurations must be committed separately, then Stage 1 must be
-re-run before performance data are collected.
+For a BF16 same-backend split, use the bounded repository-style attribution:
+
+```bash
+FLASH_HYBRID_ATTR_CTX=2048 \
+FLASH_HYBRID_ATTR_MAXNEW=32 \
+FLASH_HYBRID_ATTR_CHUNK=512 \
+python -m specdec.engine.flash_attention_g4_hybrid_attribution
+```
 
 ## Stage 3 — final supporting systems data
 
-Run only after the selected dispatch commit and repeated Stage 1 PASS:
+Run only after the correctness/attribution record and frozen PPL gate are
+available:
 
 ```bash
-FLASH_G4_CTX=512,2048,8192 \
-FLASH_G4_REPS=3 \
-FLASH_G4_WARM=1 \
-FLASH_G4_MAXNEW=64 \
-python -m specdec.engine.flash_attention_g4_ablation
+FLASH_G4_BENCH_CTX=512,2048,8192 \
+FLASH_G4_BENCH_REPS=3 \
+FLASH_G4_BENCH_WARMUP=1 \
+FLASH_G4_BENCH_MAXNEW=64 \
+FLASH_G4_BENCH_CHUNK=512 \
+python -m specdec.engine.flash_attention_g4_supporting_bench
 ```
 
 This is a supporting BF16 eager/Flash ablation; it does not modify the frozen
@@ -164,9 +181,11 @@ G4 KV × decode matrix.  Both 1.5B target and 0.5B draft remain GPU-resident.
 Then run the isolated 8K bottleneck diagnostic:
 
 ```bash
-FLASH_PROFILE_CTX=8192 \
-FLASH_G4_MAXNEW=64 \
-python -m specdec.engine.flash_attention_g4_bottleneck
+FLASH_G4_PROFILE_CTX=8192 \
+FLASH_G4_PROFILE_MAXNEW=64 \
+FLASH_G4_PROFILE_CHUNK=512 \
+FLASH_G4_PROFILE_REPS=3 \
+python -m specdec.engine.flash_attention_g4_bottleneck_profile
 ```
 
 Interpret the CUDA-event breakdown together with its stated residual caveat.
@@ -179,10 +198,11 @@ Expected files under `output/flash_g4/`:
 
 - `flash_attention_g4_core_probe.json`
 - `flash_attention_g4_specdec_compat.json`
+- `flash_attention_g4_hybrid_compat.json`
+- `flash_attention_g4_hybrid_attribution.json`
 - `flash_attention_two_pass_ppl_gate.json`
-- `flash_attention_small_q_tune_<hash>.json`
-- `flash_g4_ablation_<hash>.jsonl`
-- `flash_attention_g4_bottleneck.json`
+- `flash_g4_supporting_<hash>.json`
+- `flash_g4_bottleneck_profile.json`
 
 Raw outputs are not source commits.  Final reviewed summaries and provenance
 belong in the data ledger/results document after the runs are complete.
