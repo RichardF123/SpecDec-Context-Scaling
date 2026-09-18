@@ -5,6 +5,24 @@
 
 ---
 
+## 0. Amendment v7.2（2026-09-08，protocol amendment —— 覆盖下述各条的旧表述，历史文本保留不改写）
+
+**修订动因**：G3 pilot 证明"full-FP8 K/V"在本模型不可用（K-FP8 各粒度 ΔNLL≥+2.4），V-only FP8 无损；同时本机 CUDA FP16 对本 Qwen 路径 NaN → 正式质量口径必须 BF16。故把"KV precision={FP16,FP8}"的旧因子设计修订为下述结构。
+
+**修订内容（生效于正式 factorial；旧 FP16 时代数字 = 历史 operational evidence，不进正式汇总）**：
+1. Compute dtype：正式质量与性能实验**统一 BF16**（不做"性能 FP16 / 质量 BF16"双口径）。
+2. KV representation（正式 factorial 因子，2 档）：
+   - `base_bf16`：K=BF16，V=BF16（质量参考，uncompressed）；
+   - `v_fp8`：K=BF16，V=FP8 E4M3，per-token × per-KV-head scale，group=128（G3 正式方案）。
+3. ΔNLL/ΔPPL 一律**相对 base_bf16** 报告；质量参考 = uncompressed BF16 KV（不再是 FP16 KV）。
+4. AR 与 SpecDec 在**相同 KV representation** 下比较（同档内比；不跨档做分母）。
+5. full-FP8 K/V 与 K-FP8 仅保留为 **G3 negative ablation**，**不进入正式 factorial**。
+6. 正式 factorial = **3 context lengths × 2 KV representations × 2 decoding methods = 12 conditions**（本协议 §5/§6 已是 12 conditions；历史文档中的"18 格"为 v6/v7 内部 bookkeeping，已弃用，正式统计一律按 12 conditions 计）。
+7. 带宽归因口径（修正旧句"eager 下显存带宽不是瓶颈"）：当前 eager 实现**未观察到 V-only FP8 的延迟收益**——反量化开销超过了 KV 内存访问减少的潜在收益；本实验未独立隔离显存带宽，因此**不作更强归因**。
+8. G3 正式门（更新 §7 的 G3 定义口）：FP8 方案定案 = **Asymmetric V-only FP8 KV**（§0 第 2 项），质量/工程/显存证据见 `data_ledger.md` §3.5.3–3.5.4 与 `status_note_fp8_v4.md`；原"full-FP8"表述仅作历史与 negative ablation 引用。
+
+---
+
 ## 1. v7 → v7.1 Change Log（仅协议级修改）
 
 | # | 变更 |
@@ -105,6 +123,7 @@ dataset=Wikitext-2 test；窗口=非重叠固定上下文窗口；每 condition 
 - [ ] generation settings frozen
 - [ ] Spec k frozen（k=4）
 - [x] FP8 format/scaling frozen（design_freeze_fp8_kv.md v1.0，2026-09-08）
+- [x] G3 formal PASS / FROZEN（2026-09-08：Asymmetric V-only FP8 KV = base_bf16×v_fp8 因子落地；见 §0 Amendment v7.2 与 ledger §3.5.3）
 - [ ] speedup equations frozen
 - [ ] decode-only vs E2E definitions frozen
 - [ ] quality dataset/protocol frozen

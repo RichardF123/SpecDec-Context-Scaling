@@ -1,20 +1,21 @@
-"""Two-pass BF16 GQA FlashAttention diagnostic.
+"""Two-pass BF16 GQA FlashAttention backend.
 
 The one-pass kernel keeps online-softmax state and never materializes the
 attention matrix, but its block-local BF16 conversion does not match the
 custom eager engine's ``softmax(..., dtype=float32).to(bfloat16)`` boundary.
-This diagnostic deliberately recomputes QK in a second pass:
+This implementation deliberately recomputes QK in a second pass:
 
 1. compute and store one global maximum and denominator per query row;
 2. recompute QK, globally normalize each probability, cast that probability
    to BF16, and multiply by V.
 
 The O(M*N) score/probability matrix is still never materialized.  The extra
-storage is only two FP32 scalars per query row.  This is an isolated numerical
-diagnostic, not yet a production backend.
+storage is only two FP32 scalars per query row.  The engine keeps eager
+attention as its default and imports this inference-only backend lazily.
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
 import math
 
 import torch
@@ -22,12 +23,45 @@ import torch
 try:
     import triton
     import triton.language as tl
+    from triton.language.extra import libdevice
 except ImportError as error:  # pragma: no cover - validated on the GPU host
-    raise RuntimeError("Triton is required for the two-pass diagnostic") from error
+    raise RuntimeError("Triton is required for the two-pass backend") from error
 
 
 SUPPORTED_HEAD_DIM = 128
 KERNEL_REVISION = "v3_two_pass_global_probability_bf16"
+
+
+@dataclass(frozen=True)
+class FlashKernelConfig:
+    """Explicit launch configuration used by the bounded tuning harness."""
+
+    block_m: int
+    block_n: int
+    num_warps: int
+    num_stages: int
+    accurate_exp: bool = False
+
+
+def validated_pr2_config(query_length: int) -> FlashKernelConfig:
+    """Return the PR #2 launch policy retained as the production default."""
+    return FlashKernelConfig(
+        block_m=16 if query_length == 1 else 64,
+        block_n=64,
+        num_warps=4,
+        num_stages=2,
+    )
+
+
+def _validate_config(config: FlashKernelConfig) -> None:
+    if config.block_m not in (8, 16, 32, 64):
+        raise ValueError(f"unsupported BLOCK_M={config.block_m}")
+    if config.block_n not in (32, 64, 128):
+        raise ValueError(f"unsupported BLOCK_N={config.block_n}")
+    if config.num_warps not in (2, 4, 8):
+        raise ValueError(f"unsupported num_warps={config.num_warps}")
+    if config.num_stages not in (1, 2, 3):
+        raise ValueError(f"unsupported num_stages={config.num_stages}")
 
 
 @triton.jit
@@ -57,6 +91,7 @@ def _softmax_stats_bf16(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     CAUSAL: tl.constexpr,
+    ACCURATE_EXP: tl.constexpr,
 ):
     """Pass 1: compute global FP32 softmax statistics for each query row."""
     query_block = tl.program_id(0)
@@ -114,9 +149,15 @@ def _softmax_stats_bf16(
 
         block_max = tl.max(scores, axis=1)
         next_max = tl.maximum(running_max, block_max)
-        block_exp = tl.exp2((scores - next_max[:, None]) * LOG2_E)
+        if ACCURATE_EXP:
+            block_exp = libdevice.exp(scores - next_max[:, None])
+        else:
+            block_exp = tl.exp2((scores - next_max[:, None]) * LOG2_E)
         block_exp = tl.where(allowed, block_exp, 0.0)
-        old_weight = tl.exp2((running_max - next_max) * LOG2_E)
+        if ACCURATE_EXP:
+            old_weight = libdevice.exp(running_max - next_max)
+        else:
+            old_weight = tl.exp2((running_max - next_max) * LOG2_E)
         running_sum = running_sum * old_weight + tl.sum(block_exp, axis=1)
         running_max = next_max
 
@@ -166,6 +207,7 @@ def _globally_normalized_output_bf16(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     CAUSAL: tl.constexpr,
+    ACCURATE_EXP: tl.constexpr,
 ):
     """Pass 2: cast globally normalized probabilities before P @ V."""
     query_block = tl.program_id(0)
@@ -225,7 +267,10 @@ def _globally_normalized_output_bf16(
             )
 
         scores = tl.where(allowed, scores, -float("inf"))
-        numerator = tl.exp2((scores - global_max[:, None]) * LOG2_E)
+        if ACCURATE_EXP:
+            numerator = libdevice.exp(scores - global_max[:, None])
+        else:
+            numerator = tl.exp2((scores - global_max[:, None]) * LOG2_E)
         probability = tl.where(
             allowed,
             numerator / global_sum[:, None],
@@ -259,8 +304,9 @@ def flash_attention_bf16_two_pass(
     value: torch.Tensor,
     *,
     causal: bool = True,
+    config: FlashKernelConfig | None = None,
 ) -> torch.Tensor:
-    """Run the isolated two-pass global-normalization diagnostic."""
+    """Run two-pass global-normalization BF16 GQA attention."""
     if query.ndim != 4 or key.ndim != 4 or value.ndim != 4:
         raise ValueError("query, key, and value must all be rank-4 tensors")
     batch, query_heads, query_length, head_dim = query.shape
@@ -285,8 +331,10 @@ def flash_attention_bf16_two_pass(
         if not tensor.is_contiguous():
             raise ValueError(f"{name} must be contiguous")
 
-    block_m = 16 if query_length == 1 else 64
-    block_n = 64
+    config = validated_pr2_config(query_length) if config is None else config
+    _validate_config(config)
+    block_m = config.block_m
+    block_n = config.block_n
     row_max = torch.empty(
         (batch, query_heads, query_length),
         device=query.device,
@@ -311,8 +359,9 @@ def flash_attention_bf16_two_pass(
         "BLOCK_M": block_m,
         "BLOCK_N": block_n,
         "CAUSAL": causal,
-        "num_warps": 4,
-        "num_stages": 2,
+        "ACCURATE_EXP": config.accurate_exp,
+        "num_warps": config.num_warps,
+        "num_stages": config.num_stages,
     }
     _softmax_stats_bf16[grid](
         query,

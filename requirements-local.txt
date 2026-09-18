@@ -7,3 +7,8 @@ numpy>=1.26
 # Kernel work (Phase 3): run under WSL2 (Ubuntu) using requirements-kernels.txt,
 # or try `pip install triton-windows` on native Windows. If unavailable/slow:
 # LOCK EAGER (go/no-go rule) and proceed with L4/L4b/L5.
+
+# Docs only (PDF generation from markdown; not needed to run the engine/tests):
+reportlab>=4.0
+pypdf>=4.0
+

@@ -250,6 +250,115 @@ g64−g32 paired ΔNLL = +0.005145，SE = 0.000968，单侧 95% upper = +0.00679
 > **方法学教训（写进报告）**：首次跑出 6.83/7.62/7.63 GiB 的"峰值漂移"实为**测量伪影**——上一 run 的末块 logits（2048×151936×fp16 ≈ 0.62 GiB）跨 `empty_cache/reset_peak_memory_stats` 仍被变量引用而未释放；`del last_logits, cache` 后 3/3 稳定 6.83 GiB。峰值测量必须防跨 run 存留引用。
 > **另注**：`g2_peak_probe.py` 显示 torch reserved 池峰值 8.71 GiB > 物理 8 GiB（Windows WDDM 允许超订），nvidia-smi 实际占用峰值 ~7.70 GiB——无 OOM、无分页悬崖（时长稳定）；正式基准峰值列以 torch alloc 记 + smi used 参考。
 
+### 4.5.2 B3 双模型 8GB 可行性（G4，2026-09-08，`g4_b3_dual_model_feasibility.py`）
+条件：target=Qwen2.5-1.5B + draft=Qwen2.5-0.5B **同时常驻**，BF16 CUDA eager，batch=1；
+target KV ∈ {base_bf16, v_fp8}，draft 恒 base BF16；ctx ∈ {512, 8192}（chunked 2048）；3 轮稳定，decode smoke 5 tok。
+| 阶段/项 | 数值 | 备注 |
+|---|---|---|
+| 双模型权重常驻 | 加载后 free=2.00 GiB，smi used=5.76 GiB | target 后 free 0.81 GiB → draft 后 2.00 GiB |
+| ctx512 base_bf16 | alloc 4.34（3/3 同），resv 4.58，无 OOM，finite，smoke 稳定 | PASS |
+| ctx512 v_fp8 | alloc 4.336（3/3），resv 4.58，无 OOM，finite，smoke 稳定 | PASS（vs base −0.003 GiB 实测差）|
+| ctx8192 base_bf16 | alloc 6.16（3/3 同），resv 8.92，无 OOM，finite，smoke 稳定 | PASS（resv>8 GiB 物理：WDDM 池超订, 未 OOM）|
+| ctx8192 v_fp8 | alloc 6.16（3/3 同），resv 8.92，无 OOM，finite，smoke 稳定 | PASS（alloc 峰值与 base 相同——峰值被瞬态主导, 不宣称峰值收益；KV 逻辑差 54 MiB 见 §3.5.3）|
+| prefill 墙钟（参考, 非性能）| 512 ~0.1s；8192 tgt 8.2–8.5s / dft 8.5s | 可行性参考 |
+| decode smoke 5 tok | tgt ~0.2–0.8s；dft ~0.1–0.5s | 首 token tgt/dft 一致（512:' spans many de'; 8192:' of artificial'）|
+| 结论 | **B3: PASS（4/4 条件）**——双模型 8K 同驻可运行；不做跨实验显存比较（≠G2 fp16 单模型、≠G3 单模型 paired）| — |
+
+### 4.5.3 B4 cache 操作（G4，2026-09-08，`g4_b4_cache_tests.py` + 用户实现 `spec_cache.py`）
+| 项 | 结果 | 条件 |
+|---|---|---|
+| base_bf16（0.5B）| len=32 → append 35；trim→L0+1 / L0 正确；`raises=3/3`（超长/负数/0）；幂等；原 cache 不变 → **全 True** | 真 prefill(chunk16)+append+trim |
+| v_fp8（1.5B target）| len=32 → append 35；`v_scale-sync=True`；`raises=3/3`；`orig-unchanged=True` → **全 True** | 同上；`v_fp8` 为 target 专属（需 head_dim%128==0）|
+| 一致性守卫 | 人为裁短某层 `v` → `check_consistent` 抛 RuntimeError ✓ | — |
+| 结论 | **B4: PASS**（两模式，分进程运行以避免显存累积）| — |
+> 契约要点（按实现校正）：`trim_cache` 对**所有张量**沿 dim=2 裁（`v_scale` 同步）、返回浅拷贝不改入参、`new_len<=0` 或超长抛 `ValueError`、`trim_cache(None,0) is None`。
+> 环境经验：harness 的 `from_pretrained` 必须**本地优先**（`local_files_only=True`），否则 tokenizer 联网列模板会因网络抖动抛 `httpx.RemoteProtocolError`（曾被误判为"驱动静默杀进程"）。
+
+### 4.5.4 B5 SpecDec 最小 greedy 主循环（G4，`g4_b5_helper_tests.py` + `g4_b5_smoke.py`，实现 `spec_dec.py`）
+| 项 | 结果 | 条件 |
+|---|---|---|
+| 辅助函数单测 | **T1–T4 全 PASS** | T1 `_fmt`=True；T2 `_prefill`：shape `(1,5,151936)` finite、cache_len 5(exp 5)、**vs-forward max\|Δ\| = 0.000e+00**；T3 `_propose`：`cands == ref`（`[' Paris', '.', ' It', ' is']`）；T4 `_verify` 对齐：两条**独立** prefill 比较 `rows[j]` vs `serial[j]`（同一 row 索引），argmax-same `[True×4]`、block cache 9(exp 9)、same-context max\|Δ\| `[2.5e-01, 2.2e-01, 1.2e-01, 3.0e-01]` |
+| 主循环 smoke | **PASS（真实投机发生）** | stats（**实测**）：rounds 8 / proposed 27 / accepted 11 / mismatch 5 / all_accept 3 / rollbacks 5 / **`target_block_calls` 8（= rounds）** / **`draft_calls` 27（= proposed）**；`fields-complete=True sane=True gen_len=16`；重复运行一致 |
+| cache 不变量 | 每轮 `tgt_len == drf_len == pre + (m+1 if m<Kp else Kp)` 全成立 | 覆盖 m=0 / m=1 / m=4 与 Kp=1/2/4 |
+| **修后 GPU 复验**（2026-09-15，EOS 修复 `f7097d4` 之后） | **PASS（两档，逐轮 trace 全 `ok`）** | 见下"逐轮 cache 账"；两档 trace 与 stats **完全相同**（V-FP8 未改变任何决策，与 §4.5.6 一致）|
+| **结构性恒等式**（新登记） | `gen_len == accepted + mismatch_rounds`（16 = 11 + 5） | 每个错配轮恰好贡献 1 个 target token、每个全接受轮贡献 `kp`（= 已计入 accepted）⇒ 可作为 G5 落盘的自动校验式 |
+| 结论 | **B5: PASS**（修后复验有效） | 改动仅 EOS 分支 |
+
+> **逐轮 cache 账（修后实测，两档相同）**：
+> `round0 Kp=4 m=1 pre=12→14` ｜ `round1 Kp=4 m=0 pre=14→15` ｜ `round2 Kp=4 m=0 pre=15→16` ｜
+> `round3 Kp=4 m=1 pre=16→18` ｜ `round4 Kp=4 m=4 pre=18→22` ｜ `round5 Kp=4 m=4 pre=22→26` ｜
+> `round6 Kp=2 m=0 pre=26→27` ｜ `round7 Kp=1 m=1 pre=27→28`
+> —— 错配轮 `tgt=drf=pre+m+1`（0/1/2/3/6/7），全接受轮 `=pre+kp`（4/5）；`k_eff = min(4, 预算)` 的递减在 round6(Kp=2)/round7(Kp=1) 可见；给定 `max_new_tokens=16` 恰好产出 16。
+> **vacuity 教训（已修）**：主循环曾把 logits 保持为 `(1,V)` 且 `_propose` 用 `lg[0,-1]` 取到标量 → argmax 恒 0 → 候选恒为 token 0 → 接受率 0/58 的"空过 PASS"。现统一 logits 合同为 `(1,1,V)`（`_step` 返回 `lg[:, -1:]`），并在 B6 加 vacuity guard（`accepted==0` 时 verdict 降为 CHECK）。
+> 设计校正（v0.3）：错配分支**不得**复用 block 位置 `L+m+1` 的 logits（那里是**被拒 draft token** 的 K/V）；正确做法是 `trim_cache(tgt, pre+m)` 后对替换 token 做**一次单 token 前向**重算，两个模型都要做。
+>
+> **EOS 分支修复（2026-09-15，逐行评审发现）**：`_propose` 原把 `if t == eos_id: break` 放在**推进 cache 之前**，于是 draft 提议的最后一个候选是 EOS 时 draft cache 长度只有 `pre+kp-1`；当该轮被 target 全部确认（`m==kp`，即生成正常以 EOS 收尾）时，全接受分支的 `trim_cache(drf_cache, pre+kp)` 越界 → `ValueError`。**这是常规收尾路径，正式实验必踩。**
+> - 修法（根治，非 clamp 补丁）：EOS 检查移到推进之后 ⇒ `_propose` 出口恒定 `len(cache)==pre+kp`（唯一不变量）；副产物 `draft_calls += kp` 与实际 draft 前向次数**精确相等**（此前 EOS 轮少算 1）。
+> - 回归测试 `g4_b5_eos_branch_tests.py`（**纯逻辑 CPU stub，无模型/GPU/网络，毫秒级**，4 个 case）：修后全部 `gen` 符合预期、每轮 `tgt_len==drf_len==pre+(m+1 if m<kp else kp)`、`draft_calls==proposed`；**旧实现对照在 3 个 EOS 全接受 case 上如实复现 `ValueError: new_len N 越界 (current N-1)`**（非空过保证），EOS 被拒 case 两版行为一致。→ **B5-EOS-branch: PASS**。
+> - 对已有登记的影响：改动**只落在"该轮出现 EOS 候选"时的 draft cache 长度**。B6 的 10 个 case 未崩溃 ⇒ 不存在"EOS 候选被全接受"的轮；"EOS 候选被拒"轮经上述对照确认两版逐 token 输出一致 ⇒ **B6-bf16 的 19/20 与 194/381 结论不变**。B5 原 PASS 记录基于修前版本，**建议在修后重跑 `g4_b5_helper_tests` + `g4_b5_smoke` 以保持登记有效**（改动仅 EOS 分支）。
+
+### 4.5.5 B6 exact-token-id 正确性门（G4，`g4_b6_correctness.py`）→ **CHECK（19/20）**
+条件：10 类 prompt × 2 KV 档（base_bf16 / v_fp8）= **20 组合**；判据 = `spec_decode_greedy(...)["gen"] == target-only greedy`（**同引擎 cached AR** 参照，不是 HF）逐 token id 全等，不比文本；另加 logits finite + 重复确定性。
+| 项 | 结果 |
+|---|---|
+| base_bf16 档 | 9/10 逐 token 全等；唯一不等 = `natural-2`（"Photosynthesis is the process by which", n=16），首个分歧 @7 |
+| v_fp8 档 | 10/10 逐 token 全等（同一 `natural-2` prompt 未翻面）|
+| 合计 | **19/20 组合全等**；两档合计 accepted/proposed = **194/381**；logits 全 finite；重复运行一致 |
+| 判据结论 | **B6: CHECK**（未达 PASS；按协议 §"不得改参照、不得放宽门"）|
+
+**唯一分歧的归因**（`g4_b6_tie_diag.py`；同一 prefix = `ids + ref[:7]`，len=14）：
+
+| 口径（同位置） | `' use'`(id 990) | `' convert'`(id 5508) | gap | argmax |
+|---|---|---|---|---|
+| bf16 full / cached / AR-history | 22.8750 | 22.8750 | **0.0000**（`tied_at_max=2`）| **三路径全 = `' use'`（= ref）** |
+| fp32 full / cached / AR-history | 23.1752 | 23.3243 | **+0.1491** | **三路径全 = `' convert'`** |
+
+- **signal vs noise（同位置、同一候选对）**：`signal = |gap_fp32| = 0.1491`；`noise = |gap_bf16 − gap_fp32| = 0.1491` ⇒ `|signal| ≤ noise` ⇒ 该位置在 bf16 下**数值不可判定**（与算法实现无关）。bf16 绝对偏差 0.300 / 0.449（1 ULP = 0.125 ⇒ 2.4–3.6 ULP），而真差距仅 1.2 ULP → **bf16 连 gap 符号都判反了**。
+- 形状噪声实测（同位置整行 logits）：full-vs-cached max\|Δ\| = **0.250**；hist-vs-full = **0.281**（≈2–4 ULP）。
+- `spec[7] = ' convert'` **等于 fp32 真值**；`ref[7] = ' use'` 是 bf16 精确并列下按最小 token id 破平局的结果 ⇒ 该位置**投机路径输出的才是数值上正确的 token**。
+- **登记裁决（用户决定 = A 严格口径）**：**不设"平局例外"、不放宽 exact-id 门** ⇒ B6 记 **CHECK**，该位置作为"已知数值限制"写入报告，不转 PASS。
+- 推论（须进报告 Method/Limitations）：投机解码的接受判据本质是 **argmax 相等性检验**，其可靠性上限 = bf16 下 gap 符号的可靠性 ⇒ 实测接受率含一层**不可消除的平局翻面噪声**（可作为 Analysis 的量化项：统计验证位置上 bf16 top-2 gap ≤ 实测形状噪声带的占比）。
+- 后果（开放项，待用户决定）：协议"B6 未过不得提出主循环性能声明"仍生效；Part 4 测量是否降级为"工程观测（非已验证正确性）"需明确。
+> 仪器/判读教训：**`topk` 的返回顺序 ≠ 决策路径的 `argmax`**（并列时前者不保证取最小 index）。本 case 首次输出里 `top1=' convert'` 是 `topk` 假象，真实 argmax 三路径全为 `' use'`。B6 的 `divergence_diag` 与 tie diag 均改为打印 argmax/tied 数。
+> 设备契约：`spec_dec._verify` 曾写死 `device="cuda"`，已改为跟随 `cache[0]["k"].device`（CPU fp32 复算的前提）；fp32 阶段一律 CPU 单模型（8 GB 显存放不下 fp32 权重 6.2 GB + 临时拷贝）。
+
+### 4.5.6 B6-fp32 实现正确性门（高精度档，预登记后实测）→ **PASS**
+条件：同 §4.5.5 的 **10 个 case × 2 KV 档 = 20 组合**；**CPU / float32 / 双模型 eager / batch=1 / k=4 / greedy**（`g4_b6_fp32_correctness.py`）。判据与 §4.5.5 **逐字一致**（逐 token id 全等 vs 同引擎 cached AR；logits 全 finite；重复运行确定；vacuity guard；**case 与档位必须跑满**否则不得判 PASS）。判据在运行前入库（commit `3f7fe6f` 预登记 + `9aa6b00` 补漏），**脚本运行前后未做任何修改**；运行于 EOS 修复（`f7097d4`）**之后**。
+
+| case | n | base_bf16 acc/prop | v_fp8 acc/prop | rounds | 耗时 b/v (s) |
+|---|---|---|---|---|---|
+| natural-1 | 16 | 11/21 | 11/21 | 6 | 24.3 / 26.9 |
+| natural-2 | 16 | 16/16 | 16/16 | 4 | 16.9 / 20.6 |
+| math | 16 | 9/31 | 9/31 | 9 | 34.5 / 36.1 |
+| code | 16 | 14/19 | 14/19 | 5 | 22.3 / 24.6 |
+| short | 16 | 12/24 | 12/24 | 6 | 12.1 / 25.8 |
+| long | 16 | 12/25 | 12/25 | 7 | 13.6 / 26.8 |
+| len13 | 13 | 11/15 | 11/15 | 5 | 9.3 / 19.1 |
+| len5 | 5 | 5/5 | 5/5 | 2 | 4.0 / 8.3 |
+| len2 | 2 | 2/2 | 2/2 | 1 | 2.2 / 4.8 |
+| eos-prone | 16 | 16/16 | 16/16 | 4 | 8.9 / 20.0 |
+| **合计** | — | **216/348** | 逐组合相同 | — | 单 case 2.2–36.1 |
+
+- **20/20 组合 `equal=True`**（逐 token id）；`logits finite (all) = True`；`determinism[natural-1] = determinism[long] = True`（各 2 次，两档各测）；两档 `acc/prop` **逐 case 完全相同**（V-FP8 只改变数值、未改变任何决策 ⇒ 与 §3.5.3 的质量结论方向一致）。
+- 修后一致性核对：修前小样（`B6F_LIMIT=2`）的 `natural-1 = 11/21`、`natural-2 = 16/16` 在全量运行中**逐字复现** ⇒ EOS 修复（仅 EOS 分支）未扰动其他路径，与设计预期一致。
+
+**同 case 的 bf16 档 vs fp32 档对照（RQ2 用）**
+
+| 口径 | 总 accepted/proposed | 接受率 |
+|---|---|---|
+| B6-bf16（§4.5.5） | 194/381 | 50.9% |
+| B6-fp32（本节） | 216/348 | 62.1% |
+
+- `natural-2`：bf16 首个分歧 @7（tie-collapse）；**fp32 下 16/16 全接受且逐 token 全等** —— 即该 prompt 上 draft 与 target 的决策其实**完全一致**，bf16 的翻面同时污染了"输出 token"和"接受判定"两件事。
+- **解释边界（必须写明，不可越界归因）**：这 11.2 个百分点是**复合效应** —— bf16 下 draft 与 target 的 argmax 都会在近并列处翻面，既可能改变"提议了什么"，也可能改变"是否判为接受"，因此**不能**把差值单独归因于 tie-collapse。要归因需专门测量（统计验证位置上 bf16 top-2 gap ≤ 实测形状噪声带 0.25–0.281 的占比 = **tie 频率普查**），已列为 RQ2 的后续测量项。
+- **接受率强烈依赖 prompt**：同一档内从 `math` 9/31（29.0%）到 `natural-2`/`eos-prone` 16/16（100%）⇒ **接受率不可用单条 prompt 代表**；这正是协议要求 ≥16 个 prompt families 的实证理由（`math` 类低接受率形态必须被覆盖）。
+
+**门禁口径（防评审误读）**
+- **B6 门 = 两档并列登记**：**B6-fp32 = 实现正确性证据（PASS）**；**B6-bf16 = 性能档行为（CHECK 19/20 + 归因）**，其失败与归因原样保留在 §4.5.5，**不作任何修改或豁免**。
+- 本节**未放宽任何判据**：判据与 §4.5.5 逐字相同，差异仅在**被测量的配置**（dtype/设备）；"dtype 不是被测对象"已在本节头部（脚本 docstring）**运行前冻结**并入库。
+- 结论适用范围：`spec_decode_greedy` 的**控制流 / cache 语义（prefill-trim-rollback 与长度不变量）/ logits 对齐 / 替换 token 单步重算 / EOS 与 budget<k 边界**在良定义配置下逐 token 正确；**bf16 档的 tie-collapse 作为已知数值限制披露**，不构成对性能结论的豁免。
+- Phase 4 前提：本条 PASS 满足"实现正确性"门槛；测量仍须携带 §4.5.5 的数值限制说明。
+
 ## 5. 复现设置（每次记录必须带上）
 - seed=42（测试）；性能脚本 seed=0，3 reps 取最优 + warmup；
 - prompt 固定（bench_basic.PROMPT，38 tok）；decode 数 64；
@@ -289,6 +398,11 @@ g64−g32 paired ΔNLL = +0.005145，SE = 0.000968，单侧 95% upper = +0.00679
 - 2026-09-08（归档）：全流程日报 `daily_report_2026-09-08b_G1G2G3_FP8KV.md`；pilot 归因数据入 §3.5.4（`fp8_kv_group_probe`）；v_fp8 正式实现与测试入口就绪（`fp8_vonly_v1_roundtrip` / `fp8_vonly_8k_operational`）。
 - 2026-09-08（会话续，A4）：**V-only V1 实测 PASS**（fp8_vonly_v1_roundtrip [1]–[7] 全 True，含 current==stored 断言）→ **G3: PASS / FROZEN**（正式 = Asymmetric V-only FP8 KV；negative = K-FP8/full-FP8）。G4 尚未开始。
 - 2026-09-08（日终）：阶段 B 仅文档：`design_freeze_g4_specdec.md` v0.1 DRAFT（k=4/greedy/exact-equivalence/cache 不变式/B3 前置门）；B3–B6 未实现；日报 `daily_report_2026-09-08b_G1G2G3_FP8KV.md` §七 收尾归档。
-
-- 2026-09-14：登记 V-INT4 group64/group128 尾部验证（§3.6.1）；g64 fresh confirmation 未通过，保持 group32，关闭 scale-granularity sweep。
-- 2026-09-14：登记 from-scratch BF16 GQA FlashAttention（§3.7）；单遍版整模型等价失败，最终两遍式版本通过 core、2K/4K/8K greedy、40-window PPL equivalence 及 production-selector smoke；作为显式可选 BF16 后端，默认 eager 和冻结 G3 不变。
+- 2026-09-08（协议修订 + G4 设计审查）：`plan_v7_1_protocol_freeze.md` 增 **Amendment v7.2（§0）**：Compute=BF16；KV 因子={base_bf16, v_fp8}；质量参考=uncompressed BF16；Δ 相对 base_bf16；AR/SpecDec 同档比较；full/K-FP8 仅 negative ablation 不入 factorial；正式=12 conditions（历史"18 格"=旧 bookkeeping）；带宽归因改"反量化开销>省内存潜在收益、未独立隔离带宽、不作更强归因"。`design_freeze_g4_specdec.md` → **v0.2**（取消 bonus；logits 对齐规则 [saved, b_0..b_{k'-2}] 判 d1..d_k'，b_{k'-1} 不判；输入/template 一致；trim/rollback 精确语义；越界抛错；OOM finally；base/v_fp8 共用逻辑）。新增 **G4-0 harness**（`g4_0_draft_correctness.py`，0.5B bf16 门槛，编译通过，**尚未 GPU 运行**）。
+- 2026-09-08（G4-0 归因，已实测）：**CONDITIONAL PASS — BF16 shape drift characterized**。OURS full==HF full（max|Δ|=0）、OURS cached==HF cached（=0）；HF cached/full 同处分歧；所有路径重复确定；FP32 四路径一致 → 非 ENGINE BUG/NONDETERMINISM。block-vs-serial：被测 argmax 一致、cache 终长一致、无 off-by-one；block/serial cache 数值差 max|Δ|≈2.0 → **B6 exact-id 门保留为风险**。失败样本（cached=' for' vs full=' since', 生成第 8 步）保留。新增诊断 harness `g4_0_drift_diag.py`、`g4_block_vs_serial.py`（已实现，GPU 运行结果已用于归因）；G4-0 全量生成 exact-id 等价仍由 B6 把关（未做）。B3 harness `g4_b3_dual_model_feasibility.py` 就绪待跑。
+- 2026-09-08（B3 实测）：**B3: PASS（4/4 条件）**——1.5B+0.5B 双模型同驻 BF16，ctx512/8192 × target-KV base_bf16/v_fp8 全部 prefill+decode smoke 无 OOM、finite、3 轮稳定；详见 §4.5.2。v_fp8 与 base 的 alloc 峰值在双模型 8K 下相同（6.16 GiB），不宣称峰值收益。
+- **日期更正 + 2026-09-15 登记**：§4.5.2（B3）与 §4.5.3（B4）实际运行于 **2026-09-15**（早前标签沿用会话内 09-08，特此更正，数据不变）。同日：协议 Amendment v7.2 写入 `plan_v7_1_protocol_freeze.md`；G4 设计文档升 v0.2（取消 bonus / logits 对齐规则 / cache 回滚语义）；G4-0 归因登记为 **CONDITIONAL PASS（BF16 shape drift）**；`spec_cache.py` 由用户实现并**通过 B4**；`spec_dec.py` 已建文件但**尚未实现**（B5/B6 harness 已就绪：`g4_b5_smoke.py` / `g4_b6_correctness.py`）。日报见 `daily_report_2026-09-15.md`。
+- 2026-09-15（B5/B6 实测）：**B5: PASS**（T1–T4 单测 + 真实投机 smoke；cache 不变量全成立；修掉 `(1,V)`→`(1,1,V)` 造成的 0/58 空过 PASS）；**B6: CHECK（19/20）**——base_bf16 档 9/10、v_fp8 档 10/10，唯一分歧 `natural-2` @7 经 `g4_b6_tie_diag.py` 归因为**bf16 数值不可判定位置**（signal 0.1491 ≤ noise 0.1491；fp32 真值 = spec 侧 token）；**用户裁决 A = 严格口径：不设例外、不放宽门，B6 记 CHECK**。同日修正 `spec_dec._verify` 的 `device="cuda"` 硬编码；详见 §4.5.4 / §4.5.5。
+- 2026-09-15（EOS 分支修复 + B6-fp32 预登记）：逐行评审 `spec_dec.py` 发现并修复 **EOS 全接受路径的 `trim_cache` 越界**（`_propose` 的 EOS break 位置 → draft cache 长度 `pre+kp-1`），改为"EOS 检查在推进之后"使不变量统一为 `pre+kp`；新增**纯逻辑回归测试** `g4_b5_eos_branch_tests.py`（CPU stub，含旧实现对照复现 ValueError，B5-EOS-branch: PASS，详见 §4.5.4）。同时新增并**预登记** `g4_b6_fp32_correctness.py`（B6-fp32：CPU/float32 下的实现正确性门；判据在运行前入库，仅当 case×两 KV 档全部逐 token 相等才 PASS），结果待跑。
+- 2026-09-15（B6-fp32 实测）：**B6-fp32: PASS** —— 10 case × 2 KV 档 = **20/20 组合逐 token id 全等**（参照 = 同引擎 cached AR），finite 全真、确定性通过、非空过（总 **216/348**，62.1%），两档逐 case 数字相同；运行于 EOS 修复之后，且修前小样数字逐字复现。**B6 门按两档并列登记：fp32 档 = 实现正确性证据；bf16 档 = 性能档行为 CHECK 19/20 + tie-collapse 归因（§4.5.5 原样保留）**。新增 RQ2 观察：bf16 档接受率 50.9% vs fp32 档 62.1%，且**接受率强依赖 prompt**（29.0%–100%）；差值属复合效应，单独归因需 tie 频率普查。详见 §4.5.6。
+- 2026-09-15（B5 修后 GPU 复验）：`g4_b5_helper_tests` + `g4_b5_smoke` 在 EOS 修复（`f7097d4`）**之后**重跑 → **两档全 PASS**，逐轮 cache 账全 `ok`；`target_block_calls 8`、`draft_calls 27` 由实测确认为推导值；新登记结构性恒等式 `gen_len == accepted + mismatch_rounds`。B5 的 PASS 记录现已对应当前代码（§4.5.4）。

@@ -241,8 +241,8 @@ class SelfAttention(nn.Module):
         self.kv_heads = kv_heads
         self.head_dim = head_dim
         self.kv_format = "fp16" 
-        # The validated Triton path is opt-in.  Keeping eager as the default
-        # preserves CPU/native-Windows support and all existing experiments.
+        # FlashAttention is opt-in.  The default path must remain importable on
+        # CPU and native Windows installations that do not provide Triton.
         self.attention_backend = "eager"
         # 策略旋钮: 'fp8'(full K/V ablation) 时生效; 'v_fp8'(正式) 时 V 固定 GROUP_V
         self.fp8_g_k = GROUP_SIZE
@@ -336,27 +336,13 @@ class SelfAttention(nn.Module):
                 k_all = torch.cat([k_hist, k_cur16], dim=2)
             else:
                 k_all = torch.cat([cache["k"], k_cur16], dim=2)
-
-        # V cache/read.  Packed INT4 is identified by uint8 payload; existing
-        # FP8 formats retain their original dequantization path.
-        if cache is None:
-            v_all = v_cur16
-        elif fmt == 'fp16':
-            v_all = torch.cat([cache["v"], v], dim=2)
-        elif "v_scale" in cache:
-            if cache["v"].dtype == torch.uint8:
-                v_hist = dequantize_kv_int4_packed(
-                    cache["v"], cache["v_scale"], x.dtype,
-                )
+                cache["k"] = k_all                      # bf16 全长写回
+            if "v_scale" in cache:
+                v_all = torch.cat([dequantize_kv_fp8(cache["v"], cache["v_scale"],
+                                                     x.dtype), v_cur16], dim=2)
             else:
-                v_hist = dequantize_kv_fp8(
-                    cache["v"], cache["v_scale"], x.dtype,
-                )
-            v_all = torch.cat([v_hist, v_cur16], dim=2)
-        else:
-            v_all = torch.cat([cache["v"], v_cur16], dim=2)
-        assert self.heads % k_all.shape[1] == 0, (self.heads, k_all.shape[1])
-        assert self.heads % v_all.shape[1] == 0, (self.heads, v_all.shape[1])
+                v_all = torch.cat([cache["v"], v_cur16], dim=2)
+                cache["v"] = v_all
         if self.attention_backend == "triton_bf16_two_pass":
             supported = (
                 fmt == "fp16"
@@ -371,8 +357,7 @@ class SelfAttention(nn.Module):
                     "triton_bf16_two_pass requires CUDA BF16, head_dim=128, "
                     "fmt='fp16', and checkpoint-native KV heads"
                 )
-            # Lazy import keeps Triton optional for the default eager backend
-            # and for native Windows installations.
+            # Lazy import preserves the existing eager/CPU/Windows path.
             from .flash_attention_two_pass_triton import (
                 flash_attention_bf16_two_pass,
             )
@@ -382,9 +367,9 @@ class SelfAttention(nn.Module):
                 v_all.contiguous(),
                 causal=True,
             )
-        else:
-            k_rep = kv_repeat(k_all, self.heads // k_all.shape[1])
-            v_rep = kv_repeat(v_all, self.heads // v_all.shape[1])
+        elif self.attention_backend == "eager":
+            k_rep = kv_repeat(k_all, self.heads // self.kv_heads)
+            v_rep = kv_repeat(v_all, self.heads // self.kv_heads)
             scores = torch.matmul(q, k_rep.transpose(-2, -1)) / (self.head_dim ** 0.5)
             T = k_all.shape[2] if cache is not None else s
             p = T - s
@@ -398,6 +383,8 @@ class SelfAttention(nn.Module):
                 scores = scores.masked_fill(mask, float('-inf'))
             attn = torch.softmax(scores, dim=-1, dtype=torch.float32).to(q.dtype)
             out = torch.matmul(attn, v_rep)
+        else:
+            raise RuntimeError(f"unknown attention backend: {self.attention_backend!r}")
         out = out.transpose(1, 2).contiguous().view(b, s, self.heads * self.head_dim)
         quantized_formats = (
             'fp8', 'v_fp8', 'k_int8_v_fp8', 'v_int4', 'k_pc_int8_v_fp8',
@@ -533,12 +520,11 @@ class QwenLM(nn.Module):
             # 'fp16': 仅记录格式; fp8 旋钮不影响 base 路径
 
     def set_attention_backend(self, backend: str = "eager") -> None:
-        """Select the attention implementation for subsequent fresh runs.
+        """Select eager or the validated opt-in BF16 Triton backend.
 
-        ``triton_bf16_two_pass`` is the validated RTX-4060 inference-only
-        backend.  It intentionally supports only the BF16/native-GQA baseline;
-        quantized KV formats remain on eager attention until a separately
-        validated fused dequantization kernel exists.
+        The Triton implementation deliberately does not accept compressed KV.
+        Call this only between fresh runs; do not change attention semantics
+        while a live cache is being consumed.
         """
         if backend not in ("eager", "triton_bf16_two_pass"):
             raise ValueError(
@@ -547,35 +533,6 @@ class QwenLM(nn.Module):
             )
         for layer in self.layers:
             layer.self_attn.attention_backend = backend
-
-    def set_kv_head_policy(self, k_heads: int | None = None,
-                           v_heads: int | None = None) -> None:
-        """Set stored K/V head counts for a controlled diagnostic ablation.
-
-        None restores the checkpoint-native count.  Reducing heads applies a
-        deterministic mean merge and changes the pretrained model; such results
-        are screening evidence only unless an explicit training procedure exists.
-        Call only before starting a fresh cache.
-        """
-        native = self.layers[0].self_attn.kv_heads
-        kh = native if k_heads is None else int(k_heads)
-        vh = native if v_heads is None else int(v_heads)
-        assert native % kh == 0 and self.layers[0].self_attn.heads % kh == 0
-        assert native % vh == 0 and self.layers[0].self_attn.heads % vh == 0
-        for layer in self.layers:
-            layer.self_attn.cache_k_heads = kh
-            layer.self_attn.cache_v_heads = vh
-
-    def set_k_residual_length(self, tokens: int = 0) -> None:
-        """Keep this many most-recent K tokens in BF16 for PC-INT8 formats.
-
-        The value is captured in each new cache, so changing it never mutates a
-        live cache's representation.  It is ignored by all non-PC-INT8 formats.
-        """
-        tokens = int(tokens)
-        assert tokens >= 0
-        for layer in self.layers:
-            layer.self_attn.k_residual_length = tokens
 
     def set_fp8_groups(self, k_group: int | None = None, v_group: int | None = None) -> None:
         """诊断开关: K/V 各自 FP8 scale 分组粒度(须整除 head_dim)。默认 None=不动。

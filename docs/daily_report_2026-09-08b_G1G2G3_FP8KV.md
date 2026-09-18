@@ -83,4 +83,12 @@ full-forward 3.099e-05 / cached-vs-full 2.038e-05 / argmax same / generation equ
 - 状态：`status_note_fp8_v4.md` §7（A4 冻结确认）§8（G4 前置清单）；`design_freeze_g4_specdec.md`（新）；`data_ledger.md` §3.5.3/§3.5.4 + 变更日志；
 - 当日代码/文档已随 `c7eb1d1` 与本收尾快照 commit 入库并推送。
 
+## 八、G4-0 归因登记（续，会话更晚）
+- **G4-0: CONDITIONAL PASS — BF16 shape drift characterized**（非完整 G4 PASS）
+- 证据：OURS full==HF full、OURS cached==HF cached（max|Δ|=0）；HF 自身 cached/full 亦同处分歧；
+  所有路径重复确定；FP32 下四条路径全一致 → 非 ENGINE BUG / NONDETERMINISM，属 BF16 不同计算形状舍入。
+- block-vs-serial 探针：被测位置 argmax 一致、cache 终长一致、无 off-by-one；**但 block/serial cache
+  数值差 max|Δ|≈2.0** → B6 exact-token-id 门保留，多轮累积仍可能翻转。
+- 原始失败样本（cached=' for' vs full=' since', 第 8 步）保留。登记落点：design_freeze_g4 §8.1 / ledger。
+
 —— 2026-09-08 全天归档终。
