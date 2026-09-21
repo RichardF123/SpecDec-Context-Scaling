@@ -340,19 +340,65 @@ target KV ∈ {base_bf16, v_fp8}，draft 恒 base BF16；ctx ∈ {512, 8192}（c
 | 标定修正 | 只基于**实际运行**条件集分类：`formal 12-condition`（仅 ctx={2048,4096,8192}）/ `exploratory 12-condition`（ctx={512,2048,8192}）/ `8K 4-condition measured cost` / `subset`；**subset 拒绝 per-family 外推**，如需外推必须显式写出假设公式并与实测分列 |
 | 新增文件 | `specdec/engine/g4_part4_8k_isolated_probe.py`（两轮启动顺序 × 4 条件，每条件独立子进程，含受保护文件前后 sha256 校验）、`specdec/engine/g4_part4_selftest_cpu.py`（42 项 CPU 自测）|
 
-#### 4.6.4 8K 独立进程复验 — **未运行**
-`g4_part4_8k_isolated_probe.py` 已就位但**尚未在 GPU 上执行**。因此下列全部**未运行、无数据**：
-顺序 A/B 的 4 条件 × 5 rep 原始数据、median/min/max/spread、温度/功耗/时钟记录、
-v_fp8/base 比值稳定性、1.286× 是否复现、SpecDec 的 decode/e2e 是否获利。**不得填写预期值。**
+#### 4.6.4 第二轮工具修复（正确性比较 / 统计 / 监控解析）
+| 问题 | 修法 | 落点 |
+|---|---|---|
+| 单条件进程输出 `==AR=False` 无意义 | 单条件**没有** AR 对照 ⇒ 一律 `ar_equal=null, ar_equal_available=false`；判定只能由父进程跨子进程做；缺对照**绝不返回 False** | `run_once` 行字段 + `token_compare()` |
+| 跨进程比较缺前提校验 | `token_compare()` 先校验 `ctx` / `max_new` / `eos` / **`input_token_hash`**；不等时给 `first_diff_index` + 两侧 token id + 长度；前提不全 → `certified=false` + 原因 | 同上 |
+| JSONL 缺可比较的身份字段 | 每 run 行新增 `input_tokens`、`input_token_hash`、`max_new`、`eos_id`、`n_generated`、`generated_token_hash`、`generated_token_ids`（≤64 个体积可接受） | `run_once` |
+| AR `rel_spread` 聚合出现 `nan%` | 新增 `aggregate_finite()`：只聚合有限值、记录剔除数、全缺失 → `available=false`（**不填 0/NaN**）；探针的 AR 聚合改用它 | `aggregate_finite` / probe §[4] |
+| 缺跨**顺序**稳定性 | 新增 `order_stability()`：`order_ratio=min/max`、`relative_order_difference`、>20% → CHECK；与 within-run spread 分列报告 | `order_stability` / probe §[2] |
+| 监控数值被当字符串丢弃 | `nvml_snapshot()` 把数值字段转 float，解析失败 → `None` + `unparsed_fields`（**不填 0**）；probe 侧对旧 run 的字符串做兼容强转 | `nvml_snapshot` / `probe.monitor` |
+| 显存口径需审计 | 代码审计：`peak_alloc/peak_resv` 为 `max_memory_allocated()` / `max_memory_reserved()` **单次读数**，无相加、无跨阶段累计、不区分 target/draft；主指标 = `peak_alloc`，物理口径 = nvidia-smi used；新增"物理显存饱和"自动判定 | probe §[5] |
+| 排序在 `kv=None` 时崩溃（自测抓到） | `compare_across_conditions` 排序键对每个分量做 `str()` | `g4_part4_pilot_measure` |
+新增：`g4_part4_mismatch_diag.py`（三个历史不一致条件的确定性定位，**尚未运行**）；
+CPU 自测扩展到 **62/62 PASS**（含 NaN 混合/全缺失/单值、`ar_equal` 空值语义、跨条件前提校验、
+顺序稳定性、`[N/A]` 解析、旧版字符串兼容）。
 
-#### 4.6.5 仍开放的问题（不得因 8K 全 `==AR:True` 而关闭）
-`exploratory_run_1` 中下列条件的 SpecDec 与 AR **token 序列不等**，仍需独立诊断脚本定位
-（first_diff_index / token id / top-1·top-2 margin / block-vs-serial max\|Δ\| / FP32 control /
-determinism）：`512 base_bf16`、`2048 base_bf16`、`2048 v_fp8`。
+#### 4.6.5 8K 独立进程复验结果（**已运行**，stamp `20260921T042125Z`，8 文件 / 40 run）
+每条件独立进程、双模型常驻（AR 亦然）、warm-up=1、reps=5、max_new=64、chunk=2048。
 
-#### 4.6.6 Part 4 状态
-**CHECK（未定论）**：工具链与判据已就位且 CPU 自测通过；8K 复验未运行；两次 exploratory 已
-**证伪"8K 稳定加速"**并确立 1.286× 不可复现。**不允许进入 G5 / Pilot / Final。**
+| order | kv | mode | decode tok/s 中位数[min..max] | within-run rel% | decode s | prefill s | peak_alloc |
+|---|---|---|---|---|---|---|---|
+| A | base_bf16 | AR | 22.90 [21.58..24.62] | 13.3 | 2.79 | 7.31 | 6.06 |
+| A | base_bf16 | SpecDec | 5.99 [5.93..6.06] | 2.1 | 10.69 | 31.06 | 6.95 |
+| A | v_fp8 | AR | 22.06 [21.49..23.74] | 10.2 | 2.90 | 7.12 | 6.01 |
+| A | v_fp8 | SpecDec | 5.69 [5.58..5.74] | 2.9 | 11.24 | 31.59 | 6.90 |
+| B | base_bf16 | AR | 23.78 [23.50..24.28] | 3.3 | 2.69 | 7.37 | 6.06 |
+| B | base_bf16 | SpecDec | 8.42 [8.26..8.59] | 3.9 | 7.60 | 27.61 | 6.95 |
+| B | v_fp8 | AR | 20.36 [19.02..20.84] | 8.9 | 3.14 | 7.11 | 6.01 |
+| B | v_fp8 | SpecDec | 5.72 [5.62..5.74] | 1.9 | 11.19 | 31.61 | 6.90 |
+
+**跨顺序（between-order）**：`base_bf16 AR` 3.7% `ok`；**`base_bf16 SpecDec` 28.9% → CHECK**；
+`v_fp8 AR` 7.7% `ok`；`v_fp8 SpecDec` 0.4% `ok`。
+**AR within-run 聚合**：`available=true, n=4`，median 9.56%，max **13.25%**（≤20% 通过）。
+
+**token 比较（跨子进程）**：四个 (order × kv) 配对全部 `ar_equal=true`，AR 与 SpecDec 均 64 token，
+生成哈希一致 `610d0002bdfdcb37`；`certified=false`，原因：该 run 的 JSONL 未记录
+`input_token_hash`（字段在本次修复后才加入）⇒ 判定**未认证**。
+
+**性能判定**：`SpecDec/AR` decode = A base **0.261×**、A v_fp8 0.258×、B base 0.354×、B v_fp8 0.281×
+（**全部未获利**）；`v_fp8/base` AR = A **0.963×**、B **0.856×**（**无速度优势**）；
+历史 **1.286× 未复现**；`v_fp8` 仅使 `peak_alloc` 降约 0.05 GiB。
+
+**环境现场（关键）**：`nvidia-smi used = 7811–7887 MiB / 8188 MiB（95.5–96.3%）`；
+条件开始时 **`cuda_free` min = 0.00 GiB**；温度 64→77 °C（顺序 B 整体更热）；但
+**SM clock 恒定 2520–2535 MHz、mem clock 8000 MHz（无降频）**，功耗 53.7–78.8 W，driver 555.97。
+⇒ **8K 双模型运行点压在 8 GB 物理显存边界上（可用显存为 0），且温度/时钟不能解释跨顺序差异**；
+`peak_resv` 8.05–10.47 GiB 是**分配器池**（含空闲块与虚拟预留），**不得**当作物理占用超 8 GB。
+**归为 memory-state-sensitive**：8K 档耗时被显存状态主导，禁止进入正式速度主表。
+
+#### 4.6.6 仍开放的问题（不得因 8K 全 `ar_equal=true` 而关闭）
+`exploratory_run_1_fixed_order` 中下列条件的 SpecDec 与 AR **token 序列不等**，仍待定位：
+`512 base_bf16`、`2048 base_bf16`、`2048 v_fp8`。
+定位工具 `g4_part4_mismatch_diag.py` 已就位（输出 first_diff_index / 两侧 token / AR 与判定行
+top-1·top-2·margin / round·m·分支 / block-vs-serial max\|Δ\| / FP32 控制；按 6 类证据门槛归因），
+**尚未在 GPU 上运行** ⇒ 归因**未定**。
+
+#### 4.6.7 Part 4 状态
+**CHECK**：8K 隔离复验已完成并**证伪"8K 稳定加速"**（1.286× 不可复现、SpecDec 全面慢于 AR、
+v_fp8 无速度优势、`base SpecDec` 跨顺序 28.9% 不稳定、运行点显存饱和）；工具链与 62 项 CPU 自测
+通过；三个历史 token 不一致条件的归因**未完成**。**不允许进入 G5 / Pilot / Final。**
 
 ## 5. 复现设置（每次记录必须带上）
 - seed=42（测试）；性能脚本 seed=0，3 reps 取最优 + warmup；

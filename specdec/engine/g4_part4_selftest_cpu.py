@@ -17,6 +17,7 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import re
 import tempfile
 import traceback
 from pathlib import Path
@@ -144,22 +145,43 @@ def main() -> int:
     s_bad = M.summarize([fake_run(dec_s=1.0), fake_run(dec_s=2.0), fake_run(dec_s=1.9)])
     check("不稳定条件 flag=CHECK", "CHECK" in s_bad["spread_flag"], s_bad["spread_flag"])
 
-    print("\n== 9. 跨进程 token 比较 ==")
-    rows = [dict(ctx=8192, target_kv="base_bf16", mode="AR", order="A", gen_sha1="aa"),
-            dict(ctx=8192, target_kv="base_bf16", mode="SpecDec", order="A", gen_sha1="aa"),
-            dict(ctx=8192, target_kv="v_fp8", mode="AR", order="A", gen_sha1="bb"),
-            dict(ctx=8192, target_kv="v_fp8", mode="SpecDec", order="A", gen_sha1="cc")]
-    te = M.cross_process_token_equal(rows)
-    check("同档相等判 True", te.get((8192, "base_bf16", "A")) is True)
-    check("同档不等判 False", te.get((8192, "v_fp8", "A")) is False)
+    print("\n== 9. 跨条件 token 比较（token_compare / compare_across_conditions）==")
+    base = dict(ctx=8192, max_new=64, eos_id=3, input_token_hash="in1", target_kv="base_bf16")
+    ar_ok = dict(base, n_generated=64, generated_token_hash="aa",
+                 generated_token_ids=[1] * 64, mode="AR", order="A")
+    sp_ok = dict(base, n_generated=64, generated_token_hash="aa",
+                 generated_token_ids=[1] * 64, mode="SpecDec", order="A")
+    c = M.token_compare(ar_ok, sp_ok)
+    check("相等 + 前提齐全 -> ar_equal True 且 certified", c["ar_equal"] is True and c["certified"])
+    sp_bad = dict(base, n_generated=64, generated_token_hash="bb",
+                  generated_token_ids=[1] * 63 + [9], mode="SpecDec", order="A")
+    c = M.token_compare(ar_ok, sp_bad)
+    check("不等 -> first_diff_index=63 且两侧 token id",
+          c["ar_equal"] is False and c["first_diff_index"] == 63
+          and c["ar_token_id"] == 1 and c["spec_token_id"] == 9, str(c["first_diff_index"]))
+    c = M.token_compare(ar_ok, None)
+    check("缺 AR 对照 -> ar_equal=None 且 available=False（绝不 False）",
+          c["ar_equal"] is None and c["ar_equal_available"] is False and c["first_diff_index"] is None)
+    c = M.token_compare(dict(ar_ok, input_token_hash=None), sp_ok)
+    check("input_token_hash 缺失 -> 仍报相等但 certified=False 并给出原因",
+          c["ar_equal"] is True and c["certified"] is False and "input_token_hash" in c["certified_reason"])
+    c = M.token_compare(ar_ok, dict(sp_ok, ctx=512))
+    check("ctx 不同 -> 前提不满足被点名", "ctx_equal" in c["certified_reason"])
+    c = M.token_compare(dict(ar_ok, generated_token_ids=None), dict(sp_bad, generated_token_ids=None))
+    check("缺 ids -> 不给 first_diff_index 并说明原因",
+          c["first_diff_index"] is None and "generated_token_ids" in c["certified_reason"])
+    pairs = M.compare_across_conditions([ar_ok, sp_bad, dict(ar_ok, target_kv="v_fp8"),
+                                         dict(sp_bad, target_kv="v_fp8")])
+    check("compare_across_conditions 按 (ctx,kv,order) 配对",
+          len(pairs) == 2 and all(v["ar_equal_available"] for v in pairs.values()))
 
-    print("\n== 10. 报表措辞：subset 不得打印 12 conditions ==")
-    summary = {(8192, "base_bf16", "AR"): M.summarize([fake_run(kv="base_bf16", mode="AR")]),
-               (8192, "base_bf16", "SpecDec"): M.summarize([fake_run(kv="base_bf16", mode="SpecDec")]),
-               (8192, "v_fp8", "AR"): M.summarize([fake_run(kv="v_fp8", mode="AR")]),
-               (8192, "v_fp8", "SpecDec"): M.summarize([fake_run(kv="v_fp8", mode="SpecDec")])}
-    for s in summary.values():
-        s["oom"] = False
+    print("\n== 10. 报表措辞：subset 不得打印 12 conditions；==AR 不得误报 False ==")
+    summary = {}
+    for kv in ("base_bf16", "v_fp8"):
+        for mode in ("AR", "SpecDec"):
+            s = M.summarize([fake_run(kv=kv, mode=mode)])
+            s["oom"] = False
+            summary[(8192, kv, mode)] = s
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
         M.print_report(summary, [8192], ("base_bf16", "v_fp8"))
@@ -169,6 +191,75 @@ def main() -> int:
     check("未打印 exploratory 12-condition", "exploratory 12-condition" not in out)
     check("明确声明本 subset 不外推", "本 subset 不做 per-family 外推" in out)
     check("外推假设与实测分开显示", "纯假设，不是测量值" in out)
+    spec_lines = [ln for ln in out.splitlines()
+                  if re.match(r"^8192\s+\S+\s+SpecDec\s", ln)]   # 只取汇总表的 SpecDec 行
+    check("单条件缺 AR 对照时列显示 n/a（不得显示 False）",
+          bool(spec_lines) and all("n/a" in ln and "False" not in ln for ln in spec_lines),
+          spec_lines[0] if spec_lines else "(无 SpecDec 汇总行)")
+
+    print("\n== 11. 有限值聚合（aggregate_finite）三种情形 ==")
+    a = M.aggregate_finite([3.0, float("nan"), None, "x", 9.0])
+    check("有效+非有限混合 -> 只用有效值并记录剔除数",
+          a["available"] and a["n"] == 2 and a["dropped_nonfinite"] == 3
+          and a["min"] == 3.0 and a["max"] == 9.0, str(a))
+    a = M.aggregate_finite([float("nan"), None, "n/a"])
+    check("全部缺失 -> available=False 且 median=None（不填 0/NaN）",
+          a["available"] is False and a["median"] is None and a["n"] == 0, str(a))
+    a = M.aggregate_finite([7.5])
+    check("仅一个有效值 -> median=min=max=7.5 且 rel=0", a["available"] and a["median"] == 7.5
+          and a["max_rel_spread_pct"] == 0.0, str(a))
+    a = M.aggregate_finite([])
+    check("空列表 -> available=False", a["available"] is False)
+
+    print("\n== 12. 跨顺序稳定性（order_stability）==")
+    st = M.order_stability({"A": 5.99, "B": 8.42}, 20.0)
+    check("跨顺序 28.9% -> CHECK 且 order_ratio 正确",
+          st["available"] and "CHECK" in st["flag"]
+          and abs(st["relative_order_difference_pct"] - 28.9) < 0.2
+          and abs(st["order_ratio"] - 5.99 / 8.42) < 1e-6, str(st))
+    st = M.order_stability({"A": 22.90, "B": 23.78}, 20.0)
+    check("跨顺序 3.7% -> ok", st["available"] and st["flag"] == "ok", str(st))
+    st = M.order_stability({"A": 5.0}, 20.0)
+    check("只有一个顺序 -> available=False", st["available"] is False)
+    st = M.order_stability({"A": 5.0, "B": float("nan")}, 20.0)
+    check("含 NaN -> 视为只有一个有效顺序", st["available"] is False)
+
+    print("\n== 13. nvidia-smi 解析与旧版字符串兼容 ==")
+    snap = M.nvml_snapshot()
+    check("真实快照可用或明确 unavailable",
+          snap.get("available") in (True, False) and ("error" in snap or snap["available"]))
+    if snap.get("available"):
+        check("数值字段是 float 而非字符串",
+              isinstance(snap.get("temp_C"), (float, type(None)))
+              and isinstance(snap.get("mem_used_MiB"), (float, type(None))))
+
+    def fake_smi(*a, **k):
+        class R:
+            returncode = 0
+            stdout = "NVIDIA RTX, 7875, 8188, [N/A], 42.99, 2520, 8000, 555.97\n"
+            stderr = ""
+        return R()
+    real = M.subprocess.run
+    M.subprocess.run = fake_smi
+    try:
+        s2 = M.nvml_snapshot()
+    finally:
+        M.subprocess.run = real
+    check("[N/A] -> None 且点名 unparsed_fields（不填 0）",
+          s2["temp_C"] is None and "temp_C" in s2["unparsed_fields"]
+          and s2["power_W"] == 42.99, str(s2))
+
+    import specdec.engine.g4_part4_8k_isolated_probe as P
+    legacy = dict(target_kv="v_fp8", mode="AR", order="A",
+                  monitor_start={"available": True, "mem_used_MiB": "7875", "temp_C": "71"})
+    check("probe.monitor 兼容旧版字符串并转 float",
+          P.monitor(legacy, "start", "mem_used_MiB") == 7875.0
+          and P.monitor(legacy, "start", "temp_C") == 71.0)
+    check("probe.monitor 对不可解析值返回 None",
+          P.monitor(dict(legacy, monitor_start={"available": True, "temp_C": "[N/A]"}),
+                    "start", "temp_C") is None)
+    check("probe.monitor 对 available=False 返回 None",
+          P.monitor({"monitor_start": {"available": False, "temp_C": "71"}}, "start", "temp_C") is None)
 
     print(f"\nPart4 自测：PASS {len(PASS)} / FAIL {len(FAIL)}")
     if FAIL:

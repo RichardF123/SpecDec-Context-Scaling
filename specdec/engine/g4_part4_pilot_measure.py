@@ -79,6 +79,12 @@ REL_SPREAD_LIMIT = float(os.environ.get("P4_REL_SPREAD_LIMIT", "20"))
 
 FINITE = {"ok": True}          # 每次计时前重置；记录"prefill/单步 logits 是否 finite"
 
+RESERVED_SEMANTICS = ("peak_resv_GiB = torch.cuda.max_memory_reserved()（本进程 PyTorch 分配器"
+                      "池的峰值：含空闲块、虚拟预留；**不是物理显存占用**）。"
+                      "峰值取本条件一次计时区间内的单次读数，**不做任何相加/累计**。"
+                      "主指标用 peak_alloc_GiB = torch.cuda.max_memory_allocated()；"
+                      "物理口径看 monitor_*.mem_used_MiB（nvidia-smi used）。")
+
 
 # ---------------------------------------------------------------- 纯函数（CPU 可测）
 def parse_only() -> tuple[int, str, str] | None:
@@ -153,6 +159,112 @@ def rel_spread(vals) -> dict:
                 rel_spread_pct=rel, n=len(vals))
 
 
+def aggregate_finite(values) -> dict:
+    """只聚合**有限**数值：NaN / None / 非数值一律剔除，并记录剔除了几个。
+    全部缺失 -> available=False（**不得填 0 或 NaN 冒充**）。"""
+    seq = list(values)
+    vals = [float(v) for v in seq if isinstance(v, (int, float)) and v == v]
+    dropped = len(seq) - len(vals)
+    if not vals:
+        return dict(available=False, n=0, dropped_nonfinite=dropped, median=None,
+                    min=None, max=None, max_rel_spread_pct=None)
+    med = statistics.median(vals)
+    spread = max(vals) - min(vals)
+    return dict(available=True, n=len(vals), dropped_nonfinite=dropped, median=med,
+                min=min(vals), max=max(vals), spread=spread,
+                max_rel_spread_pct=(100.0 * spread / abs(med)) if med else None)
+
+
+def order_stability(medians: dict, limit: float = REL_SPREAD_LIMIT) -> dict:
+    """**跨顺序**稳定性：order_ratio = min(median)/max(median)，
+    relative_order_difference = (max-min)/max。>limit% -> CHECK（仅识别测量不稳定）。
+    与 within-process rep spread 是两种不同的不确定性，必须分开报告。"""
+    vals = {k: v for k, v in (medians or {}).items()
+            if isinstance(v, (int, float)) and v == v and v}
+    if len(vals) < 2:
+        return dict(available=False, reason=f"需要 >=2 个顺序的中位数，实际 {sorted(vals)}",
+                    medians=vals, order_ratio=None,
+                    relative_order_difference_pct=None, flag="unavailable")
+    lo, hi = min(vals.values()), max(vals.values())
+    rel = 100.0 * (hi - lo) / hi
+    return dict(available=True, medians=vals, order_ratio=lo / hi,
+                relative_order_difference_pct=rel,
+                flag=(f"CHECK:between-order>{limit:g}%" if rel > limit else "ok"))
+
+
+def token_compare(ar: dict, spec: dict) -> dict:
+    """比较 AR 与 SpecDec 的生成序列（可跨进程/跨条件）。
+
+    先校验可比性（ctx / max_new / eos / **input token hash**），再判等；不等时给首个差异位置
+    与两侧 token id。缺 AR 对照时**绝不返回 False**：`ar_equal=None, ar_equal_available=False`。
+    """
+    out = {"ar_equal": None, "ar_equal_available": False, "certified": False,
+           "certified_reason": None, "first_diff_index": None, "ar_token_id": None,
+           "spec_token_id": None, "ar_len": None, "spec_len": None, "preconditions": {}}
+    if ar is None or spec is None:
+        out["certified_reason"] = "缺少 AR 或 SpecDec 对照（单条件进程内不可判定）"
+        return out
+    pre = {
+        "ctx_equal": ar.get("ctx") == spec.get("ctx"),
+        "max_new_equal": ar.get("max_new") == spec.get("max_new"),
+        "eos_equal": ar.get("eos_id") == spec.get("eos_id"),
+        "input_token_hash_equal": (ar.get("input_token_hash") is not None
+                                   and ar.get("input_token_hash") == spec.get("input_token_hash")),
+    }
+    out["preconditions"] = pre
+    out["ar_len"] = ar.get("n_generated", ar.get("n_gen"))
+    out["spec_len"] = spec.get("n_generated", spec.get("n_gen"))
+    a_h = ar.get("generated_token_hash") or ar.get("gen_sha1")
+    s_h = spec.get("generated_token_hash") or spec.get("gen_sha1")
+    out["ar_hash"], out["spec_hash"] = a_h, s_h
+    if a_h is None or s_h is None:
+        out["certified_reason"] = "generated_token_hash 缺失"
+        return out
+    out["ar_equal_available"] = True
+    out["ar_equal"] = (a_h == s_h)
+    hard = [k for k in ("ctx_equal", "max_new_equal", "eos_equal") if not pre[k]]
+    if hard:
+        out["certified_reason"] = "前提不满足: " + ",".join(hard)
+    elif not pre["input_token_hash_equal"]:
+        out["certified_reason"] = ("input_token_hash 未记录或不同（本字段在修复后才加入）"
+                                   "=> 判定可比性未认证")
+    else:
+        out["certified"] = True
+    a_ids = ar.get("generated_token_ids")
+    s_ids = spec.get("generated_token_ids")
+    if out["ar_equal"] is False:
+        if a_ids is not None and s_ids is not None:
+            for i, (x, y) in enumerate(zip(a_ids, s_ids)):
+                if x != y:
+                    out["first_diff_index"] = i
+                    out["ar_token_id"], out["spec_token_id"] = x, y
+                    break
+            else:
+                out["first_diff_index"] = min(len(a_ids), len(s_ids))
+                out["certified_reason"] = (out["certified_reason"] or "") + \
+                    " | 前缀相同但长度不同"
+        else:
+            out["certified_reason"] = (out["certified_reason"] or "") + \
+                " | 缺 generated_token_ids，无法给出 first_diff_index"
+    return out
+
+
+def compare_across_conditions(rows: list[dict]) -> dict:
+    """按 (ctx, kv, order) 把 AR 与 SpecDec 配对（跨进程）；只取每条件首个 rep。"""
+    idx = {}
+    for r in rows:
+        key = (r.get("ctx"), r.get("target_kv"), r.get("order"), r.get("mode"))
+        if key[3] in ("AR", "SpecDec") and key not in idx:
+            idx[key] = r
+    out = {}
+    keys = sorted({(k[0], k[1], k[2]) for k in idx}, key=lambda x: tuple(str(v) for v in x))
+    for (ctx, kv, order) in keys:
+        if (ctx, kv, order, "AR") in idx and (ctx, kv, order, "SpecDec") in idx:
+            out[(ctx, kv, order)] = token_compare(idx[(ctx, kv, order, "AR")],
+                                                  idx[(ctx, kv, order, "SpecDec")])
+    return out
+
+
 def gen_sha1(gen) -> str:
     return hashlib.sha1(json.dumps(list(gen)).encode()).hexdigest()[:16]
 
@@ -190,6 +302,12 @@ def summarize(runs: list[dict]) -> dict:
     s["n_gen_consistent"] = len({r.get("n_gen") for r in runs}) == 1
     s["gen_sha1_consistent"] = len({r.get("gen_sha1") for r in runs}) == 1
     s["gen_sha1"] = runs[0].get("gen_sha1")
+    s["generated_token_hash"] = runs[0].get("generated_token_hash") or runs[0].get("gen_sha1")
+    s["generated_token_ids"] = runs[0].get("generated_token_ids")
+    s["input_token_hash"] = runs[0].get("input_token_hash")
+    s["input_tokens"] = runs[0].get("input_tokens")
+    s["max_new"] = runs[0].get("max_new")
+    s["eos_id"] = runs[0].get("eos_id")
     s["stats_consistent"] = len({tuple(r.get(k) for k in STAT_KEYS) for r in runs}) == 1
     s["logits_finite"] = all(bool(r.get("prefill_logits_finite")) for r in runs) and \
         all(bool(r.get("step_logits_finite", True)) for r in runs)
@@ -199,35 +317,27 @@ def summarize(runs: list[dict]) -> dict:
     s["spread_flag"] = ("CHECK:relative-spread>%g%%" % lim
                         if (s.get("decode_tok_s_rel_spread_pct") or 0) > lim
                         or (s.get("t_decode_s_rel_spread_pct") or 0) > lim else "ok")
-    s.setdefault("token_equal_vs_AR", None)
+    # 单条件进程内没有 AR 对照 ⇒ 保留 null/unavailable，等父进程跨条件填
+    s.setdefault("ar_equal", None)
+    s.setdefault("ar_equal_available", False)
+    s.setdefault("certified", False)
+    s.setdefault("certified_reason", "单条件进程内无 AR 对照（由父进程跨进程比较填入）")
+    s["reserved_semantics"] = RESERVED_SEMANTICS
     return s
-
-
-def cross_process_token_equal(run_rows: list[dict]) -> dict:
-    """用各条件首次 rep 的 gen_sha1 跨进程比较 SpecDec 与同档 AR。返回 {(ctx,kv): bool}。"""
-    first: dict = {}
-    for r in run_rows:
-        key = (r.get("ctx"), r.get("target_kv"), r.get("order"))
-        first.setdefault((key, r.get("mode")), r.get("gen_sha1"))
-    out = {}
-    for (ctx, kv, order) in sorted({(r.get("ctx"), r.get("target_kv"), r.get("order"))
-                                    for r in run_rows}, key=lambda x: (x[2] or "", x[0], x[1])):
-        a = first.get(((ctx, kv, order), "AR"))
-        s = first.get(((ctx, kv, order), "SpecDec"))
-        if a is not None and s is not None:
-            out[(ctx, kv, order)] = (a == s)
-    return out
 
 
 # ---------------------------------------------------------------- 环境监控
 MON_KEYS = ["gpu_name", "mem_used_MiB", "mem_total_MiB", "temp_C", "power_W",
             "clock_sm_MHz", "clock_mem_MHz", "driver"]
+MON_NUM_KEYS = ("mem_used_MiB", "mem_total_MiB", "temp_C", "power_W",
+                "clock_sm_MHz", "clock_mem_MHz")
 MON_QUERY = ("name,memory.used,memory.total,temperature.gpu,power.draw,"
              "clocks.sm,clocks.mem,driver_version")
 
 
 def nvml_snapshot() -> dict:
-    """nvidia-smi 快照。取不到就 available=False（**不得用 0 或假值代替**）。"""
+    """nvidia-smi 快照。数值字段转成 float；取不到/解析失败一律 None（**不得用 0 冒充**），
+    并在 `unparsed_fields` 里点名。"""
     try:
         p = subprocess.run(["nvidia-smi", f"--query-gpu={MON_QUERY}", "--format=csv,noheader,nounits"],
                            capture_output=True, text=True, timeout=15)
@@ -236,12 +346,20 @@ def nvml_snapshot() -> dict:
     if p.returncode != 0:
         return {"available": False, "error": f"nvidia-smi exit {p.returncode}: "
                                              f"{(p.stderr or '').strip()[:200]}"}
-    line = (p.stdout or "").strip().splitlines()
-    if not line:
+    lines = (p.stdout or "").strip().splitlines()
+    if not lines:
         return {"available": False, "error": "nvidia-smi 无输出"}
-    vals = [v.strip() for v in line[0].split(",")]
-    d = dict(zip(MON_KEYS, vals))
-    d["available"] = len(vals) == len(MON_KEYS)
+    vals = [v.strip() for v in lines[0].split(",")]
+    d: dict = {"available": len(vals) == len(MON_KEYS), "unparsed_fields": []}
+    for k, v in zip(MON_KEYS, vals):
+        if k in MON_NUM_KEYS:
+            try:
+                d[k] = float(v)
+            except ValueError:              # 例如 "[N/A]" / "Not Supported"
+                d[k] = None
+                d["unparsed_fields"].append(k)
+        else:
+            d[k] = v
     if not d["available"]:
         d["error"] = f"字段数不匹配: {len(vals)} != {len(MON_KEYS)}"
     return d
@@ -384,7 +502,17 @@ def run_once(tgt, drf, ids, eos, kv, mode):
                step_logits_finite=bool(step_finite),
                gen_sha1=gen_sha1(gen), ts_start=ts0, ts_end=ts1, t_wall_s=ts1 - ts0,
                monitor_start=mon0, monitor_end=mon1, cuda_start=cuda0, cuda_end=cuda1,
-               pid=os.getpid(), order=ORDER_LABEL, run_id=RUN_ID)
+               pid=os.getpid(), order=ORDER_LABEL, run_id=RUN_ID,
+               # ---- 正确性比较所需的稳定身份字段（跨进程用）----
+               input_tokens=int(ids.shape[1]),
+               input_token_hash=hashlib.sha1(json.dumps(ids[0].tolist()).encode()).hexdigest()[:16],
+               max_new=MAXNEW, eos_id=eos,
+               n_generated=len(gen),
+               generated_token_hash=gen_sha1(gen),
+               generated_token_ids=[int(x) for x in gen],   # max_new<=64，体积可接受
+               # ---- 单条件进程内**没有** AR 对照 ⇒ 不得填 False ----
+               ar_equal=None, ar_equal_available=False,
+               reserved_semantics=RESERVED_SEMANTICS)
     row["decode_tok_s"] = len(gen) / td if td > 0 else float("nan")
     row["e2e_tok_s"] = len(gen) / (tp + td) if (tp + td) > 0 else float("nan")
     if mode == "AR":
@@ -402,13 +530,15 @@ def run_once(tgt, drf, ids, eos, kv, mode):
 
 # ---------------------------------------------------------------- 报表
 def print_report(summary: dict, ctxs, kvs, modes=("AR", "SpecDec"),
-                 token_equal: dict | None = None) -> None:
+                 comparisons: dict | None = None) -> None:
     ctxs = sorted(ctxs)
     print("\n== 汇总（中位数；rel_spread>20% 判 CHECK，仅用于识别测量不稳定）==")
     print("ctx    kv         mode     dec_tok/s  e2e_tok/s  pref_s  dec_s  spread  rel%   "
-          "accept  rounds  block  draft  peak_alloc  peak_resv*  ==AR  flag")
-    print("  * peak_alloc=PyTorch 实际张量分配；peak_resv=分配器池/虚拟预留(≠物理显存)；"
-          "nvidia-smi used 见逐条件监控块")
+          "accept  rounds  block  draft  peak_alloc  peak_resv*  ==AR      flag")
+    print("  * peak_alloc=PyTorch 实际张量分配（主指标）；peak_resv=分配器池/虚拟预留(≠物理显存)；"
+          "物理口径看 nvidia-smi used")
+    print("  * ==AR: True/False 需**有 AR 对照**才可判定；单条件进程内为 n/a(unavailable)，"
+          "不得读作 False")
     for ctx in ctxs:
         for kv in kvs:
             for mode in modes:
@@ -416,22 +546,22 @@ def print_report(summary: dict, ctxs, kvs, modes=("AR", "SpecDec"),
                 if not s or s.get("oom"):
                     print(f"{ctx:<6} {kv:<10} {mode:<8} OOM/未测")
                     continue
-                te = s.get("token_equal_vs_AR")
-                if token_equal:
-                    for (c, k, _o), v in token_equal.items():
-                        if c == ctx and k == kv:
-                            te = v
+                if s.get("ar_equal_available"):
+                    te = f"{s.get('ar_equal')}" + ("" if s.get("certified") else "(未认证)")
+                else:
+                    te = "n/a"
                 rr = s.get("decode_tok_s_rel_spread_pct")
+                ac = s.get("accept_rate_med")
+                acs = f"{ac:>6.3f}" if isinstance(ac, (int, float)) and ac == ac else "   n/a"
                 print(f"{ctx:<6} {kv:<10} {mode:<8} {s['decode_tok_s_med']:>9.2f}  "
                       f"{s['e2e_tok_s_med']:>9.2f}  {s['t_prefill_s_med']:>6.2f} "
                       f"{s['t_decode_s_med']:>6.2f}  {s['t_decode_spread']:>6.2f}  "
-                      f"{(f'{rr:.1f}' if rr is not None else 'n/a'):>5}  "
-                      f"{(s.get('accept_rate_med') if s.get('accept_rate_med') == s.get('accept_rate_med') else float('nan')):>6.3f}  "
+                      f"{(f'{rr:.1f}' if rr is not None else 'n/a'):>5}  {acs}  "
                       f"{s['rounds_med']:>6.0f} {s['target_block_calls_med']:>6.0f} "
                       f"{s['draft_calls_med']:>6.0f}  {s['peak_alloc_GiB_med']:>9.2f}  "
-                      f"{s['peak_resv_GiB_med']:>9.2f}  {str(te):<5} {s.get('spread_flag', '')}")
+                      f"{s['peak_resv_GiB_med']:>9.2f}  {te:<9} {s.get('spread_flag', '')}")
 
-    print("\n== 逐条件一致性（n_gen / token hash / stats / finite / rel_spread）==")
+    print("\n== 逐条件一致性（n_gen / token hash / stats / finite / within-run rel_spread）==")
     for ctx in ctxs:
         for kv in kvs:
             for mode in modes:
@@ -443,20 +573,40 @@ def print_report(summary: dict, ctxs, kvs, modes=("AR", "SpecDec"),
                       f"stats同={s['stats_consistent']} finite={s['logits_finite']} "
                       f"rel%={s.get('decode_tok_s_rel_spread_pct')} flag={s.get('spread_flag')}")
 
-    print("\n== 同档比值（SpecDec / AR，中位数之比；**未做显著性检验、未控温漂**）==")
-    for ctx in ctxs:
-        for kv in kvs:
-            if "AR" not in modes or "SpecDec" not in modes:
-                continue
-            a, s = summary.get((ctx, kv, "AR")), summary.get((ctx, kv, "SpecDec"))
-            if not a or not s or a.get("oom") or s.get("oom"):
-                continue
-            print(f"  ctx={ctx:<5} kv={kv:<10} "
-                  f"decode×{s['decode_tok_s_med']/a['decode_tok_s_med']:.3f}  "
-                  f"e2e×{s['e2e_tok_s_med']/a['e2e_tok_s_med']:.3f}  "
-                  f"accept={s['accept_rate_med']:.3f}  "
-                  f"AR前向={a['target_decode_calls_med']:.0f} "
-                  f"Spec块+单步={s['target_block_calls_med']:.0f}+{s['mismatch_rounds_med']:.0f}")
+    if comparisons:
+        print("\n== AR vs SpecDec 跨条件 token 比较（父进程/离线聚合）==")
+        for key, c in comparisons.items():
+            ctx, kv, order = key
+            head = (f"  ctx={ctx:<5} {kv:<10} order={str(order):<5} "
+                    f"AR={c['ar_len']} tok / Spec={c['spec_len']} tok  "
+                    f"equal={c['ar_equal']} (available={c['ar_equal_available']}, "
+                    f"certified={c['certified']})")
+            print(head)
+            if c.get("first_diff_index") is not None:
+                print(f"      first_diff_index={c['first_diff_index']} "
+                      f"AR_token_id={c['ar_token_id']} SpecDec_token_id={c['spec_token_id']}")
+            if c.get("preconditions"):
+                bad = [k for k, v in c["preconditions"].items() if not v]
+                print(f"      preconditions: "
+                      f"{'全部满足' if not bad else '不满足: ' + ','.join(bad)}")
+            if c.get("certified_reason"):
+                print(f"      note: {c['certified_reason']}")
+            if c.get("ar_hash"):
+                print(f"      hash: AR={c['ar_hash']} SpecDec={c['spec_hash']}")
+
+    if "AR" in modes and "SpecDec" in modes:
+        print("\n== 同档比值（SpecDec / AR，中位数之比；**未做显著性检验、未控温漂**）==")
+        for ctx in ctxs:
+            for kv in kvs:
+                a, s = summary.get((ctx, kv, "AR")), summary.get((ctx, kv, "SpecDec"))
+                if not a or not s or a.get("oom") or s.get("oom"):
+                    continue
+                print(f"  ctx={ctx:<5} kv={kv:<10} "
+                      f"decode×{s['decode_tok_s_med']/a['decode_tok_s_med']:.3f}  "
+                      f"e2e×{s['e2e_tok_s_med']/a['e2e_tok_s_med']:.3f}  "
+                      f"accept={s['accept_rate_med']:.3f}  "
+                      f"AR前向={a['target_decode_calls_med']:.0f} "
+                      f"Spec块+单步={s['target_block_calls_med']:.0f}+{s['mismatch_rounds_med']:.0f}")
 
     if "SpecDec" in modes:
         print("\n== 每轮接受长度分布（SpecDec，跨所有 rep 汇总 m 直方图）==")
@@ -514,13 +664,16 @@ def load_summary(path: Path):
             summary[(r["ctx"], r["target_kv"], r["mode"])] = r
         elif r.get("kind") == "run":
             rows.append(r)
-    te = cross_process_token_equal(rows)
-    for (ctx, kv, _o), v in te.items():
+    comp = compare_across_conditions(rows)
+    for (ctx, kv, _o), c in comp.items():
         for s in summary.values():
             if s.get("ctx") == ctx and s.get("target_kv") == kv and s.get("mode") == "SpecDec":
-                s["token_equal_vs_AR"] = v
-                s["token_equal_source"] = "gen_sha1(跨进程/跨条件)"
-    return summary, sorted({k[0] for k in summary}), te
+                s["ar_equal"] = c["ar_equal"]
+                s["ar_equal_available"] = c["ar_equal_available"]
+                s["certified"] = c["certified"]
+                s["certified_reason"] = c["certified_reason"]
+                s["ar_equal_source"] = "token_compare(跨进程/跨条件)"
+    return summary, sorted({k[0] for k in summary}), comp
 
 
 # ---------------------------------------------------------------- main
@@ -537,9 +690,9 @@ def main() -> int:
             if not cand:
                 raise SystemExit(f"{OUTDIR} 下没有 part4_*.jsonl")
             path = cand[-1]
-        summary, ctxs, te = load_summary(path)
+        summary, ctxs, comp = load_summary(path)
         print(f"[aggregate] {path}  ({len(summary)} 个条件)")
-        print_report(summary, ctxs, ("base_bf16", "v_fp8"), token_equal=te)
+        print_report(summary, ctxs, ("base_bf16", "v_fp8"), comparisons=comp)
         return 0
 
     torch.manual_seed(0)
@@ -641,10 +794,21 @@ def main() -> int:
             summary[(ctx, kv, mode)] = s
             if mode == "AR":
                 ref_gen[(ctx, kv)] = runs[0]["gen"]
-            if only is None:              # 同进程内才能直接比 token 序列
-                if mode == "SpecDec":
-                    s["token_equal_vs_AR"] = ref_gen.get((ctx, kv)) == runs[0]["gen"]
-                    s["token_equal_source"] = "同进程对比"
+            if only is None and mode == "SpecDec":     # 同进程内才有 AR 对照可判
+                base = dict(ctx=ctx, target_kv=kv, max_new=MAXNEW, eos_id=eos,
+                            input_token_hash=runs[0].get("input_token_hash"))
+                c = token_compare(
+                    dict(base, n_generated=len(ref_gen.get((ctx, kv), [])),
+                         generated_token_hash=gen_sha1(ref_gen.get((ctx, kv), [])),
+                         generated_token_ids=ref_gen.get((ctx, kv))),
+                    dict(base, n_generated=runs[0]["n_gen"],
+                         generated_token_hash=runs[0].get("generated_token_hash"),
+                         generated_token_ids=runs[0].get("generated_token_ids")))
+                s["ar_equal"] = c["ar_equal"]
+                s["ar_equal_available"] = c["ar_equal_available"]
+                s["certified"] = c["certified"]
+                s["certified_reason"] = c["certified_reason"]
+                s["ar_equal_source"] = "同进程 token_compare"
             print(f"  [{tag}] pref={s['t_prefill_s_med']:.2f}s "
                   f"dec={s['t_decode_s_med']:.2f}s[{s['t_decode_s_min']:.2f}.."
                   f"{s['t_decode_s_max']:.2f}] rel%="
@@ -660,11 +824,8 @@ def main() -> int:
             fh.write(json.dumps(dict(kind="summary", config_hash=chash, **s),
                                 ensure_ascii=False) + "\n")
 
-    token_equal = cross_process_token_equal(
-        [dict(ctx=s["ctx"], target_kv=s["target_kv"], mode=s["mode"],
-              order=ORDER_LABEL, gen_sha1=s.get("gen_sha1")) for s in summary.values()
-         if not s.get("oom")])
-    print_report(summary, ctxs, kvs, modes=modes, token_equal=token_equal)
+    comp = compare_across_conditions([s for s in summary.values() if not s.get("oom")])
+    print_report(summary, ctxs, kvs, modes=modes, comparisons=comp)
 
     print(f"\n[out] {jsonl}")
     del tgt, drf
