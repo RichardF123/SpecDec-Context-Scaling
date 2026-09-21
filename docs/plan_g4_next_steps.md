@@ -40,6 +40,7 @@
 ## Phase 5 — 并行非技术/基建（可与其他阶段并行）
 - **10/7 课程提案**：定 2–3 人团队 + 贡献声明；提案 1 页稿按 v7.2 口径更新（BF16 compute、KV 因子 base/v_fp8、12 conditions、K-FP8 negative）。
 - **Prompt families**：设计 ≥16 个 nested-prefix families（2K⊂4K⊂8K），manifest 版本化；先出设计草案（AI 起草，用户定稿）。
+  - **状态（2026-09-15）**：**草案已入库** —— `scripts/build_prompt_families.py`（可复现构建器）+ `docs/prompt_families_manifest.json` + `docs/prompt_families_design.md`。16 个 family 取自 `wiki.train.raw` 的对齐 8192-token 窗口（与 G3 质量窗所用的 `test.raw` **天然不重叠**），按文本特征分 4 层各 4 个，并**预登记**假设"接受率 S1_low_entropy > S3_prose > S4_mixed > S2_high_markup"（pilot 证伪）。**待用户定稿 4 项**：N=16 是否够 / 分层规则 / 是否允许 train.raw / 是否加密中间长度。
 - **G5 instrumentation**：`results.jsonl` schema、config hash、resume/recovery 设计（AI 出规格，用户实现）。
 - **Freeze Checklist** 逐项核对（≥16 families、spec k、schema、clean rerun 等）。
 
