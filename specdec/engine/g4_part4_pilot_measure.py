@@ -1,25 +1,37 @@
-"""g4_part4_pilot_measure.py — G4 Part 4：小规模测量 + final 规模标定（**只出数，不作加速声明**）
+"""g4_part4_pilot_measure.py — G4 Part 4 测量 + 报表（**只出数，不作加速声明**）
 
-覆盖：每个 prompt 跑 `ctx × target_kv × decode` = 3 × 2 × 2 = **12 个条件**
-  - `decode` ∈ {`AR`, `SpecDec`}（AR = 同档基线：同 ctx、同 KV、同 prompt、**同引擎原语**）
-  - `target_kv` ∈ {`base_bf16`, `v_fp8`}；draft 恒 `base_bf16`（v_fp8 是 target 专属格式）
-  - `ctx` 默认 {512, 2048, 8192}，是**同一段真实文本的嵌套前缀**（512 ⊂ 2048 ⊂ 8192）
+条件空间：`ctx × target_kv × decode`（默认 3 × 2 × 2 = 12）
+  - `decode` ∈ {`AR`, `SpecDec`}；AR = 同档基线（同 ctx、同 KV、同 prompt、同引擎原语）
+  - `target_kv` ∈ {`base_bf16`, `v_fp8`}；draft 恒 base（v_fp8 是 target 专属格式）
+  - `ctx` 是**同一段真实文本的嵌套前缀**（默认 512 ⊂ 2048 ⊂ 8192）
 
-纪律（写死在本脚本里，避免事后"美化"）
-  1. 计时全部 `torch.cuda.synchronize()` 夹住；每条件先跑 1 次 **warm-up 并丢弃**；
-  2. 重复 `P4_REPS` 次，报**中位数 + min/max**，不只报最快一次；
-  3. peak 显存用 `reset_peak_memory_stats` + `max_memory_allocated/reserved`，并记录权重常驻基线；
-  4. **OOM 不崩**：记为 OOM 条件继续跑其余条件（协议要求 OOM 有 finally 处理）；
-  5. prompt 取自 `data/wikitext-2-raw-v1.zip` 的**真实文本**，**不插合成填充**，实际 token 数入库；
-  6. 8K 档使用**分块 prefill**（G2 结论：一次性 8K eager prefill 会 OOM；分块是 8K 的正常运行模式）；
-  7. 只输出数字：本脚本**不**声明显著性、不宣称加速；"比值"仅作同档中位数之比并附告警；
-  8. 结果写 `output/part4/*.jsonl`（该目录被 gitignore；正式 schema 由 G5 定义）。
+测量纪律（写死在代码里）
+  1. 计时 `torch.cuda.synchronize()` 夹住；每条件先 warm-up `P4_WARM` 次并丢弃；
+  2. 重复 `P4_REPS` 次，报 median / min / max / spread / **relative spread**；
+     `relative spread > P4_REL_SPREAD_LIMIT`（默认 20%）→ 该条件标记 CHECK（**只用于识别测量不
+     稳定，不用于宣布统计显著性**）；
+  3. 不在计时区内调用 `empty_cache()`（会让每个 rep 从零重建显存池，把 cudaMalloc/WDDM 映射算进
+     decode 时间）；仅 OOM 时清理；
+  4. OOM 记为 OOM 条件并继续，不崩；
+  5. 只输出数字：不声明显著性、不宣称加速；比值仅作同档中位数之比并附告警。
 
-用法（交互式 GPU 终端，单跑；建议先 `set HF_HUB_OFFLINE=1`）
-  python -m specdec.engine.g4_part4_pilot_measure
-可选环境变量
-  P4_CTX=512,2048,8192   P4_REPS=3   P4_MAXNEW=64   P4_WARM=1   P4_CHUNK=2048
-  P4_TEXT=<path>         指定自定义纯文本语料（默认用仓库 data/ 下的 wikitext-2 zip）
+运行身份（防覆盖）
+  - 输出文件名 = `part4_<config_hash>_<RUN_ID>.jsonl`，RUN_ID 默认 UTC 时间戳；
+  - **绝不**用 `"w"` 静默覆盖已存在的同名文件：文件已存在且不在"同 RUN_ID 组"内 → 直接报错退出；
+  - 子进程（`P4_ONLY`）共享父进程给定的 `P4_RUN_ID`，以追加模式写入同一文件。
+
+条件过滤（未设置 = 保持全条件行为）
+  P4_CTX=8192           只跑该 ctx（逗号分隔可多值）
+  P4_KV=base_bf16 | v_fp8
+  P4_MODE=AR | SpecDec
+  P4_ONLY=<ctx>,<kv>,<mode>     只跑一个条件（每条件独立进程模式）
+  P4_REVERSE=1                  每个 ctx 内先 v_fp8 后 base_bf16（顺序对照）
+
+用法
+  python -m specdec.engine.g4_part4_pilot_measure                    # 全条件
+  python -m specdec.engine.g4_part4_pilot_measure --aggregate [file]  # 只从 JSONL 重算报表
+Run（交互式 GPU 终端，单跑；建议先 `set HF_HUB_OFFLINE=1`）
+  可选：P4_REPS / P4_MAXNEW / P4_WARM / P4_CHUNK / P4_TEXT / P4_RUN_ID / P4_ORDER
 """
 from __future__ import annotations
 
@@ -29,6 +41,7 @@ import hashlib
 import json
 import os
 import statistics
+import subprocess
 import time
 import traceback
 import zipfile
@@ -42,17 +55,32 @@ from .g4_b4_cache_tests import load_ours
 TARGET = "Qwen/Qwen2.5-1.5B-Instruct"
 DRAFT = "Qwen/Qwen2.5-0.5B-Instruct"
 K = spec_dec.K
+KV_CHOICES = ("base_bf16", "v_fp8")
+MODE_CHOICES = ("AR", "SpecDec")
+FORMAL_CTX = (2048, 4096, 8192)
+EXPLORATORY_CTX = (512, 2048, 8192)
 
 ROOT = Path(__file__).resolve().parents[2]
+OUTDIR = ROOT / "output" / "part4"
+
 CTX = [int(x) for x in os.environ.get("P4_CTX", "512,2048,8192").split(",") if x.strip()]
 REPS = int(os.environ.get("P4_REPS", "3"))
 MAXNEW = int(os.environ.get("P4_MAXNEW", "64"))
 WARM = int(os.environ.get("P4_WARM", "1"))
 CHUNK = int(os.environ.get("P4_CHUNK", "2048"))
 REVERSE = os.environ.get("P4_REVERSE", "") not in ("", "0", "false", "False")
-ONLY = os.environ.get("P4_ONLY", "").strip()      # "ctx,kv,mode"：只跑一个条件（每条件独立进程）
+ONLY = os.environ.get("P4_ONLY", "").strip()
+KV_FILTER = os.environ.get("P4_KV", "").strip() or None
+MODE_FILTER = os.environ.get("P4_MODE", "").strip() or None
+RUN_ID = os.environ.get("P4_RUN_ID", "").strip() or \
+    time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+ORDER_LABEL = os.environ.get("P4_ORDER", "").strip() or None
+REL_SPREAD_LIMIT = float(os.environ.get("P4_REL_SPREAD_LIMIT", "20"))
+
+FINITE = {"ok": True}          # 每次计时前重置；记录"prefill/单步 logits 是否 finite"
 
 
+# ---------------------------------------------------------------- 纯函数（CPU 可测）
 def parse_only() -> tuple[int, str, str] | None:
     if not ONLY:
         return None
@@ -60,19 +88,195 @@ def parse_only() -> tuple[int, str, str] | None:
     if len(parts) != 3:
         raise SystemExit(f'P4_ONLY 需形如 "8192,v_fp8,AR"，收到 {ONLY!r}')
     ctx, kv, mode = int(parts[0]), parts[1], parts[2]
-    if kv not in ("base_bf16", "v_fp8") or mode not in ("AR", "SpecDec"):
+    if kv not in KV_CHOICES or mode not in MODE_CHOICES:
         raise SystemExit(f"P4_ONLY kv/mode 非法: {kv}/{mode}")
     return ctx, kv, mode
-OUTDIR = ROOT / "output" / "part4"
 
 
+def parse_filters(kv_filter: str | None = None, mode_filter: str | None = None,
+                  ctxs=None, reverse: bool | None = None) -> tuple[list[int], list[str], list[str]]:
+    """把 (P4_CTX, P4_KV, P4_MODE, P4_REVERSE) 解析成实际要跑的维度。非法值直接报错。"""
+    kvs = [kv_filter] if kv_filter else list(KV_CHOICES)
+    modes = [mode_filter] if mode_filter else list(MODE_CHOICES)
+    for kv in kvs:
+        if kv not in KV_CHOICES:
+            raise SystemExit(f"P4_KV 非法: {kv!r}（可选 {KV_CHOICES}）")
+    for m in modes:
+        if m not in MODE_CHOICES:
+            raise SystemExit(f"P4_MODE 非法: {m!r}（可选 {MODE_CHOICES}）")
+    ctxs = list(ctxs if ctxs is not None else CTX)
+    if not ctxs:
+        raise SystemExit("P4_CTX 为空")
+    rev = REVERSE if reverse is None else reverse
+    if rev:
+        kvs = list(reversed(kvs))
+    return ctxs, kvs, modes
+
+
+def build_matrix(ctxs, kvs, modes) -> list[tuple[int, str, str]]:
+    return [(c, kv, m) for c in ctxs for kv in kvs for m in modes]
+
+
+def classify_matrix(ctxs_present, kvs_present, modes_present, n_measured: int) -> tuple[str, bool]:
+    """返回 (标签, 是否允许直接给出 per-family 外推)。标签基于**实际测量到的**条件集合。"""
+    ctxs = tuple(sorted(ctxs_present))
+    kvs = tuple(sorted(kvs_present))
+    modes = tuple(sorted(modes_present))
+    full = (len(kvs) == 2 and len(modes) == 2)
+    if full and ctxs == tuple(sorted(FORMAL_CTX)):
+        return "formal 12-condition per-family cost", True
+    if full and ctxs == tuple(sorted(EXPLORATORY_CTX)):
+        return "exploratory 12-condition cost", True
+    if len(ctxs) == 1 and full:
+        return f"{ctxs[0]//1024}K {n_measured}-condition measured cost", False
+    return f"subset ({n_measured} conditions, ctx={list(ctxs)}, kv={list(kvs)}, " \
+           f"mode={list(modes)}) measured cost", False
+
+
+def resolve_jsonl(outdir: Path, chash: str, run_id: str, append_ok: bool) -> Path:
+    """定名并**拒绝静默覆盖**：已存在且不在同 RUN_ID 组内 → SystemExit。"""
+    path = outdir / f"part4_{chash}_{run_id}.jsonl"
+    if path.exists() and not append_ok:
+        raise SystemExit(f"[拒绝覆盖] {path} 已存在；换一个 P4_RUN_ID，或设置 P4_ONLY 以追加到同一组")
+    return path
+
+
+def rel_spread(vals) -> dict:
+    vals = [v for v in vals if isinstance(v, (int, float)) and v == v]
+    if not vals:
+        return dict(median=float("nan"), min=float("nan"), max=float("nan"),
+                    spread=float("nan"), rel_spread_pct=None, n=0)
+    med = statistics.median(vals)
+    spread = max(vals) - min(vals)
+    rel = (100.0 * spread / abs(med)) if med else None
+    return dict(median=med, min=min(vals), max=max(vals), spread=spread,
+                rel_spread_pct=rel, n=len(vals))
+
+
+def gen_sha1(gen) -> str:
+    return hashlib.sha1(json.dumps(list(gen)).encode()).hexdigest()[:16]
+
+
+STAT_KEYS = ("rounds", "proposed", "accepted", "target_block_calls", "draft_calls",
+             "mismatch_rounds", "all_accept_rounds")
+
+
+def summarize(runs: list[dict]) -> dict:
+    keys_num = ["t_prefill_s", "t_decode_s", "t_total_s", "decode_tok_s", "e2e_tok_s",
+                "peak_alloc_GiB", "peak_resv_GiB", "accept_rate", "rounds",
+                "proposed", "accepted", "target_block_calls", "draft_calls",
+                "target_decode_calls", "mismatch_rounds", "all_accept_rounds"]
+    skip = keys_num + ["gen", "m_hist", "gen_sha1", "monitor_start", "monitor_end",
+                       "cuda_start", "cuda_end", "ts_start", "ts_end", "pid"]
+    s = {k: v for k, v in runs[0].items() if k not in skip}
+    for k in keys_num:
+        vals = [r[k] for r in runs if isinstance(r.get(k), (int, float))]
+        vals = [v for v in vals if v == v]
+        if vals:
+            s[k + "_med"] = statistics.median(vals)
+            s[k + "_min"] = min(vals)
+            s[k + "_max"] = max(vals)
+        else:
+            s[k + "_med"] = float("nan")
+            s[k + "_min"] = float("nan")
+            s[k + "_max"] = float("nan")
+    s["t_decode_spread"] = s["t_decode_s_max"] - s["t_decode_s_min"]
+    s["m_hist"] = [m for r in runs for m in r.get("m_hist", [])]
+    s["reps"] = len(runs)
+    # ---- 稳定性/一致性 ----
+    for key, name in (("decode_tok_s", "decode_tok_s"), ("t_decode_s", "t_decode_s")):
+        rs = rel_spread([r.get(key) for r in runs])
+        s[f"{name}_rel_spread_pct"] = rs["rel_spread_pct"]
+    s["n_gen_consistent"] = len({r.get("n_gen") for r in runs}) == 1
+    s["gen_sha1_consistent"] = len({r.get("gen_sha1") for r in runs}) == 1
+    s["gen_sha1"] = runs[0].get("gen_sha1")
+    s["stats_consistent"] = len({tuple(r.get(k) for k in STAT_KEYS) for r in runs}) == 1
+    s["logits_finite"] = all(bool(r.get("prefill_logits_finite")) for r in runs) and \
+        all(bool(r.get("step_logits_finite", True)) for r in runs)
+    s["finite_check_scope"] = ("prefill logits + AR 每步 logits；SpecDec 验证块行未扫描"
+                               "（需要引擎插桩，超出本轮范围）")
+    lim = REL_SPREAD_LIMIT
+    s["spread_flag"] = ("CHECK:relative-spread>%g%%" % lim
+                        if (s.get("decode_tok_s_rel_spread_pct") or 0) > lim
+                        or (s.get("t_decode_s_rel_spread_pct") or 0) > lim else "ok")
+    s.setdefault("token_equal_vs_AR", None)
+    return s
+
+
+def cross_process_token_equal(run_rows: list[dict]) -> dict:
+    """用各条件首次 rep 的 gen_sha1 跨进程比较 SpecDec 与同档 AR。返回 {(ctx,kv): bool}。"""
+    first: dict = {}
+    for r in run_rows:
+        key = (r.get("ctx"), r.get("target_kv"), r.get("order"))
+        first.setdefault((key, r.get("mode")), r.get("gen_sha1"))
+    out = {}
+    for (ctx, kv, order) in sorted({(r.get("ctx"), r.get("target_kv"), r.get("order"))
+                                    for r in run_rows}, key=lambda x: (x[2] or "", x[0], x[1])):
+        a = first.get(((ctx, kv, order), "AR"))
+        s = first.get(((ctx, kv, order), "SpecDec"))
+        if a is not None and s is not None:
+            out[(ctx, kv, order)] = (a == s)
+    return out
+
+
+# ---------------------------------------------------------------- 环境监控
+MON_KEYS = ["gpu_name", "mem_used_MiB", "mem_total_MiB", "temp_C", "power_W",
+            "clock_sm_MHz", "clock_mem_MHz", "driver"]
+MON_QUERY = ("name,memory.used,memory.total,temperature.gpu,power.draw,"
+             "clocks.sm,clocks.mem,driver_version")
+
+
+def nvml_snapshot() -> dict:
+    """nvidia-smi 快照。取不到就 available=False（**不得用 0 或假值代替**）。"""
+    try:
+        p = subprocess.run(["nvidia-smi", f"--query-gpu={MON_QUERY}", "--format=csv,noheader,nounits"],
+                           capture_output=True, text=True, timeout=15)
+    except Exception as e:  # noqa: BLE001
+        return {"available": False, "error": f"{type(e).__name__}: {e}"}
+    if p.returncode != 0:
+        return {"available": False, "error": f"nvidia-smi exit {p.returncode}: "
+                                             f"{(p.stderr or '').strip()[:200]}"}
+    line = (p.stdout or "").strip().splitlines()
+    if not line:
+        return {"available": False, "error": "nvidia-smi 无输出"}
+    vals = [v.strip() for v in line[0].split(",")]
+    d = dict(zip(MON_KEYS, vals))
+    d["available"] = len(vals) == len(MON_KEYS)
+    if not d["available"]:
+        d["error"] = f"字段数不匹配: {len(vals)} != {len(MON_KEYS)}"
+    return d
+
+
+def cuda_snapshot() -> dict:
+    try:
+        free, total = torch.cuda.mem_get_info()
+        return {"available": True,
+                "cuda_free_GiB": free / 2**30, "cuda_total_GiB": total / 2**30,
+                "torch_allocated_GiB": torch.cuda.memory_allocated() / 2**30,
+                "torch_reserved_GiB": torch.cuda.memory_reserved() / 2**30}
+    except Exception as e:  # noqa: BLE001
+        return {"available": False, "error": f"{type(e).__name__}: {e}"}
+
+
+def allocator_info() -> dict:
+    d: dict = {"available": True,
+               "PYTORCH_CUDA_ALLOC_CONF": os.environ.get("PYTORCH_CUDA_ALLOC_CONF"),
+               "empty_cache_in_timed_region": False}
+    try:
+        d["allocator_backend"] = torch.cuda.get_allocator_backend()
+    except Exception as e:  # noqa: BLE001
+        d["allocator_backend"] = None
+        d["allocator_backend_error"] = f"{type(e).__name__}: {e}"
+    return d
+
+
+# ---------------------------------------------------------------- 测量
 def sync_time() -> float:
     torch.cuda.synchronize()
     return time.perf_counter()
 
 
 def load_text() -> tuple[str, str]:
-    """返回 (文本, 来源标签)。优先环境变量指定的文件，否则用仓库内的 wikitext-2 zip。"""
     p = os.environ.get("P4_TEXT")
     if p:
         return Path(p).read_text(encoding="utf-8", errors="ignore"), f"file:{p}"
@@ -84,21 +288,14 @@ def load_text() -> tuple[str, str]:
             if pick is None:
                 pick = next((n for n in names if n.endswith((".raw", ".txt"))), None)
             raw = z.read(pick).decode("utf-8", errors="ignore")
-        lines = []
-        for ln in raw.splitlines():
-            s = ln.strip()
-            if not s or s.startswith("="):          # 跳过标题/空行，保留正文
-                continue
-            lines.append(s)
+        lines = [ln.strip() for ln in raw.splitlines()
+                 if ln.strip() and not ln.strip().startswith("=")]
         return " ".join(lines), f"wikitext-2-raw-v1/{Path(pick).name}"
-    # 最后的兜底：明确标注为非语料（正式实验不得使用）
     return ("Speculative decoding uses a small draft model to propose tokens and a "
             "larger target model to verify them. " * 400), "FALLBACK-SYNTHETIC(不得用于正式实验)"
 
 
 def chunked_prefill(model, ids, chunk: int = CHUNK):
-    """分块 prefill：除最后一块外都不需要 logits。等价于引擎的 prefill_chunked + 末块 logits。
-    8K 在本卡上必须分块（G2）；chunk 无关性已由 V3 实测。"""
     with torch.inference_mode():
         cache = None
         lg = None
@@ -107,18 +304,20 @@ def chunked_prefill(model, ids, chunk: int = CHUNK):
             piece = ids[:, st:st + chunk]
             lg, cache = model._run(model.embed_tokens(piece), cache,
                                    need_logits=(st + chunk >= n))
+    if lg is not None:
+        FINITE["ok"] &= bool(torch.isfinite(lg).all().item())
     return lg, cache
 
 
 def ar_decode(tgt, ids, n, eos, kv, chunk: int = CHUNK):
-    """AR 同档基线：一次分块 prefill + 逐 token `_step`（与引擎 generate 同语义）。
-    末 token 之后不再多跑一次前向（避免把 1 次无用前向算进基线）。"""
+    """AR 同档基线：分块 prefill + 逐 token `_step`（与引擎 generate 同语义）。"""
     tgt.set_kv_format(spec_dec._fmt(kv))
     t0 = sync_time()
     lg, cache = chunked_prefill(tgt, ids, chunk)
     t1 = sync_time()
     gen = []
     fwd = 0
+    step_finite = True
     cur = lg[:, -1:]
     for i in range(n):
         tok = int(cur.reshape(-1, cur.shape[-1])[-1].argmax())
@@ -128,13 +327,13 @@ def ar_decode(tgt, ids, n, eos, kv, chunk: int = CHUNK):
         if i == n - 1:
             break
         cur, cache = spec_dec._step(tgt, tok, cache)
+        step_finite &= bool(torch.isfinite(cur).all().item())
         fwd += 1
     t2 = sync_time()
-    return gen, t1 - t0, t2 - t1, {"target_decode_calls": fwd}
+    return gen, t1 - t0, t2 - t1, {"target_decode_calls": fwd}, step_finite
 
 
 def spec_decode_timed(tgt, drf, ids, n, eos, kv, chunk: int = CHUNK):
-    """SpecDec：统计 prefill 耗时（monkeypatch，不改核心代码）后，总耗时 − prefill = decode。"""
     acc = {"t": 0.0}
     orig = spec_dec._prefill
 
@@ -159,153 +358,176 @@ def spec_decode_timed(tgt, drf, ids, n, eos, kv, chunk: int = CHUNK):
 
 def mem_read():
     return (torch.cuda.max_memory_allocated() / 2**30,
-            torch.cuda.max_memory_reserved() / 2**30,
-            torch.cuda.memory_allocated() / 2**30)
+            torch.cuda.max_memory_reserved() / 2**30)
 
 
 def run_once(tgt, drf, ids, eos, kv, mode):
-    # 注意：**不在计时区内调用 empty_cache()**。它会把手里的缓存块全部还给驱动，使每个 rep
-    # 都从零重建显存池；而 KV cache 每步 torch.cat 都要申请新块（8K 档每步 ~4 MiB × 28 层 ×
-    # 2~3 个张量），从零池开始会把成千上万次 cudaMalloc/WDDM 映射算进 decode 时间 ——
-    # 这会系统性地惩罚"第一个跑到该 ctx 的条件"。稳态复用才是真实服务循环的行为。
-    # 仅 OOM 时清理（见 main）。
+    """**不在计时区内 empty_cache()**：它会把缓存块全还给驱动，让每个 rep 从零重建显存池，
+    把上千次 cudaMalloc/WDDM 映射算进 decode 时间（实测可使同一格从 6.44s 变 10.87s）。"""
+    FINITE["ok"] = True
     torch.cuda.reset_peak_memory_stats()
     base_alloc = torch.cuda.memory_allocated() / 2**30
-    trace = []
+    mon0, cuda0, ts0 = nvml_snapshot(), cuda_snapshot(), time.time()
+    trace: list[dict] = []
+    step_finite = True
     if mode == "AR":
-        gen, tp, td, st = ar_decode(tgt, ids, MAXNEW, eos, kv)
+        gen, tp, td, st, step_finite = ar_decode(tgt, ids, MAXNEW, eos, kv)
     else:
         gen, tp, td, st, trace = spec_decode_timed(tgt, drf, ids, MAXNEW, eos, kv)
-    pa, pr, _ = mem_read()
+    ts1 = time.time()
+    mon1, cuda1 = nvml_snapshot(), cuda_snapshot()
+    pa, pr = mem_read()
     row = dict(mode=mode, target_kv=kv, ctx=int(ids.shape[1]), n_gen=len(gen),
                t_prefill_s=tp, t_decode_s=td, t_total_s=tp + td,
-               peak_alloc_GiB=pa, peak_resv_GiB=pr, weights_resident_GiB=base_alloc)
+               peak_alloc_GiB=pa, peak_resv_GiB=pr, weights_resident_GiB=base_alloc,
+               prefill_logits_finite=bool(FINITE["ok"]),
+               step_logits_finite=bool(step_finite),
+               gen_sha1=gen_sha1(gen), ts_start=ts0, ts_end=ts1, t_wall_s=ts1 - ts0,
+               monitor_start=mon0, monitor_end=mon1, cuda_start=cuda0, cuda_end=cuda1,
+               pid=os.getpid(), order=ORDER_LABEL, run_id=RUN_ID)
     row["decode_tok_s"] = len(gen) / td if td > 0 else float("nan")
     row["e2e_tok_s"] = len(gen) / (tp + td) if (tp + td) > 0 else float("nan")
     if mode == "AR":
-        row["target_block_calls"] = 0
-        row["draft_calls"] = 0
-        row["rounds"] = 0
-        row["accepted"] = 0
-        row["proposed"] = 0
+        row.update({k: 0 for k in STAT_KEYS})
         row["accept_rate"] = float("nan")
         row["target_decode_calls"] = st["target_decode_calls"]
         row["m_hist"] = []
     else:
-        row.update({k: st[k] for k in ("rounds", "proposed", "accepted",
-                                       "target_block_calls", "draft_calls",
-                                       "mismatch_rounds", "all_accept_rounds")})
+        row.update({k: st[k] for k in STAT_KEYS})
         row["accept_rate"] = st["accepted"] / st["proposed"] if st["proposed"] else float("nan")
         row["m_hist"] = [d["m"] for d in trace]
     row["gen"] = gen
     return row
 
 
-def summarize(runs: list[dict]) -> dict:
-    keys_num = ["t_prefill_s", "t_decode_s", "t_total_s", "decode_tok_s", "e2e_tok_s",
-                "peak_alloc_GiB", "peak_resv_GiB", "accept_rate", "rounds",
-                "proposed", "accepted", "target_block_calls", "draft_calls",
-                "target_decode_calls", "mismatch_rounds", "all_accept_rounds"]
-    s = {k: v for k, v in runs[0].items() if k not in keys_num + ["gen", "m_hist"]}
-    for k in keys_num:
-        vals = [r[k] for r in runs if isinstance(r.get(k), (int, float))]
-        vals = [v for v in vals if v == v]        # 去 NaN
-        if vals:
-            s[k + "_med"] = statistics.median(vals)
-            s[k + "_min"] = min(vals)
-            s[k + "_max"] = max(vals)
-        else:
-            s[k + "_med"] = float("nan")
-    s["m_hist"] = [m for r in runs for m in r.get("m_hist", [])]
-    s["reps"] = len(runs)
-    return s
-
-
-def print_report(summary: dict, ctxs, kvs) -> None:
-    """打印四张表。可从内存 summary 调用，也可从 JSONL 重建后调用（--aggregate）。"""
-    print("\n== 汇总（中位数；dec_spread = max-min，>20% 即视为可疑需查）==")
-    print("ctx    kv         mode     dec_tok/s  e2e_tok/s  pref_s  dec_s  spread  accept  "
-          "rounds  block  draft  peak_alloc  peak_resv*  ==AR")
-    print("  * peak_resv 是分配器池（含空闲块），不是物理占用；peak_alloc 才是实际用量")
+# ---------------------------------------------------------------- 报表
+def print_report(summary: dict, ctxs, kvs, modes=("AR", "SpecDec"),
+                 token_equal: dict | None = None) -> None:
+    ctxs = sorted(ctxs)
+    print("\n== 汇总（中位数；rel_spread>20% 判 CHECK，仅用于识别测量不稳定）==")
+    print("ctx    kv         mode     dec_tok/s  e2e_tok/s  pref_s  dec_s  spread  rel%   "
+          "accept  rounds  block  draft  peak_alloc  peak_resv*  ==AR  flag")
+    print("  * peak_alloc=PyTorch 实际张量分配；peak_resv=分配器池/虚拟预留(≠物理显存)；"
+          "nvidia-smi used 见逐条件监控块")
     for ctx in ctxs:
         for kv in kvs:
-            for mode in ("AR", "SpecDec"):
+            for mode in modes:
                 s = summary.get((ctx, kv, mode))
                 if not s or s.get("oom"):
                     print(f"{ctx:<6} {kv:<10} {mode:<8} OOM/未测")
                     continue
-                ac = s.get("accept_rate_med", float("nan"))
+                te = s.get("token_equal_vs_AR")
+                if token_equal:
+                    for (c, k, _o), v in token_equal.items():
+                        if c == ctx and k == kv:
+                            te = v
+                rr = s.get("decode_tok_s_rel_spread_pct")
                 print(f"{ctx:<6} {kv:<10} {mode:<8} {s['decode_tok_s_med']:>9.2f}  "
                       f"{s['e2e_tok_s_med']:>9.2f}  {s['t_prefill_s_med']:>6.2f} "
-                      f"{s['t_decode_s_med']:>6.2f}  "
-                      f"{s['t_decode_s_max']-s['t_decode_s_min']:>6.2f}  {ac:>6.3f}  "
-                      f"{s['rounds_med']:>6.0f} "
-                      f"{s['target_block_calls_med']:>6.0f} {s['draft_calls_med']:>6.0f}  "
-                      f"{s['peak_alloc_GiB_med']:>9.2f}  {s['peak_resv_GiB_med']:>9.2f}  "
-                      f"{s.get('token_equal_vs_AR', '-')}")
+                      f"{s['t_decode_s_med']:>6.2f}  {s['t_decode_spread']:>6.2f}  "
+                      f"{(f'{rr:.1f}' if rr is not None else 'n/a'):>5}  "
+                      f"{(s.get('accept_rate_med') if s.get('accept_rate_med') == s.get('accept_rate_med') else float('nan')):>6.3f}  "
+                      f"{s['rounds_med']:>6.0f} {s['target_block_calls_med']:>6.0f} "
+                      f"{s['draft_calls_med']:>6.0f}  {s['peak_alloc_GiB_med']:>9.2f}  "
+                      f"{s['peak_resv_GiB_med']:>9.2f}  {str(te):<5} {s.get('spread_flag', '')}")
 
-    print("\n== 同档比值（SpecDec / AR，中位数之比；**未做显著性检验、未控温漂**，仅作数量级参考）==")
+    print("\n== 逐条件一致性（n_gen / token hash / stats / finite / rel_spread）==")
     for ctx in ctxs:
         for kv in kvs:
+            for mode in modes:
+                s = summary.get((ctx, kv, mode))
+                if not s or s.get("oom"):
+                    continue
+                print(f"  ctx={ctx:<5} {kv:<10} {mode:<8} reps={s['reps']} "
+                      f"n_gen同={s['n_gen_consistent']} hash同={s['gen_sha1_consistent']} "
+                      f"stats同={s['stats_consistent']} finite={s['logits_finite']} "
+                      f"rel%={s.get('decode_tok_s_rel_spread_pct')} flag={s.get('spread_flag')}")
+
+    print("\n== 同档比值（SpecDec / AR，中位数之比；**未做显著性检验、未控温漂**）==")
+    for ctx in ctxs:
+        for kv in kvs:
+            if "AR" not in modes or "SpecDec" not in modes:
+                continue
             a, s = summary.get((ctx, kv, "AR")), summary.get((ctx, kv, "SpecDec"))
             if not a or not s or a.get("oom") or s.get("oom"):
                 continue
-            r_dec = s["decode_tok_s_med"] / a["decode_tok_s_med"]
-            r_e2e = s["e2e_tok_s_med"] / a["e2e_tok_s_med"]
-            print(f"  ctx={ctx:<5} kv={kv:<10} decode×{r_dec:.3f}  e2e×{r_e2e:.3f}  "
-                  f"accept={s['accept_rate_med']:.3f}  AR前向={a['target_decode_calls_med']:.0f} "
+            print(f"  ctx={ctx:<5} kv={kv:<10} "
+                  f"decode×{s['decode_tok_s_med']/a['decode_tok_s_med']:.3f}  "
+                  f"e2e×{s['e2e_tok_s_med']/a['e2e_tok_s_med']:.3f}  "
+                  f"accept={s['accept_rate_med']:.3f}  "
+                  f"AR前向={a['target_decode_calls_med']:.0f} "
                   f"Spec块+单步={s['target_block_calls_med']:.0f}+{s['mismatch_rounds_med']:.0f}")
 
-    print("\n== 每轮接受长度分布（SpecDec，跨所有 rep 汇总 m 直方图）==")
-    for ctx in ctxs:
-        for kv in kvs:
-            s = summary.get((ctx, kv, "SpecDec"))
-            if not s or s.get("oom"):
-                continue
-            hist = s.get("m_hist", [])
-            cnt = {i: hist.count(i) for i in range(K + 1)}
-            print(f"  ctx={ctx:<5} kv={kv:<10} m=0..{K}: "
-                  + " ".join(f"{i}:{cnt[i]}" for i in range(K + 1))
-                  + f"   (总轮数 {len(hist)})")
+    if "SpecDec" in modes:
+        print("\n== 每轮接受长度分布（SpecDec，跨所有 rep 汇总 m 直方图）==")
+        for ctx in ctxs:
+            for kv in kvs:
+                s = summary.get((ctx, kv, "SpecDec"))
+                if not s or s.get("oom"):
+                    continue
+                hist = s.get("m_hist", [])
+                cnt = {i: hist.count(i) for i in range(K + 1)}
+                print(f"  ctx={ctx:<5} kv={kv:<10} m=0..{K}: "
+                      + " ".join(f"{i}:{cnt[i]}" for i in range(K + 1))
+                      + f"   (总轮数 {len(hist)})")
 
+    # ---- 标定：只基于实际测到的条件 ----
     measured = [s for s in summary.values() if not s.get("oom")]
-    full = len(ctxs) * len(kvs) * 2
+    ctxs_p = sorted({s["ctx"] for s in measured})
+    kvs_p = sorted({s["target_kv"] for s in measured})
+    modes_p = sorted({s["mode"] for s in measured})
+    label, allow_extrap = classify_matrix(ctxs_p, kvs_p, modes_p, len(measured))
     per_family = sum(s["t_total_s_med"] for s in measured)
-    print("\n== final 规模标定 ==")
-    print(f"  已测 {len(measured)}/{full} 个条件（ctx={list(ctxs)}）；每 family 走完这 {len(measured)} "
-          f"个条件的实测成本 = {per_family:.1f}s")
-    if len(measured) < full:
-        print("  !! **外推不完整**：缺少某些 ctx/KV/decode 条件 ⇒ 先补跑再据此定规模")
-    else:
+    print("\n== 规模标定（只基于实际运行的条件）==")
+    print(f"  实际运行维度：ctx={ctxs_p}（{len(ctxs_p)}）× kv={kvs_p}（{len(kvs_p)}）"
+          f"× mode={modes_p}（{len(modes_p)}）")
+    print(f"  **本次实际运行 {len(measured)} conditions**"
+          f"（{len(ctxs_p)}×{len(kvs_p)}×{len(modes_p)} = {len(ctxs_p)*len(kvs_p)*len(modes_p)}）"
+          f"，标签 = {label}")
+    print(f"  实测成本：每 family 走完这 {len(measured)} 个条件 = **{per_family:.1f}s**"
+          f"（= 各条件 t_total 中位数之和）")
+    if allow_extrap:
         for fams, reps in ((16, 5), (16, 3)):
             tot_h = per_family * fams * reps / 3600.0
             warm_h = per_family * fams * WARM / 3600.0
-            print(f"  ≥{fams} families × {full} conditions × {reps} reps ≈ "
-                  f"**{tot_h:.1f} GPU 小时**（不含失败重试；warm-up={WARM} 再加 ≈{warm_h:.1f}h）")
-    print(f"  ※ 本次实测墙钟（含 warm-up）≈ "
-          f"{sum(s['t_total_s_med']*(REPS+WARM) for s in measured)/60:.1f} 分钟")
+            print(f"  [{label}] ≥{fams} families × {len(measured)} conditions × {reps} reps "
+                  f"≈ **{tot_h:.1f} GPU 小时**（不含失败重试；warm-up={WARM} 再加 ≈{warm_h:.1f}h）")
+    else:
+        print("  !! **本 subset 不做 per-family 外推**：缺少的维度未测量，不得当作已测。")
+        print(f"     若确需外推，必须显式写假设，例如："
+              f"assume_cost(missing ctx) = median(measured ctx) => "
+              f"per_family ≈ {per_family:.1f}s × (12/{len(measured)}) = "
+              f"{per_family*12/max(len(measured),1):.1f}s（**纯假设，不是测量值**）")
+    print(f"  ※ 本次条件组（{len(measured)} conditions × {REPS} reps + warm-up={WARM}）"
+          f"实测墙钟 ≈ {sum(s['t_total_s_med']*(REPS+WARM) for s in measured)/60:.1f} 分钟")
 
 
 def load_summary(path: Path):
-    """从 JSONL 重建 summary（供 --aggregate 用；不需要重新加载模型）。"""
+    """从 JSONL 重建 summary（--aggregate 用；不加载模型）。"""
     summary: dict = {}
-    ctxs = set()
+    rows: list[dict] = []
     for line in path.read_text(encoding="utf-8").splitlines():
         if not line.strip():
             continue
         r = json.loads(line)
-        if r.get("kind") != "summary":
-            continue
-        summary[(r["ctx"], r["target_kv"], r["mode"])] = r
-        ctxs.add(r["ctx"])
-    return summary, sorted(ctxs)
+        if r.get("kind") == "summary":
+            summary[(r["ctx"], r["target_kv"], r["mode"])] = r
+        elif r.get("kind") == "run":
+            rows.append(r)
+    te = cross_process_token_equal(rows)
+    for (ctx, kv, _o), v in te.items():
+        for s in summary.values():
+            if s.get("ctx") == ctx and s.get("target_kv") == kv and s.get("mode") == "SpecDec":
+                s["token_equal_vs_AR"] = v
+                s["token_equal_source"] = "gen_sha1(跨进程/跨条件)"
+    return summary, sorted({k[0] for k in summary}), te
 
 
+# ---------------------------------------------------------------- main
 def main() -> int:
     ap = argparse.ArgumentParser(description="G4 Part 4 测量 / 报表")
     ap.add_argument("--aggregate", nargs="?", const="", default=None,
-                    help="不跑模型，只从 output/part4 的 JSONL 重算四张表"
-                         "（可跟具体文件路径；缺省取最新一份）")
+                    help="不跑模型，只从 JSONL 重算报表（可跟路径；缺省取最新一份）")
     args = ap.parse_args()
     if args.aggregate is not None:
         if args.aggregate:
@@ -315,25 +537,35 @@ def main() -> int:
             if not cand:
                 raise SystemExit(f"{OUTDIR} 下没有 part4_*.jsonl")
             path = cand[-1]
-        summary, ctxs = load_summary(path)
+        summary, ctxs, te = load_summary(path)
         print(f"[aggregate] {path}  ({len(summary)} 个条件)")
-        print_report(summary, ctxs, ("base_bf16", "v_fp8"))
+        print_report(summary, ctxs, ("base_bf16", "v_fp8"), token_equal=te)
         return 0
 
     torch.manual_seed(0)
     OUTDIR.mkdir(parents=True, exist_ok=True)
+    ctxs, kvs, modes = parse_filters(KV_FILTER, MODE_FILTER, CTX, REVERSE)
+    conditions = build_matrix(ctxs, kvs, modes)
+    only = parse_only()
+    if only is not None:
+        conditions = [only]
+        print(f"[cfg] P4_ONLY={only} -> 单条件独立进程模式", flush=True)
+    if len(ctxs) * len(kvs) * len(modes) != len(conditions):
+        pass   # 仅用于提示：过滤后条件数以此为准
+    print(f"[cfg] filter: P4_CTX={CTX} P4_KV={KV_FILTER} P4_MODE={MODE_FILTER} "
+          f"P4_REVERSE={REVERSE} -> {len(conditions)} conditions", flush=True)
+    print(f"[cfg] reps={REPS} max_new={MAXNEW} warm={WARM} chunk={CHUNK} k={K} "
+          f"run_id={RUN_ID} order={ORDER_LABEL}", flush=True)
+
     text, src = load_text()
     print(f"[env] torch={torch.__version__} gpu={torch.cuda.get_device_name(0)}", flush=True)
-    print(f"[cfg] ctx={CTX} reps={REPS} max_new={MAXNEW} warm={WARM} chunk={CHUNK} k={K}",
-          flush=True)
+    print(f"[env] allocator={allocator_info()}", flush=True)
     print(f"[cfg] text={src} chars={len(text)}", flush=True)
 
     from transformers import AutoTokenizer
     from .g4_b4_cache_tests import _from_pretrained
     tok = _from_pretrained(AutoTokenizer, TARGET, trust_remote_code=True)
     eos = tok.eos_token_id
-    # 只取前 400k 字符（≈92k token）：足以覆盖 ctx≤8192，且避免 tokenizer 的"超过模型最大
-    # 长度"告警（该告警只与一次性编码长度有关，与我们要的前缀无关）。
     text_used = text[:400_000]
     if len(text_used) < len(text):
         print(f"[data] 截取前 {len(text_used)} 字符（原文 {len(text)}）", flush=True)
@@ -345,34 +577,36 @@ def main() -> int:
     tgt, _ = load_ours(TARGET)
     print("[stage] loading draft 0.5B ...", flush=True)
     drf, _ = load_ours(DRAFT)
-    print(f"[mem] 两模型常驻 alloc={torch.cuda.memory_allocated()/2**30:.2f} GiB", flush=True)
+    print(f"[mem] 两模型常驻 alloc={torch.cuda.memory_allocated()/2**30:.2f} GiB "
+          f"（AR 条件也保持双模型常驻，避免改变显存状态）", flush=True)
 
     cfg = dict(ctx=CTX, reps=REPS, max_new=MAXNEW, k=K, chunk=CHUNK,
                target=TARGET, draft=DRAFT, text=src, torch=torch.__version__,
                gpu=torch.cuda.get_device_name(0), warm=WARM,
                kv_order="reversed" if REVERSE else "base-first",
+               filters=dict(P4_CTX=CTX, P4_KV=KV_FILTER, P4_MODE=MODE_FILTER),
+               condition_list=[f"{c},{kv},{m}" for c, kv, m in conditions],
                prompt_encoding="tokenizer default, no chat template, raw text prefix",
-               nested_prefix=True, filler="none (real wikitext text)")
+               nested_prefix=True, filler="none (real wikitext text)",
+               rel_spread_limit_pct=REL_SPREAD_LIMIT,
+               note="hash 不含 P4_ONLY/RUN_ID（那是执行指令，不是实验身份）；每行带 condition+order")
     chash = hashlib.sha256(json.dumps(cfg, sort_keys=True).encode()).hexdigest()[:12]
-    jsonl = OUTDIR / f"part4_{chash}.jsonl"
-
-    KVS = ("v_fp8", "base_bf16") if REVERSE else ("base_bf16", "v_fp8")
-    if REVERSE:
-        print("[cfg] P4_REVERSE=1 -> 每个 ctx 内先 v_fp8 后 base_bf16（顺序对照）", flush=True)
-    conditions = [(ctx, kv, mode) for ctx in CTX for kv in KVS
-                  for mode in ("AR", "SpecDec")]
-    only = parse_only()
-    if only is not None:
-        conditions = [only]
-        print(f"[cfg] P4_ONLY={only} -> 单条件独立进程模式（每格从干净显存状态开始）",
-              flush=True)
+    jsonl = resolve_jsonl(OUTDIR, chash, RUN_ID, append_ok=only is not None)
     append = only is not None and jsonl.exists()
+
     summary: dict[tuple, dict] = {}
     ref_gen: dict[tuple, list] = {}
+    proc_row = dict(kind="process", config_hash=chash, run_id=RUN_ID, pid=os.getpid(),
+                    only=ONLY or None, order=ORDER_LABEL, ctx_filter=CTX, kv_filter=KV_FILTER,
+                    mode_filter=MODE_FILTER, reps=REPS, warm=WARM, max_new=MAXNEW, chunk=CHUNK,
+                    conditions=[f"{c},{kv},{m}" for c, kv, m in conditions],
+                    ts_start=time.time(), monitor_start=nvml_snapshot(),
+                    cuda_start=cuda_snapshot(), allocator=allocator_info())
     with jsonl.open("a" if append else "w", encoding="utf-8") as fh:
         if not append:
             fh.write(json.dumps(dict(kind="config", config_hash=chash, **cfg),
                                 ensure_ascii=False) + "\n")
+        fh.write(json.dumps(proc_row, ensure_ascii=False) + "\n")
         for ctx, kv, mode in conditions:
             if all_ids.shape[1] < ctx:
                 print(f"[skip] ctx={ctx} 超出语料 token 数 {all_ids.shape[1]}")
@@ -396,9 +630,8 @@ def main() -> int:
                     print(f"  [{tag}] rep{rep} OOM -> 记 OOM 并继续", flush=True)
                     break
                 runs.append(r)
-                fh.write(json.dumps(dict(kind="run", config_hash=chash, rep=rep,
-                                         **{k: v for k, v in r.items() if k != "gen"}),
-                                    ensure_ascii=False) + "\n")
+                fh.write(json.dumps(dict(kind="run", config_hash=chash, rep=rep, **{
+                    k: v for k, v in r.items() if k != "gen"}), ensure_ascii=False) + "\n")
                 fh.flush()
             if not runs:
                 summary[(ctx, kv, mode)] = dict(oom=True, mode=mode, target_kv=kv, ctx=ctx)
@@ -408,25 +641,30 @@ def main() -> int:
             summary[(ctx, kv, mode)] = s
             if mode == "AR":
                 ref_gen[(ctx, kv)] = runs[0]["gen"]
-                print(f"  [{tag}] pref={s['t_prefill_s_med']:.2f}s "
-                      f"dec={s['t_decode_s_med']:.2f}s[{s['t_decode_s_min']:.2f}.."
-                      f"{s['t_decode_s_max']:.2f}] dec_tok/s={s['decode_tok_s_med']:.2f} "
-                      f"peak_alloc={s['peak_alloc_GiB_med']:.2f}", flush=True)
-            else:
-                eq = ref_gen.get((ctx, kv)) == runs[0]["gen"]
-                s["token_equal_vs_AR"] = eq
-                print(f"  [{tag}] pref={s['t_prefill_s_med']:.2f}s "
-                      f"dec={s['t_decode_s_med']:.2f}s[{s['t_decode_s_min']:.2f}.."
-                      f"{s['t_decode_s_max']:.2f}] dec_tok/s={s['decode_tok_s_med']:.2f} "
-                      f"accept={s['accept_rate_med']:.3f} "
-                      f"rounds={s['rounds_med']:.0f} block={s['target_block_calls_med']:.0f} "
-                      f"draft={s['draft_calls_med']:.0f} peak_alloc={s['peak_alloc_GiB_med']:.2f} "
-                      f"==AR:{eq}", flush=True)
+            if only is None:              # 同进程内才能直接比 token 序列
+                if mode == "SpecDec":
+                    s["token_equal_vs_AR"] = ref_gen.get((ctx, kv)) == runs[0]["gen"]
+                    s["token_equal_source"] = "同进程对比"
+            print(f"  [{tag}] pref={s['t_prefill_s_med']:.2f}s "
+                  f"dec={s['t_decode_s_med']:.2f}s[{s['t_decode_s_min']:.2f}.."
+                  f"{s['t_decode_s_max']:.2f}] rel%="
+                  f"{(s['decode_tok_s_rel_spread_pct'] or 0):.1f} "
+                  f"dec_tok/s={s['decode_tok_s_med']:.2f} "
+                  f"peak_alloc={s['peak_alloc_GiB_med']:.2f} "
+                  f"finite={s['logits_finite']} n_gen同={s['n_gen_consistent']} "
+                  f"hash同={s['gen_sha1_consistent']} "
+                  + (f"accept={s['accept_rate_med']:.3f} rounds={s['rounds_med']:.0f} "
+                     f"block={s['target_block_calls_med']:.0f} draft={s['draft_calls_med']:.0f} "
+                     if mode == "SpecDec" else "")
+                  + f"flag={s.get('spread_flag')}", flush=True)
             fh.write(json.dumps(dict(kind="summary", config_hash=chash, **s),
                                 ensure_ascii=False) + "\n")
 
-    # ---- 汇总表（与 --aggregate 共用同一函数）----
-    print_report(summary, CTX, KVS)
+    token_equal = cross_process_token_equal(
+        [dict(ctx=s["ctx"], target_kv=s["target_kv"], mode=s["mode"],
+              order=ORDER_LABEL, gen_sha1=s.get("gen_sha1")) for s in summary.values()
+         if not s.get("oom")])
+    print_report(summary, ctxs, kvs, modes=modes, token_equal=token_equal)
 
     print(f"\n[out] {jsonl}")
     del tgt, drf

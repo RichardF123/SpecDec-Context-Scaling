@@ -293,6 +293,67 @@ target KV ∈ {base_bf16, v_fp8}，draft 恒 base BF16；ctx ∈ {512, 8192}（c
 - 结论适用范围：`spec_decode_greedy` 的**控制流 / cache 语义（prefill-trim-rollback 与长度不变量）/ logits 对齐 / 替换 token 单步重算 / EOS 与 budget<k 边界**在良定义配置下逐 token 正确；**bf16 档的 tie-collapse 作为已知数值限制披露**，不构成对性能结论的豁免。
 - Phase 4 前提：本条 PASS 满足"实现正确性"门槛；测量仍须携带 §4.5.5 的数值限制说明。
 
+### 4.6 Part 4 小规模测量（G4）— **工具链已修，8K 复验未运行 ⇒ 状态未定论**
+> 门禁：Part 4 未定论期间**不启动 G5 正式落盘 / 4-family Pilot / Final**；不更新 speedup 主结论；
+> 不改 k=4、模型、KV 方案与正式 factorial；B6-bf16 CHECK 19/20 的严格登记不变。
+
+#### 4.6.1 两个 exploratory run（**受保护，不得覆盖/删除/修改**）
+| 登记名 | 文件 | 条件 | 结果 | 已知缺陷 |
+|---|---|---|---|---|
+| `exploratory_run_1_fixed_order` | `output/part4/part4_dc0bd5d87389.jsonl` | 12（ctx 512/2048/8192 × 2 KV × 2 decode） | 12/12 条件、36/36 run 写入成功；**最后因 `mismatch_rounds_med` 缺失 KeyError** 终止（数据已落盘） | 固定条件顺序；`empty_cache` 在计时区内；标定误报"12 conditions" |
+| `exploratory_run_2_reverse_order` | `output/part4/part4_ba0c985bcd5d.jsonl` | 4（仅 ctx=8192，`P4_REVERSE=1`） | 正常 exit 0 | 仅 4 条件；标定把 4 条件外推成"12 conditions / 3.0 GPU 小时"（无效）|
+
+**完整性锚点（2026-09-15 记录；后续任何改动都会被 probe 的前后 sha256 校验报警）**
+
+| 文件 | bytes | lines | sha256 |
+|---|---|---|---|
+| `part4_dc0bd5d87389.jsonl` | 41026 | 49 | `bfb85f509b6802393637ea9cea9d7f5275579deb457ed6456db9bb087664c53c` |
+| `part4_ba0c985bcd5d.jsonl` | 14310 | 17 | `6ad22617a46be08328f980537eb77ed95fb7b38e5548166da3b910f335d4c7c3` |
+
+#### 4.6.2 两次 exploratory 的关键读数与已确立判定（ctx=8192）
+| 口径 | run1（base 先，含 empty_cache） | run2（v_fp8 先，无 empty_cache） |
+|---|---|---|
+| base_bf16 AR decode | 10.87 s → 5.89 tok/s | 6.44 s → 9.93 tok/s |
+| v_fp8 AR decode | 2.91 s → 22.00 tok/s | 3.69 s → 17.35 tok/s |
+| base SpecDec decode | 8.45 s | 13.64 s |
+| v_fp8 SpecDec decode | 9.34 s | 15.60 s |
+| base decode Spec/AR | **1.286×** | **0.472×** |
+| v_fp8 decode Spec/AR | 0.311×（按 run1 原始行） | 0.236× |
+| acceptance（两档） | 0.737 | 0.737（两档皆 `==AR:True`）|
+| 接受长度分布（两档**完全相同**） | — | `m=0:3 1:12 2:12 3:0 4:33`（60 轮）|
+
+**判定（事实）**
+1. **1.286× 未复现**（run2 同格为 0.472×）⇒ 不是稳定加速，**不得写入速度主表**。
+2. `v_fp8 > base`（AR）**两种顺序下方向一致**（3.74× → 1.75×），但**量级漂移 1.7×**，且
+   `peak_resv` 8.05–10.47 GiB **越过 8 GiB 物理显存** ⇒ 归为 **allocator/WDDM/thermal-sensitive**；
+   在正式 harness 采用随机化/交错 + 环境记录之前，**禁止进入正式速度主表**。
+3. 只测 8192 的结果**不得当作 12 条件**：run2 的 3.0h/1.8h 外推作废。
+4. **未验证**：v_fp8 优势的机制（字节节省 vs 驻留/paging 效应）**未被直接隔离**，只能作支持性推断。
+
+#### 4.6.3 本轮工具链修正（CPU 自测 **42/42 PASS**）
+| 项 | 内容 |
+|---|---|
+| 条件过滤 | `P4_KV` / `P4_MODE` / `P4_CTX` / `P4_ONLY=<ctx>,<kv>,<mode>` / `P4_REVERSE`；非法值立即报错 |
+| 运行身份 | 输出名 `part4_<config_hash>_<RUN_ID>.jsonl`（RUN_ID 默认 UTC 时间戳）；**既有同名文件且非同 RUN_ID 组 → 直接报错退出，绝不以 `"w"` 静默覆盖**；hash 含 filter + condition_list |
+| 环境监控 | 每 rep 记录 start/end：CUDA free/total、torch allocated/reserved、nvidia-smi used/temp/power/clocks/driver、allocator 配置；**取不到一律 `available=false` + `error`，不用 0 冒充** |
+| 稳定性判据 | median/min/max/spread/**relative spread**；`rel_spread>20%` → 条件标 `CHECK`（仅用于识别测量不稳定，不作显著性）；另查 n_gen 一致 / token hash 一致 / stats 一致 / finite / SpecDec 是否逐 token 等于同档 AR（**跨进程用 `gen_sha1`**）|
+| 标定修正 | 只基于**实际运行**条件集分类：`formal 12-condition`（仅 ctx={2048,4096,8192}）/ `exploratory 12-condition`（ctx={512,2048,8192}）/ `8K 4-condition measured cost` / `subset`；**subset 拒绝 per-family 外推**，如需外推必须显式写出假设公式并与实测分列 |
+| 新增文件 | `specdec/engine/g4_part4_8k_isolated_probe.py`（两轮启动顺序 × 4 条件，每条件独立子进程，含受保护文件前后 sha256 校验）、`specdec/engine/g4_part4_selftest_cpu.py`（42 项 CPU 自测）|
+
+#### 4.6.4 8K 独立进程复验 — **未运行**
+`g4_part4_8k_isolated_probe.py` 已就位但**尚未在 GPU 上执行**。因此下列全部**未运行、无数据**：
+顺序 A/B 的 4 条件 × 5 rep 原始数据、median/min/max/spread、温度/功耗/时钟记录、
+v_fp8/base 比值稳定性、1.286× 是否复现、SpecDec 的 decode/e2e 是否获利。**不得填写预期值。**
+
+#### 4.6.5 仍开放的问题（不得因 8K 全 `==AR:True` 而关闭）
+`exploratory_run_1` 中下列条件的 SpecDec 与 AR **token 序列不等**，仍需独立诊断脚本定位
+（first_diff_index / token id / top-1·top-2 margin / block-vs-serial max\|Δ\| / FP32 control /
+determinism）：`512 base_bf16`、`2048 base_bf16`、`2048 v_fp8`。
+
+#### 4.6.6 Part 4 状态
+**CHECK（未定论）**：工具链与判据已就位且 CPU 自测通过；8K 复验未运行；两次 exploratory 已
+**证伪"8K 稳定加速"**并确立 1.286× 不可复现。**不允许进入 G5 / Pilot / Final。**
+
 ## 5. 复现设置（每次记录必须带上）
 - seed=42（测试）；性能脚本 seed=0，3 reps 取最优 + warmup；
 - prompt 固定（bench_basic.PROMPT，38 tok）；decode 数 64；

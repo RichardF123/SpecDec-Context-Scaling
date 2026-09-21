@@ -30,19 +30,17 @@ MODES = ("AR", "SpecDec")
 
 def main() -> int:
     conds = [(c, kv, m) for c in CTXS for kv in KVS for m in MODES]
+    run_id = os.environ.get("P4_RUN_ID") or time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
     print(f"[driver] {len(conds)} 个条件（逐进程）：{conds}", flush=True)
-    # 归档历史 JSONL：子进程用追加模式共享一个文件，重跑前必须清场，否则新旧行混在一起
+    print(f"[driver] run_id={run_id}（输出文件名含 config hash + run_id，**不覆盖既有文件**）",
+          flush=True)
+    # 注意：**不做任何归档/移动**。历史 run（含两个受保护的 exploratory JSONL）必须原地保留；
+    # RUN_ID 已保证新 run 不会与旧文件同名。
     outdir = ROOT / "output" / "part4"
     outdir.mkdir(parents=True, exist_ok=True)
-    old = sorted(outdir.glob("part4_*.jsonl"))
-    if old:
-        arch = outdir / f"archive_{time.strftime('%Y%m%d_%H%M%S')}"
-        arch.mkdir(exist_ok=True)
-        for p in old:
-            p.rename(arch / p.name)
-        print(f"[driver] 历史 JSONL 已归档到 {arch}（{len(old)} 份）", flush=True)
     env0 = os.environ.copy()
     env0.pop("P4_ONLY", None)
+    env0["P4_RUN_ID"] = run_id
     t_all = time.perf_counter()
     for i, (ctx, kv, mode) in enumerate(conds, 1):
         env = dict(env0)
