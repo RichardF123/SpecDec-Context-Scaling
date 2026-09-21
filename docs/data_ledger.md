@@ -536,6 +536,12 @@ correctness gate preserved:    YES（FP32 B6 PASS 保持；未动 spec_dec / spe
 ready for formal Pilot:        NO
 ```
 
+### 4.9 交接文档（2026-09-21）
+`docs/handoff_to_analysis_agent.md`：面向接手**分析/实验设计**的 agent 的自包含交接报告，包含
+Gate 总表、硬规则 10 条、代码与工具清单、**数据清单 + 受保护文件 sha256 锚点**、
+"已确立事实 / 推断 / 未运行"三分类、开放阻塞项与最小解法、环境与 shell 陷阱、
+以及下一步推荐动作与禁止动作。**本文档不引入新数据，只是既有台账的索引与解释。**
+
 ## 5. 复现设置（每次记录必须带上）
 - seed=42（测试）；性能脚本 seed=0，3 reps 取最优 + warmup；
 - prompt 固定（bench_basic.PROMPT，38 tok）；decode 数 64；
