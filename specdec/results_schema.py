@@ -27,7 +27,14 @@ import os
 import statistics
 from pathlib import Path
 
-SCHEMA_VERSION = "g5-results-1.0"
+SCHEMA_VERSION = "g5-results-1.1"
+# v1.0 -> v1.1（不兼容变更）：新增资源口径字段并区分 AR 主基线/诊断控制；
+#   v1.0 行仍可由 build_g5_row() 只读映射，新字段一律 null + availability=false（**不猜**）。
+
+MODE_CHOICES = ("AR", "SpecDec")
+AR_RESIDENCY_CHOICES = ("target_only", "dual_control")
+PRIMARY_AR_RESIDENCY = "target_only"          # 正式主基线
+DIAGNOSTIC_AR_RESIDENCY = "dual_control"      # 诊断控制（不计入 factorial）
 
 # ---------------------------------------------------------------- 字段定义
 # name -> (kind, 说明)；kind ∈ {"str","int","float","bool","list","dict"}
@@ -86,6 +93,13 @@ FIELDS: dict[str, tuple[str, str]] = {
     "ar_equal_certified": ("bool", "前提（ctx/max_new/eos/input_token_hash）是否全部满足"),
     "first_diff_index": ("int", "首个不同 token 位置（不等时）"),
     "status": ("str", "OK | OOM | CHECK | SKIP"),
+    # ---- 资源口径（v1.1 新增）：谁是主要条件、谁占了多少资源、谁配当分母 ----
+    "resident_models": ("list", "实际驻留的模型，如 ['target'] 或 ['target','draft']"),
+    "ar_residency": ("str", "AR 的驻留模式：target_only | dual_control（SpecDec 为 null）"),
+    "condition_role": ("str", "primary | diagnostic_control"),
+    "formal_factorial_member": ("bool", "是否属于正式 3x2x2 factorial；诊断控制为 false"),
+    "speedup_denominator_eligible": ("bool", "能否作为正式 speedup 分母；仅 AR target_only 为 true"),
+    "speedup_claim_allowed": ("bool", "该 cell 是否允许产生**确定的**加速声明（不稳定 cell 为 false）"),
     "profile": ("dict", "profiling 分解（默认 null；profiling 数据不作为正式吞吐）"),
     "availability": ("dict", "field -> bool；值为 null 的字段必须显式为 false"),
     "notes": ("str", ""),
@@ -96,6 +110,119 @@ TELEMETRY_FIELDS = ("nvidia_smi_used_mib", "temperature_c", "power_w", "sm_clock
 NUMERIC_FIELDS = tuple(k for k, (kind, _) in FIELDS.items() if kind in ("int", "float"))
 # `availability` 是**元字段**，不参与自身的一致性检查（否则会往 availability 里写 availability）
 NULLABLE_FIELDS = tuple(k for k in FIELDS if k != "availability")
+
+
+def resolve_condition_role(mode: str, ar_residency: str | None) -> dict:
+    """**显式枚举**决定驻留与角色（不做字符串包含判断）。非法组合直接抛 ValueError。
+
+    正式主基线：`AR + target_only`（只驻留 target；真实部署口径；正式 speedup 分母）
+    诊断控制  ：`AR + dual_control`（draft 仅常驻、不参与 prefill/decode；**不入 factorial**）
+    SpecDec   ：必须 target+draft 双驻留（算法自身资源需求）；`ar_residency` 记为 null
+    """
+    if mode not in MODE_CHOICES:
+        raise ValueError(f"非法 mode: {mode!r}（可选 {MODE_CHOICES}）")
+    if ar_residency is not None and ar_residency not in AR_RESIDENCY_CHOICES:
+        raise ValueError(f"非法 ar_residency: {ar_residency!r}（可选 {AR_RESIDENCY_CHOICES}）")
+    if mode == "AR":
+        if ar_residency == PRIMARY_AR_RESIDENCY:
+            return dict(ar_residency=PRIMARY_AR_RESIDENCY, resident_models=["target"],
+                        condition_role="primary", formal_factorial_member=True,
+                        speedup_denominator_eligible=True)
+        return dict(ar_residency=DIAGNOSTIC_AR_RESIDENCY,
+                    resident_models=["target", "draft"],
+                    condition_role="diagnostic_control", formal_factorial_member=False,
+                    speedup_denominator_eligible=False)
+    return dict(ar_residency=None, resident_models=["target", "draft"],
+                condition_role="primary", formal_factorial_member=True,
+                speedup_denominator_eligible=False)
+
+
+def build_primary_matrix(ctxs, kvs, modes=MODE_CHOICES,
+                         ar_residency: str = PRIMARY_AR_RESIDENCY) -> list[tuple]:
+    """正式 primary factorial cells：(ctx, kv, mode)，其中 AR 一律 target-only。"""
+    return [(c, kv, m) for c in ctxs for kv in kvs for m in modes]
+
+
+def build_dual_controls(ctxs, kvs) -> list[tuple]:
+    """可选诊断控制 cells：AR + dual_control（**不计入 primary factorial**）。"""
+    return [(c, kv, "AR") for c in ctxs for kv in kvs]
+
+
+def compute_speedup(ar_row: dict, spec_row: dict) -> dict:
+    """统一方向：speedup = T_AR / T_Spec（>1 表示 SpecDec 更快，<1 表示更慢）。
+
+    强制：AR 行必须是 **target_only primary**（否则抛错，防止诊断控制混入分母）；
+    `speedup_claim_allowed=False` 时不产出确定性结论（只给数字与 CHECK 标注）。
+    """
+    if ar_row.get("mode") != "AR":
+        raise ValueError("speedup 分母必须是 AR 行")
+    if ar_row.get("ar_residency") != PRIMARY_AR_RESIDENCY or \
+            not ar_row.get("speedup_denominator_eligible"):
+        raise ValueError("speedup 分母必须是 AR + target_only（primary）；"
+                         "dual_control 不得作为分母")
+    if spec_row.get("mode") != "SpecDec":
+        raise ValueError("speedup 分子必须是 SpecDec 行")
+    if (ar_row.get("context_actual"), ar_row.get("target_kv")) != \
+            (spec_row.get("context_actual"), spec_row.get("target_kv")):
+        raise ValueError("speedup 只能同 context、同 KV 比较")
+    out = dict(context_actual=ar_row.get("context_actual"), target_kv=ar_row.get("target_kv"))
+    for field, key in (("total_seconds", "e2e"), ("decode_seconds", "decode")):
+        t_ar, t_spec = ar_row.get(field), spec_row.get(field)
+        if isinstance(t_ar, (int, float)) and isinstance(t_spec, (int, float)) and t_spec:
+            out[f"speedup_{key}"] = t_ar / t_spec
+        else:
+            out[f"speedup_{key}"] = None
+    out["speedup_claim_allowed"] = bool(
+        ar_row.get("speedup_claim_allowed") and spec_row.get("speedup_claim_allowed"))
+    return out
+
+
+def residency_penalty(ar_primary: dict, ar_dual: dict) -> dict:
+    """`penalty = T_AR_target_only / T_AR_dual_control`。
+
+    **方向语义（写死）**：`penalty < 1` ⇒ 双驻留下 AR 更慢（即"额外模型驻留本身就有代价"）；
+    等价地 `slowdown = T_dual / T_target = 1 / penalty > 1` 表示拖慢倍数。
+    """
+    if ar_primary.get("ar_residency") != PRIMARY_AR_RESIDENCY:
+        raise ValueError("第一个参数必须是 AR target_only")
+    if ar_dual.get("ar_residency") != DIAGNOSTIC_AR_RESIDENCY:
+        raise ValueError("第二个参数必须是 AR dual_control")
+    out = dict(context_actual=ar_primary.get("context_actual"),
+               target_kv=ar_primary.get("target_kv"))
+    for field, key in (("total_seconds", "e2e"), ("decode_seconds", "decode")):
+        a, b = ar_primary.get(field), ar_dual.get(field)
+        if isinstance(a, (int, float)) and isinstance(b, (int, float)) and b and a:
+            out[f"penalty_{key}"] = a / b
+            out[f"slowdown_{key}"] = b / a
+        else:
+            out[f"penalty_{key}"] = None
+            out[f"slowdown_{key}"] = None
+    out["interpretation"] = "penalty<1（slowdown>1）⇒ 双驻留本身拖慢了 AR"
+    return out
+
+
+def plan_process(conditions, ar_residency: str | None = None) -> dict:
+    """给定"一个进程里要跑的条件列表"，决定该进程需要驻留哪些模型，并做硬约束检查。
+
+    `conditions`: [(ctx, kv, mode), ...]；`ar_residency`: AR 条件用的驻留模式。
+
+    **硬约束**：`AR + target_only`（正式主基线）要求该进程**从未加载 draft**，因此不能与 SpecDec
+    条件同进程（否则 AR 实际上是双驻留）。违反直接抛 ValueError。
+    """
+    if ar_residency is not None and ar_residency not in AR_RESIDENCY_CHOICES:
+        raise ValueError(f"非法 ar_residency: {ar_residency!r}（可选 {AR_RESIDENCY_CHOICES}）")
+    modes = {m for _, _, m in conditions}
+    for m in modes:
+        if m not in MODE_CHOICES:
+            raise ValueError(f"非法 mode: {m!r}（可选 {MODE_CHOICES}）")
+    if ar_residency == PRIMARY_AR_RESIDENCY and "AR" in modes and "SpecDec" in modes:
+        raise ValueError("AR target_only 不能与 SpecDec 同进程（draft 一旦加载就不再是 "
+                         "target-only）：请按 mode 过滤或用逐条件独立进程")
+    need_draft = ("SpecDec" in modes) or \
+                 (ar_residency == DIAGNOSTIC_AR_RESIDENCY and "AR" in modes)
+    return dict(load_draft=need_draft,
+                resident_models=["target"] + (["draft"] if need_draft else []),
+                ar_residency=ar_residency, n_conditions=len(conditions))
 
 
 def finalize_row(row: dict) -> dict:
@@ -157,6 +284,36 @@ def validate_row(row: dict) -> list[str]:
              (kind == "dict" and isinstance(v, dict))
         if not ok:
             errs.append(f"{name} 类型应为 {kind}，实际 {type(v).__name__}")
+    # ---- 资源口径一致性（v1.1）：矛盾组合必须被拒绝 ----
+    mode = row.get("mode")
+    res = row.get("ar_residency")
+    rm = row.get("resident_models")
+    if mode in MODE_CHOICES and res is not None and isinstance(rm, list):
+        try:
+            want = resolve_condition_role(mode, res)
+        except ValueError as e:  # noqa: PERF203
+            errs.append(f"mode/residency 组合非法: {e}")
+        else:
+            if rm != want["resident_models"]:
+                errs.append(f"resident_models {rm} 与 mode={mode}/residency={res} 矛盾"
+                            f"（应为 {want['resident_models']}）")
+            for field in ("condition_role", "formal_factorial_member",
+                          "speedup_denominator_eligible"):
+                v = row.get(field)
+                if v is not None and v != want[field]:
+                    errs.append(f"{field}={v!r} 与 mode={mode}/residency={res} 矛盾"
+                                f"（应为 {want[field]!r}）")
+    if mode == "AR" and res == DIAGNOSTIC_AR_RESIDENCY:
+        if row.get("formal_factorial_member") is True:
+            errs.append("dual_control 不得标 formal_factorial_member=true")
+        if row.get("speedup_denominator_eligible") is True:
+            errs.append("dual_control 不得作为 speedup 分母")
+    if mode == "AR" and res == PRIMARY_AR_RESIDENCY and isinstance(rm, list) and "draft" in rm:
+        errs.append("AR target_only 的 resident_models 不得包含 draft")
+    if mode == "SpecDec" and res is not None:
+        errs.append("SpecDec 的 ar_residency 必须为 null")
+    if row.get("status") not in (None, "OK") and row.get("speedup_claim_allowed") is True:
+        errs.append(f"status={row.get('status')} 的 cell 不得 speedup_claim_allowed=true")
     return errs
 
 
@@ -247,7 +404,34 @@ def build_g5_row(src: dict, meta: dict | None = None) -> dict:
     row["chunk_size"] = src.get("chunk", meta.get("chunk_size"))
     row["notes"] = ("tokens_finite 范围：prefill + AR 每步；SpecDec 验证块行未扫描"
                     "（需引擎插桩）。由 results_schema.build_g5_row 从 Part 4 行映射。")
+    # meta 先合并，**之后再解析角色**：否则 meta 的 mode/ar_residency 覆盖 src 后角色不重算，
+    # 会产生"mode=AR 但角色按 SpecDec 填"的自相矛盾行（自测已抓到）。
     row.update({k: v for k, v in meta.items() if k in FIELDS and v is not None})
+    mode_final = row.get("mode")
+    res_final = row.get("ar_residency")
+    role_src = meta.get("condition_role")
+    if mode_final == "SpecDec":
+        want = resolve_condition_role("SpecDec", None)       # SpecDec 必须双驻留（可确定）
+        row.update({"ar_residency": None, "resident_models": want["resident_models"],
+                    "condition_role": want["condition_role"],
+                    "formal_factorial_member": want["formal_factorial_member"],
+                    "speedup_denominator_eligible": want["speedup_denominator_eligible"]})
+    elif mode_final == "AR" and res_final is not None:
+        want = resolve_condition_role("AR", res_final)
+        row.update({"ar_residency": want["ar_residency"],
+                    "resident_models": src.get("resident_models", meta.get("resident_models"))
+                    or want["resident_models"],
+                    "condition_role": want["condition_role"],
+                    "formal_factorial_member": want["formal_factorial_member"],
+                    "speedup_denominator_eligible": want["speedup_denominator_eligible"]})
+    else:
+        # AR 但 residency 未知（v1.0 / exploratory 数据）：**不猜**，一律 null
+        for fld in ("ar_residency", "resident_models", "condition_role",
+                    "formal_factorial_member", "speedup_denominator_eligible"):
+            row[fld] = None
+        if role_src is not None:
+            row["condition_role"] = role_src
+    row["speedup_claim_allowed"] = (row["status"] == "OK")
     return finalize_row(row)
 
 

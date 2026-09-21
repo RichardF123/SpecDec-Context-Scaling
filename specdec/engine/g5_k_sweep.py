@@ -40,15 +40,26 @@ def main() -> int:
     print(f"[ksweep] run_id={run_id} ctx={CTX} k={KS} kv={KV} reps={REPS} "
           f"k_protocol={K_PROTOCOL}（正式协议不变）", flush=True)
     print("[ksweep] 冻结变体：不发射 bonus token（本轮**不做** K+1 算法改动）", flush=True)
+    print("[ksweep] AR 分母 = **target-only 正式主基线**，每个 ctx 只测一次"
+          "（不为每个 k 重测/择优）", flush=True)
     results: dict = {}
     for ctx in CTX:
-        for k in KS + [None]:                    # None => AR 对照（同 ctx）
+        # AR 分母：**target-only 正式主基线**，每个 ctx **只测一次**（不为每个 k 重测/择优）
+        ar_info = D.spawn_condition(ctx=ctx, kv=KV, mode="AR",
+                                    run_id=f"ksweep_{ctx}_AR_target_only", reps=REPS,
+                                    warm=WARM, maxnew=MAXNEW, chunk=CHUNK, k=None,
+                                    order="AR-baseline",
+                                    ar_residency=S.PRIMARY_AR_RESIDENCY)
+        for k in KS + [None]:
             mode = "AR" if k is None else "SpecDec"
             kk = K_PROTOCOL if k is None else k
-            cid = f"ksweep_{ctx}_{mode}_{kk}"
-            info = D.spawn_condition(ctx=ctx, kv=KV, mode=mode, run_id=cid, reps=REPS,
-                                     warm=WARM, maxnew=MAXNEW, chunk=CHUNK,
-                                     k=(None if k is None else k), order=f"k{k}")
+            if k is None:
+                info, cid = ar_info, f"ksweep_{ctx}_AR_target_only"
+            else:
+                cid = f"ksweep_{ctx}_{mode}_{kk}"
+                info = D.spawn_condition(ctx=ctx, kv=KV, mode=mode, run_id=cid, reps=REPS,
+                                         warm=WARM, maxnew=MAXNEW, chunk=CHUNK, k=k,
+                                         order=f"k{k}", ar_residency=None)
             runs, sums, jpath = D.read_part4_rows(cid)
             if not runs:
                 print(f"  [skip] ctx={ctx} k={kk} {mode} 无数据（exit={info['returncode']}）")
@@ -104,7 +115,7 @@ def main() -> int:
                   f"{r['rounds']:>6} {r['block']:>6} {r['draft']:>6}  {dec_s:>9}  "
                   f"{r['peak']:>10.2f}  {eq}")
 
-    print("\n== SpecDec/AR 同档比值（只作诊断）==")
+    print("\n== speedup = T_AR(target-only) / T_Spec（>1 = SpecDec 更快；<1 = 更慢）==")
     for ctx in CTX:
         ar = results.get((ctx, K_PROTOCOL, "AR"))
         if not ar or not ar["dec_med"]:
@@ -112,7 +123,8 @@ def main() -> int:
         for k in KS:
             r = results.get((ctx, k, "SpecDec"))
             if r and r["dec_med"]:
-                print(f"  ctx={ctx:<5} k={k:<2} SpecDec/AR = {r['dec_med'] / ar['dec_med']:.3f}×")
+                print(f"  ctx={ctx:<5} k={k:<2} speedup = {ar['dec_med'] / r['dec_med']:.3f}× "
+                      f"（AR target-only {ar['dec_med']:.2f} tok/s ÷ SpecDec {r['dec_med']:.2f}）")
 
     best = []
     for ctx in CTX:

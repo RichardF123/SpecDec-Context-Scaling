@@ -38,6 +38,8 @@ Report & Presentation 15% / Creativity 10%。截止：提案 **10/7**、演示 W
 | KV 条件 | `base_bf16`（K/V 均 BF16）、`v_fp8`（K BF16 + V FP8 E4M3，per-token×per-head，gs128） |
 | 解码 | AR（cached greedy）与 SpecDec（**greedy、k=4、不发射 bonus**） |
 | 正式 factorial | ctx {2K,4K,8K} × KV {base_bf16, v_fp8} × mode {AR, SpecDec} = **12 条件** |
+| **AR 基线口径（v1.1）** | **正式 AR = `AR-primary` = target-only**（只加载 target，draft 从不加载）；它是正式 speedup 分母。`AR-dual-resident-control`（双模型常驻、draft 仅驻留）只是**诊断控制**，**不入 factorial、不作分母** |
+| speedup 方向 | `speedup = T_AR / T_Spec`（>1 = SpecDec 更快）；`residency_penalty = T_AR(target-only)/T_AR(dual)`，`<1` ⇒ 双驻留本身拖慢 AR |
 | prompt | 真实 wikitext 文本的**嵌套前缀**（2K⊂4K⊂8K），不插合成填充；family 用 `train.raw`，质量窗用 `test.raw` |
 
 ---
@@ -57,7 +59,8 @@ Report & Presentation 15% / Creativity 10%。截止：提案 **10/7**、演示 W
 | B6-bf16 | **CHECK 19/20** | ledger §4.5.5（唯一分歧 = 已量化 tie-collapse：signal 0.1491 ≤ noise 0.1491） |
 | 索引语义 / cache 不变量 | **PASS** | ledger §4.6.5、§4.7（哨兵 35/35 + 真实模型 fp32 语义 + B6-fp32） |
 | Part 4 正确性归因 | **CLOSED** | 三条件 = `BF16_NEAR_TIE`，`off_by_one=False` |
-| Part 4 性能数据 | **INVALID（不得入正式主表）** | 原因：8K 显存饱和 + between-block 28.9% 不稳定（**与索引无关**） |
+| **AR 正式基线（target-only）** | **口径已定，数据未测** | §1 表；历史 AR 数据是 `AR-dual-resident exploratory`，**不能当正式分母** |
+| Part 4 性能数据 | **VALID EXPLORATORY DATA / INELIGIBLE FOR FORMAL SPEEDUP TABLE** | 两个原因：① AR 是双驻留口径，不符合正式主基线；② 8K 显存饱和 + between-block 28.9% 不稳定。**数据有效（它证明显存饱和与顺序敏感），只是不符合正式主基线口径** |
 | G5 schema / 协议 | **已冻结** | `docs/g5_measurement_protocol.md`；`results_schema.py`（43 项 CPU 自测） |
 | G5 稳定性 / 成本分解 / k 扫描 | **未运行** | ledger §4.8.4 |
 | 正式 Pilot / Final | **禁止** | 见 §9 |
@@ -194,12 +197,13 @@ Report & Presentation 15% / Creativity 10%。截止：提案 **10/7**、演示 W
 
 | # | 阻塞项 | 最小解法 | 命令（**GPU，需人运行**） |
 |---|---|---|---|
-| 1 | 跨顺序不稳定未量化到 12 条件 | 随机化 2 block 探针 | `python -m specdec.engine.g5_stability_probe` |
-| 2 | "为什么慢"缺阶段归因 | 阶段成本分解 | `python -m specdec.engine.g5_cost_breakdown` |
+| 0 | **正式 AR 主基线（target-only）尚无数据**；历史 AR 是双驻留口径 | stability probe 的 primary AR 条件（工具已按 target-only 实现） | `python -m specdec.engine.g5_stability_probe` |
+| 1 | 跨顺序不稳定未量化到 12 条件 | 随机化 2 block 探针（可选加 6 个 dual control） | 同上；可选 `set P5_INCLUDE_DUAL_AR_CONTROL=1` |
+| 2 | "为什么慢"缺阶段归因 | 阶段成本分解（AR 用 target-only，dual 可选） | `python -m specdec.engine.g5_cost_breakdown` |
 | 3 | 8K 显存饱和的**协议级处置**未决（标注 / 降并发 / 缩小 max_new） | 人工决策 | —— |
-| 4 | k 的收益曲线未知 | k 扫描（诊断） | `python -m specdec.engine.g5_k_sweep` |
+| 4 | k 的收益曲线未知 | k 扫描（诊断；AR 分母 = target-only，每 ctx 只测一次） | `python -m specdec.engine.g5_k_sweep` |
 | 5 | family manifest 待定稿（N、分层规则、是否用 train.raw、是否加密中间长度） | 人工定稿 | —— |
-| 6 | 验证器 / 报告 | 等 §9.1–9.2 数据 | —— |
+| 6 | 验证器 / 报告 | 等 §9.0–9.2 数据 | —— |
 
 ---
 

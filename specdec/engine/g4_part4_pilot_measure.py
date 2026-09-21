@@ -72,6 +72,8 @@ WARM = int(os.environ.get("P4_WARM", "1"))
 CHUNK = int(os.environ.get("P4_CHUNK", "2048"))
 REVERSE = os.environ.get("P4_REVERSE", "") not in ("", "0", "false", "False")
 ONLY = os.environ.get("P4_ONLY", "").strip()
+# AR 的驻留模式：target_only（正式主基线，只加载 target）/ dual_control（诊断控制，draft 仅常驻）
+AR_RESIDENCY = os.environ.get("P4_AR_RESIDENCY", "target_only").strip()
 KV_FILTER = os.environ.get("P4_KV", "").strip() or None
 MODE_FILTER = os.environ.get("P4_MODE", "").strip() or None
 RUN_ID = os.environ.get("P4_RUN_ID", "").strip() or \
@@ -484,6 +486,12 @@ def mem_read():
 def run_once(tgt, drf, ids, eos, kv, mode):
     """**不在计时区内 empty_cache()**：它会把缓存块全还给驱动，让每个 rep 从零重建显存池，
     把上千次 cudaMalloc/WDDM 映射算进 decode 时间（实测可使同一格从 6.44s 变 10.87s）。"""
+    from .. import results_schema as _S
+    role = _S.resolve_condition_role(mode, AR_RESIDENCY if mode == "AR" else None)
+    if mode == "SpecDec" and drf is None:
+        raise RuntimeError("SpecDec 必须双模型驻留：draft 未加载")
+    if mode == "AR" and role["ar_residency"] == "target_only" and drf is not None:
+        raise RuntimeError("AR target_only 不得在本进程加载 draft（否则不再是 target-only 口径）")
     FINITE["ok"] = True
     torch.cuda.reset_peak_memory_stats()
     base_alloc = torch.cuda.memory_allocated() / 2**30
@@ -516,7 +524,13 @@ def run_once(tgt, drf, ids, eos, kv, mode):
                k_is_protocol=(K == PROTOCOL_K),
                # ---- 单条件进程内**没有** AR 对照 ⇒ 不得填 False ----
                ar_equal=None, ar_equal_available=False,
-               reserved_semantics=RESERVED_SEMANTICS)
+               reserved_semantics=RESERVED_SEMANTICS,
+               # ---- 资源口径（v1.1）：驻留模型 / AR 主基线 vs 诊断控制 ----
+               ar_residency=role["ar_residency"],
+               resident_models=["target"] + (["draft"] if drf is not None else []),
+               condition_role=role["condition_role"],
+               formal_factorial_member=role["formal_factorial_member"],
+               speedup_denominator_eligible=role["speedup_denominator_eligible"])
     row["decode_tok_s"] = len(gen) / td if td > 0 else float("nan")
     row["e2e_tok_s"] = len(gen) / (tp + td) if (tp + td) > 0 else float("nan")
     if mode == "AR":
@@ -707,10 +721,20 @@ def main() -> int:
     if only is not None:
         conditions = [only]
         print(f"[cfg] P4_ONLY={only} -> 单条件独立进程模式", flush=True)
-    if len(ctxs) * len(kvs) * len(modes) != len(conditions):
-        pass   # 仅用于提示：过滤后条件数以此为准
+    # ---- 资源口径校验：target_only 的 AR 只能在不加载 draft 的进程里测 ----
+    from .. import results_schema as _S
+    try:
+        plan = _S.plan_process([(c, kv, m) for c, kv, m in conditions], AR_RESIDENCY)
+    except ValueError as e:
+        raise SystemExit(f"[cfg] 条件/驻留组合非法: {e}")
+    role0 = _S.resolve_condition_role("AR", AR_RESIDENCY)
+    need_draft = plan["load_draft"]
     print(f"[cfg] filter: P4_CTX={CTX} P4_KV={KV_FILTER} P4_MODE={MODE_FILTER} "
-          f"P4_REVERSE={REVERSE} -> {len(conditions)} conditions", flush=True)
+          f"P4_REVERSE={REVERSE} P4_AR_RESIDENCY={AR_RESIDENCY} -> {len(conditions)} conditions",
+          flush=True)
+    print(f"[cfg] 角色: AR={role0['condition_role']}"
+          f"(residency={role0['ar_residency']}, 分母资格={role0['speedup_denominator_eligible']})"
+          f" | 本进程驻留={plan['resident_models']}", flush=True)
     print(f"[cfg] reps={REPS} max_new={MAXNEW} warm={WARM} chunk={CHUNK} k={K} "
           f"run_id={RUN_ID} order={ORDER_LABEL}", flush=True)
 
@@ -732,17 +756,23 @@ def main() -> int:
 
     print("[stage] loading target 1.5B ...", flush=True)
     tgt, _ = load_ours(TARGET)
-    print("[stage] loading draft 0.5B ...", flush=True)
-    drf, _ = load_ours(DRAFT)
-    print(f"[mem] 两模型常驻 alloc={torch.cuda.memory_allocated()/2**30:.2f} GiB "
-          f"（AR 条件也保持双模型常驻，避免改变显存状态）", flush=True)
+    drf = None
+    if need_draft:
+        print("[stage] loading draft 0.5B ...", flush=True)
+        drf, _ = load_ours(DRAFT)
+    else:
+        print("[stage] draft 不加载（AR target_only 正式主基线口径）", flush=True)
+    print(f"[mem] 驻留模型={['target'] + (['draft'] if drf is not None else [])} "
+          f"alloc={torch.cuda.memory_allocated()/2**30:.2f} GiB", flush=True)
 
     cfg = dict(ctx=CTX, reps=REPS, max_new=MAXNEW, k=K, chunk=CHUNK,
                target=TARGET, draft=DRAFT, text=src, torch=torch.__version__,
                gpu=torch.cuda.get_device_name(0), warm=WARM,
                kv_order="reversed" if REVERSE else "base-first",
-               filters=dict(P4_CTX=CTX, P4_KV=KV_FILTER, P4_MODE=MODE_FILTER),
+               filters=dict(P4_CTX=CTX, P4_KV=KV_FILTER, P4_MODE=MODE_FILTER,
+                            P4_AR_RESIDENCY=AR_RESIDENCY),
                condition_list=[f"{c},{kv},{m}" for c, kv, m in conditions],
+               resident_models=["target"] + (["draft"] if need_draft else []),
                prompt_encoding="tokenizer default, no chat template, raw text prefix",
                nested_prefix=True, filler="none (real wikitext text)",
                rel_spread_limit_pct=REL_SPREAD_LIMIT,

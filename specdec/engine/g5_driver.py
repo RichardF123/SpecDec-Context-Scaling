@@ -73,11 +73,16 @@ def cuda_snapshot() -> dict:
 
 def spawn_condition(*, ctx: int, kv: str, mode: str, run_id: str, reps: int, warm: int,
                     maxnew: int, chunk: int, k: int | None = None, order: str | None = None,
-                    extra_env: dict | None = None, quiet: bool = False) -> dict:
+                    ar_residency: str | None = None, extra_env: dict | None = None,
+                    quiet: bool = False) -> dict:
     """在**全新子进程**中跑一个条件。返回执行元信息（退出码/墙钟/起止时间）。
 
     计时完全由子进程内部负责；父进程只做编排，因此模型加载/tokenizer/文件写入都不进入
     prefill/decode 计时。
+
+    `ar_residency` 只在 `mode == "AR"` 时有意义：
+      - `target_only`（默认，正式主基线）：子进程**只加载 target**，从不加载 draft；
+      - `dual_control`（诊断控制）：加载双模型，但 draft 不参与 AR 的 prefill/decode。
     """
     env = os.environ.copy()
     env.update({
@@ -88,6 +93,10 @@ def spawn_condition(*, ctx: int, kv: str, mode: str, run_id: str, reps: int, war
         "P4_MAXNEW": str(maxnew), "P4_CHUNK": str(chunk),
         "P4_RUN_ID": run_id,
     })
+    if mode == "AR":
+        env["P4_AR_RESIDENCY"] = ar_residency or "target_only"
+    else:
+        env.pop("P4_AR_RESIDENCY", None)
     if k is not None:
         env["P4_K"] = str(k)
     if order:
@@ -100,6 +109,7 @@ def spawn_condition(*, ctx: int, kv: str, mode: str, run_id: str, reps: int, war
                        env=env, cwd=str(ROOT),
                        stdout=subprocess.DEVNULL if quiet else None)
     return dict(ctx=ctx, kv=kv, mode=mode, k=k, run_id=run_id, order=order,
+                ar_residency=(env.get("P4_AR_RESIDENCY") if mode == "AR" else None),
                 returncode=r.returncode, ts_start=t0, ts_end=time.time(),
                 wall_s=time.time() - t0)
 

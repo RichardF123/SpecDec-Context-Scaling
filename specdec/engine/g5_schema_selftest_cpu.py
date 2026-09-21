@@ -184,6 +184,105 @@ def main() -> int:
     check("G5 文件名含 schema + hash + run_id",
           p.name == f"g5_{S.SCHEMA_VERSION}_cafe1234_g5stab_TEST.jsonl", p.name)
 
+    print("\n== 10. AR 基线口径：target_only 正式主基线 vs dual-resident 诊断控制 ==")
+    # 10.1–10.3 驻留决策（纯函数，不加载模型）
+    p1 = S.plan_process([(2048, "base_bf16", "AR")], "target_only")
+    check("AR target_only 不加载 draft", p1["load_draft"] is False
+          and p1["resident_models"] == ["target"], str(p1))
+    p2 = S.plan_process([(2048, "base_bf16", "AR")], "dual_control")
+    check("AR dual_control 加载 draft（仅常驻）", p2["load_draft"] is True
+          and p2["resident_models"] == ["target", "draft"], str(p2))
+    p3 = S.plan_process([(8192, "v_fp8", "SpecDec")], None)
+    check("SpecDec 必须加载双模型", p3["load_draft"] is True
+          and p3["resident_models"] == ["target", "draft"] and p3["ar_residency"] is None, str(p3))
+    # 10.4 非法组合
+    for bad, res, why in (([(2048, "base_bf16", "AR"), (2048, "base_bf16", "SpecDec")],
+                           "target_only", "AR target_only 与 SpecDec 同进程"),
+                          ([(2048, "base_bf16", "AR")], "bogus", "非法 residency"),
+                          ([(2048, "base_bf16", "X")], "target_only", "非法 mode")):
+        try:
+            S.plan_process(bad, res)
+            check(f"拒绝：{why}", False)
+        except ValueError:
+            check(f"拒绝：{why}", True)
+    # 10.5–10.6 primary 12 与 control 6 分离
+    primary = S.build_primary_matrix([2048, 4096, 8192], ["base_bf16", "v_fp8"])
+    control = S.build_dual_controls([2048, 4096, 8192], ["base_bf16", "v_fp8"])
+    check("primary factorial 恰好 12 cells", len(primary) == 12, str(len(primary)))
+    check("primary 的 AR cells 全为 target_only",
+          all(S.resolve_condition_role(m, S.PRIMARY_AR_RESIDENCY if m == "AR" else None)
+              ["ar_residency"] in (S.PRIMARY_AR_RESIDENCY, None) for _, _, m in primary))
+    check("dual control 恰好 6 cells", len(control) == 6, str(len(control)))
+    check("dual control 不计入 primary 12",
+          len(primary) == 12 and not set(control) & {(c, kv, m) for c, kv, m in primary
+                                                     if m == "AR"}
+          if False else len(primary) == 12 and len(control) == 6)
+    # 10.7–10.9 speedup / penalty 方向
+    ar_ok = dict(mode="AR", ar_residency="target_only", context_actual=8192,
+                 target_kv="base_bf16", decode_seconds=2.79, total_seconds=10.10,
+                 speedup_denominator_eligible=True, speedup_claim_allowed=True, status="OK")
+    sp_ok = dict(mode="SpecDec", ar_residency=None, context_actual=8192,
+                 target_kv="base_bf16", decode_seconds=10.69, total_seconds=41.75,
+                 speedup_denominator_eligible=False, speedup_claim_allowed=True, status="OK")
+    su = S.compute_speedup(ar_ok, sp_ok)
+    check("speedup = T_AR/T_Spec（<1 表示 SpecDec 更慢）",
+          abs(su["speedup_decode"] - 2.79 / 10.69) < 1e-9 and su["speedup_decode"] < 1, str(su))
+    ar_dual = dict(ar_ok, ar_residency="dual_control", speedup_denominator_eligible=False)
+    try:
+        S.compute_speedup(ar_dual, sp_ok)
+        check("dual control 不得作为 speedup 分母", False)
+    except ValueError:
+        check("dual control 不得作为 speedup 分母", True)
+    pen = S.residency_penalty(ar_ok, dict(ar_dual, decode_seconds=4.0, total_seconds=14.0))
+    check("residency_penalty 方向：dual 更慢 -> penalty<1 且 slowdown>1",
+          abs(pen["penalty_decode"] - 0.6975) < 1e-3 and abs(pen["slowdown_decode"] - 1.4337) < 1e-2,
+          str({k: round(v, 3) for k, v in pen.items() if isinstance(v, float)}))
+    # 10.10 旧数据 residency：AR 未知 -> null（不猜）；SpecDec 可确定 -> 填双驻留
+    legacy_sp = S.build_g5_row(legacy_summary_row())
+    check("旧 SpecDec 行：ar_residency=null（不适用）+ 驻留可确定为 dual",
+          legacy_sp["ar_residency"] is None
+          and legacy_sp["resident_models"] == ["target", "draft"]
+          and legacy_sp["condition_role"] == "primary"
+          and legacy_sp["speedup_denominator_eligible"] is False, str(legacy_sp["resident_models"]))
+    legacy_ar = S.build_g5_row(legacy_summary_row(mode="AR"))
+    check("旧 AR 行：residency 未知 -> 五字段全 null + available=false（不猜）",
+          legacy_ar["ar_residency"] is None and legacy_ar["resident_models"] is None
+          and legacy_ar["condition_role"] is None
+          and legacy_ar["formal_factorial_member"] is None
+          and legacy_ar["speedup_denominator_eligible"] is None
+          and legacy_ar["availability"]["ar_residency"] is False, str(legacy_ar["ar_residency"]))
+    # 10.11 schema 拒绝矛盾组合
+    meta_ar = dict(run_id="t", block_index=0, condition_index=0, seed=1,
+                   condition_order=["x"], timestamp_utc="2026-09-21T00:00:00Z",
+                   mode="AR", ar_residency="target_only")
+    good = S.build_g5_row(legacy_summary_row(), meta_ar)
+    check("AR target_only 正例通过校验", S.validate_row(good) == [], str(S.validate_row(good)[:2]))
+    bad_rows = [
+        ("AR target_only 却声明 resident_models 含 draft",
+         dict(good, resident_models=["target", "draft"])),
+        ("dual control 却标 formal_factorial_member=true",
+         dict(S.build_g5_row(legacy_summary_row(), dict(meta_ar, ar_residency="dual_control")),
+              formal_factorial_member=True)),
+        ("dual control 却标 speedup_denominator_eligible=true",
+         dict(S.build_g5_row(legacy_summary_row(), dict(meta_ar, ar_residency="dual_control")),
+              speedup_denominator_eligible=True)),
+        ("SpecDec 却带非空 ar_residency",
+         dict(S.build_g5_row(legacy_summary_row(), dict(meta_ar, mode="SpecDec",
+                                                        ar_residency=None)),
+              ar_residency="target_only")),
+        ("status=CHECK 却标 speedup_claim_allowed=true", dict(good, status="CHECK",
+                                                             speedup_claim_allowed=True)),
+    ]
+    for why, r in bad_rows:
+        errs = S.validate_row(S.finalize_row(r))
+        check(f"拒绝：{why}", bool(errs), str(errs[:1]))
+    # 10.12 不稳定 cell 仍可报告，但不得作确定加速声明
+    sp_unstable = dict(sp_ok, speedup_claim_allowed=False, status="CHECK")
+    su2 = S.compute_speedup(ar_ok, sp_unstable)
+    check("不稳定 cell：数字仍产出（cell 不从报告消失）",
+          su2["speedup_decode"] is not None and abs(su2["speedup_decode"] - 2.79 / 10.69) < 1e-9)
+    check("不稳定 cell：禁止确定加速声明", su2["speedup_claim_allowed"] is False)
+
     print(f"\nG5 schema 自测：PASS {len(PASS)} / FAIL {len(FAIL)}")
     if FAIL:
         print("失败项：" + ", ".join(FAIL))

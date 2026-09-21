@@ -542,6 +542,59 @@ Gate 总表、硬规则 10 条、代码与工具清单、**数据清单 + 受保
 "已确立事实 / 推断 / 未运行"三分类、开放阻塞项与最小解法、环境与 shell 陷阱、
 以及下一步推荐动作与禁止动作。**本文档不引入新数据，只是既有台账的索引与解释。**
 
+### 4.10 AR 基线口径修正（2026-09-21，v1.1）—— target-only 正式主基线 + dual-resident 诊断控制
+**问题**：G5 协议原先规定"AR 条件也保持 target+draft 双模型常驻"。它适合控制显存状态，
+但**不应作为唯一正式 AR 基线**：真实 AR 不需要 draft，强制双驻留会额外占显存，在 8K×8GB 下
+可能推高显存压力、触发 WDDM 换页或改变分配器状态，从而**人为压低 AR、系统性偏向 SpecDec**。
+
+**决策（已实现）**
+| 口径 | 驻留 | 角色 | factorial | speedup 分母 |
+|---|---|---|---|---|
+| `AR-primary` | **仅 target**（draft 从不加载） | primary | ✅（12 之一） | ✅ |
+| `AR-dual-resident-control` | target+draft（draft 仅常驻、不参与计算） | diagnostic_control | ❌ | ❌ |
+| `SpecDec` | target+draft（算法必需） | primary | ✅ | ❌ |
+
+- 正式 factorial 仍是 **12 cells**；额外 **6 cells** 为诊断控制，`P5_INCLUDE_DUAL_AR_CONTROL=1` 启用，
+  汇总**单独分组**，**不得写成 18 条件 factorial**；
+- `speedup = T_AR / T_Spec`（>1 = SpecDec 更快）；`residency_penalty = T_AR(target-only)/T_AR(dual)`，
+  `penalty < 1`（`slowdown = 1/penalty > 1`）⇒ 双驻留本身拖慢 AR；
+- **硬约束**：`AR + target_only` 要求进程**从未加载 draft** ⇒ 不得与 SpecDec 条件同进程
+  （`results_schema.plan_process()` 强制，违反报错）。
+
+**新增 schema 字段（`g5-results-1.1`，不兼容变更 → 版本升级）**：`resident_models` /
+`ar_residency` / `condition_role` / `formal_factorial_member` / `speedup_denominator_eligible` /
+`speedup_claim_allowed`；矛盾组合被 `validate_row` 拒绝（如 `AR target_only` 却声明含 draft、
+`dual_control` 却标 `formal_factorial_member=true`、`SpecDec` 带非空 `ar_residency`、
+`status=CHECK` 却允许加速声明）。
+**旧数据**：`ar_residency` 等未知字段一律 `null` + `availability=false`（**不猜**）；
+SpecDec 行因算法必需双模型 ⇒ 驻留可确定并填入；AR 行未知 ⇒ 全 null。
+
+**历史数据措辞更正**：`output/part4/*` 的 AR 行是双驻留口径 ⇒ 记为
+**`AR-dual-resident exploratory`**：**VALID EXPLORATORY DATA / INELIGIBLE FOR FORMAL SPEEDUP TABLE**
+（它能证明显存饱和与顺序敏感，只是不符合正式主基线口径）。**不删除、不覆盖、不重写。**
+同理 `output/cost_8192.txt`（本轮中止的半截 profiling）是按旧口径跑的，**作废但保留**。
+
+**不稳定 cell 报告规则（v1.1 修正）**：原始数据永远保留 → 仍出现在**完整结果表**中 →
+必须报 median/min/max/MAD/IQR 与 between-block 差异 → 标 `status=CHECK`、
+`speedup_claim_allowed=false` → **不允许**从该 cell 做确定加速声明 → 可从稳定汇总/显著性结论中
+排除（注明理由）→ **不得从报告中消失**。这样保持 12-cell factorial 完整，避免选择性报告。
+
+**CPU 验证（已运行）**：`python -m specdec.engine.g5_schema_selftest_cpu` → **PASS 66 / FAIL 0**
+（新增 23 项：驻留决策 3 项、非法组合拒绝 3 项、primary 12/control 6 分离 4 项、
+speedup/penalty 方向 3 项、旧数据 null 语义 2 项、schema 矛盾拒绝 5 项、不稳定 cell 可报告但禁止声明 2 项、
+以及"meta 覆盖 mode 后角色必须重算"这一被自测抓到的真 bug 的回归）。
+`g4_part4_selftest_cpu` 仍 **62/62 PASS**（回归未破）。
+
+**口径冒烟（已运行，非性能数据）**：`P4_MODE=AR P4_KV=base_bf16 P4_CTX=2048 P4_REPS=1 P4_WARM=0
+P4_AR_RESIDENCY=target_only` → exit 0；日志出现 `[stage] draft 不加载（AR target_only 正式主基线口径）`、
+`[mem] 驻留模型=['target'] alloc=2.88 GiB`；行内字段 `ar_residency=target_only`、
+`resident_models=['target']`、`condition_role=primary`、`formal_factorial_member=true`、
+`speedup_denominator_eligible=true`、`weights_resident_GiB=2.876`（对比双驻留基线 3.81 GiB
+⇒ **draft 确实未加载**）。产物 `output/part4/part4_a34b1db83273_g5v11_ar_targetonly_smoke.jsonl`。
+**注意**：该冒烟是 REPS=1/WARM=0，`peak_alloc`/`decode_tok_s` **不得**用于 residency 性能对比
+（那需要 stability probe 的 warm-up + reps 数据）。
+反向守卫亦已实测：无过滤（AR+SpecDec 同进程 + target_only）**立即报错退出、不加载任何模型**。
+
 ## 5. 复现设置（每次记录必须带上）
 - seed=42（测试）；性能脚本 seed=0，3 reps 取最优 + warmup；
 - prompt 固定（bench_basic.PROMPT，38 tok）；decode 数 64；

@@ -21,11 +21,57 @@
   `condition_index` / `condition_order`；
 - 缺字段一律 `null` + `availability[field]=false`；**遥测字段绝不用 0 或字符串冒充**（schema 校验强制）。
 
-## 3. 每条件独立进程
+## 3. 每条件独立进程 + **AR 基线口径（v1.1 修正）**
 
-- 一个条件 = 一个全新 Python 子进程（`g5_driver.spawn_condition`）；父进程只编排；
-- **AR 条件同样保持 target+draft 双模型常驻**，显存驻留条件与 SpecDec 一致；
-- 模型加载 / tokenizer / 文件写入**不进** prefill/decode 计时（它们在子进程的计时区间之外）。
+### 3.1 三种资源口径（不得混用）
+
+| 口径 | 驻留模型 | 角色 | 是否入 3×2×2 factorial | 能否当 speedup 分母 |
+|---|---|---|---|---|
+| **`AR-primary`**（正式主基线） | **仅 target** | primary | ✅ | ✅ |
+| `AR-dual-resident-control`（诊断控制） | target + draft（draft 仅常驻，**不参与** AR 的 prefill/decode） | diagnostic_control | ❌ | ❌ |
+| `SpecDec` | target + draft（算法自身必需） | primary | ✅ | ❌ |
+
+正式 factorial 仍是 **12 cells**：`ctx{2K,4K,8K} × KV{base_bf16,v_fp8} × mode{AR-primary, SpecDec}`。
+额外的 **6 cells**（`ctx × KV × AR-dual-resident-control`）是**诊断控制，不计入 factorial**，
+启用方式 `P5_INCLUDE_DUAL_AR_CONTROL=1`；汇总中必须单独分组，**不得写成"18 条件 factorial"**。
+
+**speedup 方向统一**：`speedup = T_AR / T_Spec`（>1 = SpecDec 更快，<1 = 更慢），
+且只能同 context、同 KV、分子为 SpecDec、分母为 **AR-primary**。
+**residency penalty**：`penalty = T_AR(target-only) / T_AR(dual)`；`penalty < 1`（等价
+`slowdown = T_dual/T_target > 1`）⇒ **双驻留本身**就拖慢了 AR。
+
+### 3.2 为什么正式 AR 是 target-only
+
+- 真实 AR 推理**不需要 draft**：`AR total = target prefill + target decode`；
+- 每种方法应承担**自身真实所需资源**；让 AR 背上它根本不用的 draft，会把"资源需求差异"
+  错误地记成"方法速度差异"；
+- 尤其在 8K×8GB 上，额外驻留会推高显存占用、触发 WDDM 换页或改变分配器状态，
+  **人为压低 AR**，从而系统性地偏向 SpecDec —— 这会让 RQ1/RQ2 的结论失去意义。
+
+"相同硬件条件"≠"强制相同模型驻留"：可比的**硬件与计时边界**应相同（同 GPU、同 dtype、
+同 KV 格式、同 prompt、同引擎原语、同 CUDA 同步边界），但**资源必须各自真实**。
+
+### 3.3 为什么仍保留 dual-resident 控制组
+
+它的用途是**隔离**：回答"draft 仅常驻、不参与任何计算时，AR 是否已经变慢"，
+从而把"额外模型驻留/显存压力"从 AR 的性能里分离出来，并解释 8K 的 WDDM/显存饱和效应。
+它**不进入**正式 factorial，也**不作为**正式 speedup 分母。
+
+### 3.4 历史 Part 4 双模型常驻 AR 数据
+
+历史 `output/part4/*` 的 AR 行是在**双模型常驻**下测的 ⇒ 记为
+**`AR-dual-resident exploratory`**：**VALID EXPLORATORY DATA /
+INELIGIBLE FOR FORMAL SPEEDUP TABLE**（它可以证明显存饱和与顺序敏感，只是不符合正式主基线口径）。
+**不删除、不覆盖、不重写**；其 `ar_residency` 在 G5 schema 中写 `null`（不猜）。
+
+### 3.5 进程隔离（硬约束）
+
+- 一个条件 = 一个全新子进程；父进程只编排；模型加载/tokenizer **不进** prefill/decode 计时；
+- **`AR + target_only` 要求该进程从未加载 draft** ⇒ 不能与 SpecDec 条件同进程
+  （`results_schema.plan_process()` 强制；违反直接报错）；
+- 每 block 条件顺序由固定 seed 随机化（seed 记档可重放），至少 2 个独立 block；
+- 每条件 warm-up 1 次 + measured reps 5；条件间 cooldown 不进计时；
+- 每个 block 开始前记录系统状态。
 
 理由：8 GB 卡上 8K 双模型时分配器池会越过物理显存，池状态可改变同一格耗时（实测 6.44s ↔ 10.87s）；
 只有每格从干净进程状态开始，格与格之间才可比。
@@ -58,12 +104,18 @@
 `peak_reserved > 8 GiB` **不得**解释为"使用了超过 8 GB 显存"。8K 双模型实测
 `used ≈ 7811–7887 / 8188 MiB`、`cuda_free ≈ 0.00 GiB` ⇒ 该运行点按**显存饱和**标注。
 
-## 7. 稳定性判据与预登记处理
+## 7. 稳定性判据与预登记处理（v1.1 修正）
 
 - 报 `median / min / max / MAD / IQR` + within-run rep spread + between-block（顺序）差异；
 - `20%` 只作**"需要调查"的诊断线**，**不是**研究协议规定的性能 PASS 门槛；
-- 预登记处理：`between-block 相对差 > 20%` ⇒ 该条件 `status=CHECK`，
-  **不得进入正式主表**；数据保留、不删除、不重跑挑选。
+- **不稳定 cell 的完整处理规则**（预先规定，避免选择性报告）：
+  1. **原始数据永远保留**（不删除、不重跑挑选、不覆盖）；
+  2. 该 cell **仍出现在完整结果表中**（12-cell factorial 必须完整展示）；
+  3. 必须报告 `median / min / max / MAD / IQR` 与 between-block 差异；
+  4. 标记 `status=CHECK`、`speedup_claim_allowed=false`；
+  5. **不允许**从该 cell 做确定的加速声明；
+  6. 可从**稳定 speedup 汇总 / 显著性结论**中排除（并注明排除理由）；
+  7. **不得**让该 cell 从报告中消失（也不得用"剔除后平均"冒充整体结论）。
 
 ## 8. 正确性口径
 
@@ -93,8 +145,8 @@
 
 ## 11. 进入正式 Pilot 的最低条件
 
-1. 所有运行可审计且不覆盖旧数据 —— ✅（schema + run_id + 拒绝覆盖，43 项 CPU 自测）
-2. AR/SpecDec 驻留与计时边界一致 —— ✅（协议 §3/§5 写死）
+1. 所有运行可审计且不覆盖旧数据 —— ✅（schema + run_id + 拒绝覆盖，66 项 CPU 自测）
+2. AR/SpecDec 驻留与计时边界一致 —— ✅（§3：AR-primary = target-only；边界写死）
 3. 跨顺序差异已量化 —— ⬜ **需跑 stability probe**（工具已就绪）
 4. 8K 显存饱和被明确标注 —— ✅（§6 + 探针自动判定）
 5. 性能不稳定时有预先规定的处理 —— ✅（§7）
@@ -104,8 +156,13 @@
 ## 12. 命令清单
 
 ```powershell
-python -m specdec.engine.g5_schema_selftest_cpu     # CPU：schema/驱动自测（43 项）
-python -m specdec.engine.g5_stability_probe         # GPU：12 条件 × 2 随机 block（Task B）
-python -m specdec.engine.g5_cost_breakdown          # GPU：阶段成本分解（Task C，profiling）
-python -m specdec.engine.g5_k_sweep                 # GPU：k 扫描（Task D，诊断）
+python -m specdec.engine.g5_schema_selftest_cpu     # CPU：schema/驱动自测（66 项）
+python -m specdec.engine.g5_stability_probe         # GPU：12 primary（+ 可选 6 control）× 2 随机 block
+set P5_INCLUDE_DUAL_AR_CONTROL=1                    # 可选：加上 6 个 dual-resident 诊断控制
+python -m specdec.engine.g5_cost_breakdown          # GPU：阶段归因（AR 用 target-only；dual 可选）
+python -m specdec.engine.g5_k_sweep                 # GPU：k 扫描（AR 分母 = target-only，每 ctx 只测一次）
 ```
+
+> AR-primary 单独测法（诊断/对照，非必须）：
+> `set P4_MODE=AR` + `set P4_AR_RESIDENCY=target_only` → `python -m specdec.engine.g4_part4_pilot_measure`
+> （进程只加载 target；若同时要求 SpecDec 条件，必须改为逐条件独立进程。）
