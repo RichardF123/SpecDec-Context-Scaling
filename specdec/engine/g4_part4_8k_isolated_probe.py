@@ -297,8 +297,37 @@ def report_verdict(stats, order):
           f"看上表 base_bf16 行，>1 才可称复现")
 
 
+def report_accepted_histogram(runs):
+    """接受长度直方图（每轮 m 的分布，跨 rep 汇总）。m 可取值 0..K。"""
+    K = spec_dec_K()
+    print("\n== [1b] 接受长度分布（SpecDec，跨 rep 汇总 m 直方图）==")
+    any_rows = False
+    for (order, kv, mode), rs in sorted(by_condition(runs).items(),
+                                        key=lambda x: (x[0][0], x[0][1], x[0][2])):
+        if mode != "SpecDec":
+            continue
+        hist = [m for r in rs for m in (r.get("m_hist") or [])]
+        if not hist:
+            print(f"  order={order} {kv:<10} m_hist 缺失 -> available=false")
+            continue
+        any_rows = True
+        cnt = {i: hist.count(i) for i in range(K + 1)}
+        rounds = len(hist)
+        print(f"  order={order} {kv:<10} m=0..{K}: "
+              + " ".join(f"{i}:{cnt[i]}" for i in range(K + 1))
+              + f"   总轮数={rounds}（{len(rs)} rep × {rounds // max(len(rs), 1)}）"
+              + f"  sum(m)={sum(hist)}  全接受轮占比={100.0 * cnt[K] / max(rounds, 1):.1f}%")
+    if not any_rows:
+        print("  available=false（本 run 无 SpecDec 行）")
+
+
+def spec_dec_K() -> int:
+    return M.K
+
+
 def full_report(runs, sums) -> None:
     stats = report_within_process(runs)
+    report_accepted_histogram(runs)
     order = report_between_order(stats)
     report_token_comparison(runs)
     report_ar_aggregation(runs)

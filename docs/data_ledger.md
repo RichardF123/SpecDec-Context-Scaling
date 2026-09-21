@@ -446,6 +446,23 @@ EOS（候选/替换/尾块）与预算<K 边界全部通过。
 - 待用户在 GPU 上重跑 `python -m specdec.engine.g4_part4_mismatch_diag`（新分类器），
   若三个条件均给出 `BF16_NEAR_TIE` 且 `off_by_one=False`，则 Part 4 正确性可闭环。
 
+#### 4.7.6 B6-fp32 端到端复跑（2026-09-21，CPU，**现行代码未改**）
+命令 `python -m specdec.engine.g4_b6_fp32_correctness` → **PASS（tiers=2/2, cases=10/10, k=4,
+exact token-id；总 accepted/proposed = 216/348）**，与 2026-09-15 首次结果**逐 case 完全相同**
+（含 `natural-1 11/21`、`natural-2 16/16`、`math 9/31`、`len2 2/2`、`eos-prone 16/16`；
+`determinism[natural-1]=determinism[long]=True`；`logits finite=True`）。
+**意义**：这排除了"离散索引/接线错误"——错位一格属逻辑错误，**不会在高精度下消失**；
+而 10 类 prompt × 2 KV 档、数百次验证决策在 fp32 下与 AR 逐 token 完全相同。
+（首次后台尝试与语义验证并发运行，因两个 1.5B fp32 副本的瞬时内存峰值触发原生访问冲突
+`exit=0xC0000005`；**单独重跑即通过**——记一条操作教训：不要并行跑两个重内存任务。）
+
+#### 4.7.7 数据自洽性核查（为何"60 轮"与"100 轮"并存）
+§4.6.2 表中的直方图 `m=0:3 1:12 2:12 3:0 4:33`（60 轮）来自 **run 2**（`REPS=3` ⇒ 3×20=60 轮）；
+隔离探针为 `REPS=5` ⇒ 100 轮。二者**来自不同 run，均正确**（先前一度误以为是同一 run 的内部矛盾）。
+隔离探针（5 rep）恢复直方图段后的实测（四格**完全一致**，跨 KV 档与跨启动顺序皆同）：
+`m=0:5  1:20  2:20  3:0  4:55`，总轮数 100，`sum(m)=280`（每 rep 56），全接受轮占比 **55.0%**。
+⇒ **决策层（接受/轮数/直方图）完全可复现**，只有**计时**不稳定（§4.6.5 的 28.9%）。
+
 ## 5. 复现设置（每次记录必须带上）
 - seed=42（测试）；性能脚本 seed=0，3 reps 取最优 + warmup；
 - prompt 固定（bench_basic.PROMPT，38 tok）；decode 数 64；
