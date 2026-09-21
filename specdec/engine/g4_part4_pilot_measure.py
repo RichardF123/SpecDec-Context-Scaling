@@ -48,6 +48,7 @@ REPS = int(os.environ.get("P4_REPS", "3"))
 MAXNEW = int(os.environ.get("P4_MAXNEW", "64"))
 WARM = int(os.environ.get("P4_WARM", "1"))
 CHUNK = int(os.environ.get("P4_CHUNK", "2048"))
+REVERSE = os.environ.get("P4_REVERSE", "") not in ("", "0", "false", "False")
 OUTDIR = ROOT / "output" / "part4"
 
 
@@ -149,7 +150,11 @@ def mem_read():
 
 
 def run_once(tgt, drf, ids, eos, kv, mode):
-    torch.cuda.empty_cache()
+    # 注意：**不在计时区内调用 empty_cache()**。它会把手里的缓存块全部还给驱动，使每个 rep
+    # 都从零重建显存池；而 KV cache 每步 torch.cat 都要申请新块（8K 档每步 ~4 MiB × 28 层 ×
+    # 2~3 个张量），从零池开始会把成千上万次 cudaMalloc/WDDM 映射算进 decode 时间 ——
+    # 这会系统性地惩罚"第一个跑到该 ctx 的条件"。稳态复用才是真实服务循环的行为。
+    # 仅 OOM 时清理（见 main）。
     torch.cuda.reset_peak_memory_stats()
     base_alloc = torch.cuda.memory_allocated() / 2**30
     trace = []
@@ -186,7 +191,7 @@ def summarize(runs: list[dict]) -> dict:
     keys_num = ["t_prefill_s", "t_decode_s", "t_total_s", "decode_tok_s", "e2e_tok_s",
                 "peak_alloc_GiB", "peak_resv_GiB", "accept_rate", "rounds",
                 "proposed", "accepted", "target_block_calls", "draft_calls",
-                "target_decode_calls"]
+                "target_decode_calls", "mismatch_rounds", "all_accept_rounds"]
     s = {k: v for k, v in runs[0].items() if k not in keys_num + ["gen", "m_hist"]}
     for k in keys_num:
         vals = [r[k] for r in runs if isinstance(r.get(k), (int, float))]
@@ -233,12 +238,16 @@ def main() -> int:
     cfg = dict(ctx=CTX, reps=REPS, max_new=MAXNEW, k=K, chunk=CHUNK,
                target=TARGET, draft=DRAFT, text=src, torch=torch.__version__,
                gpu=torch.cuda.get_device_name(0), warm=WARM,
+               kv_order="reversed" if REVERSE else "base-first",
                prompt_encoding="tokenizer default, no chat template, raw text prefix",
                nested_prefix=True, filler="none (real wikitext text)")
     chash = hashlib.sha256(json.dumps(cfg, sort_keys=True).encode()).hexdigest()[:12]
     jsonl = OUTDIR / f"part4_{chash}.jsonl"
 
-    conditions = [(ctx, kv, mode) for ctx in CTX for kv in ("base_bf16", "v_fp8")
+    KVS = ("v_fp8", "base_bf16") if REVERSE else ("base_bf16", "v_fp8")
+    if REVERSE:
+        print("[cfg] P4_REVERSE=1 -> 每个 ctx 内先 v_fp8 后 base_bf16（顺序对照）", flush=True)
+    conditions = [(ctx, kv, mode) for ctx in CTX for kv in KVS
                   for mode in ("AR", "SpecDec")]
     summary: dict[tuple, dict] = {}
     ref_gen: dict[tuple, list] = {}
@@ -280,14 +289,17 @@ def main() -> int:
             summary[(ctx, kv, mode)] = s
             if mode == "AR":
                 ref_gen[(ctx, kv)] = runs[0]["gen"]
-                print(f"  [{tag}] pref={s['t_prefill_s_med']:.2f}s dec={s['t_decode_s_med']:.2f}s "
-                      f"dec_tok/s={s['decode_tok_s_med']:.2f} peak_alloc={s['peak_alloc_GiB_med']:.2f}",
-                      flush=True)
+                print(f"  [{tag}] pref={s['t_prefill_s_med']:.2f}s "
+                      f"dec={s['t_decode_s_med']:.2f}s[{s['t_decode_s_min']:.2f}.."
+                      f"{s['t_decode_s_max']:.2f}] dec_tok/s={s['decode_tok_s_med']:.2f} "
+                      f"peak_alloc={s['peak_alloc_GiB_med']:.2f}", flush=True)
             else:
                 eq = ref_gen.get((ctx, kv)) == runs[0]["gen"]
                 s["token_equal_vs_AR"] = eq
-                print(f"  [{tag}] pref={s['t_prefill_s_med']:.2f}s dec={s['t_decode_s_med']:.2f}s "
-                      f"dec_tok/s={s['decode_tok_s_med']:.2f} accept={s['accept_rate_med']:.3f} "
+                print(f"  [{tag}] pref={s['t_prefill_s_med']:.2f}s "
+                      f"dec={s['t_decode_s_med']:.2f}s[{s['t_decode_s_min']:.2f}.."
+                      f"{s['t_decode_s_max']:.2f}] dec_tok/s={s['decode_tok_s_med']:.2f} "
+                      f"accept={s['accept_rate_med']:.3f} "
                       f"rounds={s['rounds_med']:.0f} block={s['target_block_calls_med']:.0f} "
                       f"draft={s['draft_calls_med']:.0f} peak_alloc={s['peak_alloc_GiB_med']:.2f} "
                       f"==AR:{eq}", flush=True)
@@ -295,11 +307,12 @@ def main() -> int:
                                 ensure_ascii=False) + "\n")
 
     # ---- 汇总表 ----
-    print("\n== 汇总（中位数）==")
-    print("ctx    kv         mode     dec_tok/s  e2e_tok/s  pref_s  dec_s  accept  rounds  "
-          "block  draft  peak_alloc  peak_resv  ==AR")
+    print("\n== 汇总（中位数；dec_spread = max-min，>20% 即视为可疑需查）==")
+    print("ctx    kv         mode     dec_tok/s  e2e_tok/s  pref_s  dec_s  spread  accept  "
+          "rounds  block  draft  peak_alloc  peak_resv*  ==AR")
+    print("  * peak_resv 是分配器池（含空闲块），不是物理占用；peak_alloc 才是实际用量")
     for ctx in CTX:
-        for kv in ("base_bf16", "v_fp8"):
+        for kv in KVS:
             for mode in ("AR", "SpecDec"):
                 s = summary.get((ctx, kv, mode))
                 if not s or s.get("oom"):
@@ -308,9 +321,11 @@ def main() -> int:
                 ac = s.get("accept_rate_med", float("nan"))
                 print(f"{ctx:<6} {kv:<10} {mode:<8} {s['decode_tok_s_med']:>9.2f}  "
                       f"{s['e2e_tok_s_med']:>9.2f}  {s['t_prefill_s_med']:>6.2f} "
-                      f"{s['t_decode_s_med']:>6.2f}  {ac:>6.3f}  {s['rounds_med']:>6.0f} "
+                      f"{s['t_decode_s_med']:>6.2f}  "
+                      f"{s['t_decode_s_max']-s['t_decode_s_min']:>6.2f}  {ac:>6.3f}  "
+                      f"{s['rounds_med']:>6.0f} "
                       f"{s['target_block_calls_med']:>6.0f} {s['draft_calls_med']:>6.0f}  "
-                      f"{s['peak_alloc_GiB_med']:>9.2f}  {s['peak_resv_GiB_med']:>8.2f}  "
+                      f"{s['peak_alloc_GiB_med']:>9.2f}  {s['peak_resv_GiB_med']:>9.2f}  "
                       f"{s.get('token_equal_vs_AR', '-')}")
 
     print("\n== 同档比值（SpecDec / AR，中位数之比；**未做显著性检验、未控温漂**，仅作数量级参考）==")
