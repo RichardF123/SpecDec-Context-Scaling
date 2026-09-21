@@ -23,6 +23,7 @@
 """
 from __future__ import annotations
 
+import argparse
 import gc
 import hashlib
 import json
@@ -49,6 +50,19 @@ MAXNEW = int(os.environ.get("P4_MAXNEW", "64"))
 WARM = int(os.environ.get("P4_WARM", "1"))
 CHUNK = int(os.environ.get("P4_CHUNK", "2048"))
 REVERSE = os.environ.get("P4_REVERSE", "") not in ("", "0", "false", "False")
+ONLY = os.environ.get("P4_ONLY", "").strip()      # "ctx,kv,mode"：只跑一个条件（每条件独立进程）
+
+
+def parse_only() -> tuple[int, str, str] | None:
+    if not ONLY:
+        return None
+    parts = [x.strip() for x in ONLY.split(",")]
+    if len(parts) != 3:
+        raise SystemExit(f'P4_ONLY 需形如 "8192,v_fp8,AR"，收到 {ONLY!r}')
+    ctx, kv, mode = int(parts[0]), parts[1], parts[2]
+    if kv not in ("base_bf16", "v_fp8") or mode not in ("AR", "SpecDec"):
+        raise SystemExit(f"P4_ONLY kv/mode 非法: {kv}/{mode}")
+    return ctx, kv, mode
 OUTDIR = ROOT / "output" / "part4"
 
 
@@ -207,7 +221,105 @@ def summarize(runs: list[dict]) -> dict:
     return s
 
 
+def print_report(summary: dict, ctxs, kvs) -> None:
+    """打印四张表。可从内存 summary 调用，也可从 JSONL 重建后调用（--aggregate）。"""
+    print("\n== 汇总（中位数；dec_spread = max-min，>20% 即视为可疑需查）==")
+    print("ctx    kv         mode     dec_tok/s  e2e_tok/s  pref_s  dec_s  spread  accept  "
+          "rounds  block  draft  peak_alloc  peak_resv*  ==AR")
+    print("  * peak_resv 是分配器池（含空闲块），不是物理占用；peak_alloc 才是实际用量")
+    for ctx in ctxs:
+        for kv in kvs:
+            for mode in ("AR", "SpecDec"):
+                s = summary.get((ctx, kv, mode))
+                if not s or s.get("oom"):
+                    print(f"{ctx:<6} {kv:<10} {mode:<8} OOM/未测")
+                    continue
+                ac = s.get("accept_rate_med", float("nan"))
+                print(f"{ctx:<6} {kv:<10} {mode:<8} {s['decode_tok_s_med']:>9.2f}  "
+                      f"{s['e2e_tok_s_med']:>9.2f}  {s['t_prefill_s_med']:>6.2f} "
+                      f"{s['t_decode_s_med']:>6.2f}  "
+                      f"{s['t_decode_s_max']-s['t_decode_s_min']:>6.2f}  {ac:>6.3f}  "
+                      f"{s['rounds_med']:>6.0f} "
+                      f"{s['target_block_calls_med']:>6.0f} {s['draft_calls_med']:>6.0f}  "
+                      f"{s['peak_alloc_GiB_med']:>9.2f}  {s['peak_resv_GiB_med']:>9.2f}  "
+                      f"{s.get('token_equal_vs_AR', '-')}")
+
+    print("\n== 同档比值（SpecDec / AR，中位数之比；**未做显著性检验、未控温漂**，仅作数量级参考）==")
+    for ctx in ctxs:
+        for kv in kvs:
+            a, s = summary.get((ctx, kv, "AR")), summary.get((ctx, kv, "SpecDec"))
+            if not a or not s or a.get("oom") or s.get("oom"):
+                continue
+            r_dec = s["decode_tok_s_med"] / a["decode_tok_s_med"]
+            r_e2e = s["e2e_tok_s_med"] / a["e2e_tok_s_med"]
+            print(f"  ctx={ctx:<5} kv={kv:<10} decode×{r_dec:.3f}  e2e×{r_e2e:.3f}  "
+                  f"accept={s['accept_rate_med']:.3f}  AR前向={a['target_decode_calls_med']:.0f} "
+                  f"Spec块+单步={s['target_block_calls_med']:.0f}+{s['mismatch_rounds_med']:.0f}")
+
+    print("\n== 每轮接受长度分布（SpecDec，跨所有 rep 汇总 m 直方图）==")
+    for ctx in ctxs:
+        for kv in kvs:
+            s = summary.get((ctx, kv, "SpecDec"))
+            if not s or s.get("oom"):
+                continue
+            hist = s.get("m_hist", [])
+            cnt = {i: hist.count(i) for i in range(K + 1)}
+            print(f"  ctx={ctx:<5} kv={kv:<10} m=0..{K}: "
+                  + " ".join(f"{i}:{cnt[i]}" for i in range(K + 1))
+                  + f"   (总轮数 {len(hist)})")
+
+    measured = [s for s in summary.values() if not s.get("oom")]
+    full = len(ctxs) * len(kvs) * 2
+    per_family = sum(s["t_total_s_med"] for s in measured)
+    print("\n== final 规模标定 ==")
+    print(f"  已测 {len(measured)}/{full} 个条件（ctx={list(ctxs)}）；每 family 走完这 {len(measured)} "
+          f"个条件的实测成本 = {per_family:.1f}s")
+    if len(measured) < full:
+        print("  !! **外推不完整**：缺少某些 ctx/KV/decode 条件 ⇒ 先补跑再据此定规模")
+    else:
+        for fams, reps in ((16, 5), (16, 3)):
+            tot_h = per_family * fams * reps / 3600.0
+            warm_h = per_family * fams * WARM / 3600.0
+            print(f"  ≥{fams} families × {full} conditions × {reps} reps ≈ "
+                  f"**{tot_h:.1f} GPU 小时**（不含失败重试；warm-up={WARM} 再加 ≈{warm_h:.1f}h）")
+    print(f"  ※ 本次实测墙钟（含 warm-up）≈ "
+          f"{sum(s['t_total_s_med']*(REPS+WARM) for s in measured)/60:.1f} 分钟")
+
+
+def load_summary(path: Path):
+    """从 JSONL 重建 summary（供 --aggregate 用；不需要重新加载模型）。"""
+    summary: dict = {}
+    ctxs = set()
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        r = json.loads(line)
+        if r.get("kind") != "summary":
+            continue
+        summary[(r["ctx"], r["target_kv"], r["mode"])] = r
+        ctxs.add(r["ctx"])
+    return summary, sorted(ctxs)
+
+
 def main() -> int:
+    ap = argparse.ArgumentParser(description="G4 Part 4 测量 / 报表")
+    ap.add_argument("--aggregate", nargs="?", const="", default=None,
+                    help="不跑模型，只从 output/part4 的 JSONL 重算四张表"
+                         "（可跟具体文件路径；缺省取最新一份）")
+    args = ap.parse_args()
+    if args.aggregate is not None:
+        if args.aggregate:
+            path = Path(args.aggregate)
+        else:
+            cand = sorted(OUTDIR.glob("part4_*.jsonl"), key=lambda p: p.stat().st_mtime)
+            if not cand:
+                raise SystemExit(f"{OUTDIR} 下没有 part4_*.jsonl")
+            path = cand[-1]
+        summary, ctxs = load_summary(path)
+        print(f"[aggregate] {path}  ({len(summary)} 个条件)")
+        print_report(summary, ctxs, ("base_bf16", "v_fp8"))
+        return 0
+
     torch.manual_seed(0)
     OUTDIR.mkdir(parents=True, exist_ok=True)
     text, src = load_text()
@@ -249,11 +361,18 @@ def main() -> int:
         print("[cfg] P4_REVERSE=1 -> 每个 ctx 内先 v_fp8 后 base_bf16（顺序对照）", flush=True)
     conditions = [(ctx, kv, mode) for ctx in CTX for kv in KVS
                   for mode in ("AR", "SpecDec")]
+    only = parse_only()
+    if only is not None:
+        conditions = [only]
+        print(f"[cfg] P4_ONLY={only} -> 单条件独立进程模式（每格从干净显存状态开始）",
+              flush=True)
+    append = only is not None and jsonl.exists()
     summary: dict[tuple, dict] = {}
     ref_gen: dict[tuple, list] = {}
-    with jsonl.open("w", encoding="utf-8") as fh:
-        fh.write(json.dumps(dict(kind="config", config_hash=chash, **cfg),
-                            ensure_ascii=False) + "\n")
+    with jsonl.open("a" if append else "w", encoding="utf-8") as fh:
+        if not append:
+            fh.write(json.dumps(dict(kind="config", config_hash=chash, **cfg),
+                                ensure_ascii=False) + "\n")
         for ctx, kv, mode in conditions:
             if all_ids.shape[1] < ctx:
                 print(f"[skip] ctx={ctx} 超出语料 token 数 {all_ids.shape[1]}")
@@ -306,69 +425,8 @@ def main() -> int:
             fh.write(json.dumps(dict(kind="summary", config_hash=chash, **s),
                                 ensure_ascii=False) + "\n")
 
-    # ---- 汇总表 ----
-    print("\n== 汇总（中位数；dec_spread = max-min，>20% 即视为可疑需查）==")
-    print("ctx    kv         mode     dec_tok/s  e2e_tok/s  pref_s  dec_s  spread  accept  "
-          "rounds  block  draft  peak_alloc  peak_resv*  ==AR")
-    print("  * peak_resv 是分配器池（含空闲块），不是物理占用；peak_alloc 才是实际用量")
-    for ctx in CTX:
-        for kv in KVS:
-            for mode in ("AR", "SpecDec"):
-                s = summary.get((ctx, kv, mode))
-                if not s or s.get("oom"):
-                    print(f"{ctx:<6} {kv:<10} {mode:<8} OOM/跳过")
-                    continue
-                ac = s.get("accept_rate_med", float("nan"))
-                print(f"{ctx:<6} {kv:<10} {mode:<8} {s['decode_tok_s_med']:>9.2f}  "
-                      f"{s['e2e_tok_s_med']:>9.2f}  {s['t_prefill_s_med']:>6.2f} "
-                      f"{s['t_decode_s_med']:>6.2f}  "
-                      f"{s['t_decode_s_max']-s['t_decode_s_min']:>6.2f}  {ac:>6.3f}  "
-                      f"{s['rounds_med']:>6.0f} "
-                      f"{s['target_block_calls_med']:>6.0f} {s['draft_calls_med']:>6.0f}  "
-                      f"{s['peak_alloc_GiB_med']:>9.2f}  {s['peak_resv_GiB_med']:>9.2f}  "
-                      f"{s.get('token_equal_vs_AR', '-')}")
-
-    print("\n== 同档比值（SpecDec / AR，中位数之比；**未做显著性检验、未控温漂**，仅作数量级参考）==")
-    for ctx in CTX:
-        for kv in ("base_bf16", "v_fp8"):
-            a, s = summary.get((ctx, kv, "AR")), summary.get((ctx, kv, "SpecDec"))
-            if not a or not s or a.get("oom") or s.get("oom"):
-                continue
-            r_dec = s["decode_tok_s_med"] / a["decode_tok_s_med"]
-            r_e2e = s["e2e_tok_s_med"] / a["e2e_tok_s_med"]
-            print(f"  ctx={ctx:<5} kv={kv:<10} decode×{r_dec:.3f}  e2e×{r_e2e:.3f}  "
-                  f"accept={s['accept_rate_med']:.3f}  AR前向={a['target_decode_calls_med']:.0f} "
-                  f"Spec块+单步={s['target_block_calls_med']:.0f}+{s['mismatch_rounds_med']:.0f}")
-
-    print("\n== 每轮接受长度分布（SpecDec，跨所有 rep 汇总 m 直方图）==")
-    for ctx in CTX:
-        for kv in ("base_bf16", "v_fp8"):
-            s = summary.get((ctx, kv, "SpecDec"))
-            if not s or s.get("oom"):
-                continue
-            hist = s.get("m_hist", [])
-            cnt = {i: hist.count(i) for i in range(K + 1)}
-            print(f"  ctx={ctx:<5} kv={kv:<10} m=0..{K}: "
-                  + " ".join(f"{i}:{cnt[i]}" for i in range(K + 1))
-                  + f"   (总轮数 {len(hist)})")
-
-    # ---- final 规模标定（纯外推，假设写在这里）----
-    print("\n== final 规模标定（外推，假设：每个 family 在 ctx 上的分布与本次相同）==")
-    per_family = 0.0
-    for ctx in CTX:
-        for kv in ("base_bf16", "v_fp8"):
-            for mode in ("AR", "SpecDec"):
-                s = summary.get((ctx, kv, mode))
-                if s and not s.get("oom"):
-                    per_family += s["t_total_s_med"]
-    for fams, reps in ((16, 5), (16, 3)):
-        tot_h = per_family * fams * reps / 3600.0
-        warm_h = per_family * fams * WARM / 3600.0
-        print(f"  ≥{fams} families × 12 conditions × {reps} reps ≈ "
-              f"{per_family:.1f}s/条件组 → **{tot_h:.1f} GPU 小时**"
-              f"（不含失败重试；warm-up={WARM} 再加 ≈{warm_h:.1f}h）")
-    print(f"  ※ 本次单条件组（12 条件 × {REPS} reps + warm-up）实测 ≈ "
-          f"{sum(s['t_total_s_med']*REPS for s in summary.values() if not s.get('oom'))/60:.1f} 分钟")
+    # ---- 汇总表（与 --aggregate 共用同一函数）----
+    print_report(summary, CTX, KVS)
 
     print(f"\n[out] {jsonl}")
     del tgt, drf
