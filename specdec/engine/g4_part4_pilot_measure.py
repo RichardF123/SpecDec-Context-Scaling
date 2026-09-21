@@ -291,8 +291,7 @@ def main() -> int:
                       f"rounds={s['rounds_med']:.0f} block={s['target_block_calls_med']:.0f} "
                       f"draft={s['draft_calls_med']:.0f} peak_alloc={s['peak_alloc_GiB_med']:.2f} "
                       f"==AR:{eq}", flush=True)
-            fh.write(json.dumps(dict(kind="summary", config_hash=chash,
-                                     ctx=ctx, target_kv=kv, mode=mode, **s),
+            fh.write(json.dumps(dict(kind="summary", config_hash=chash, **s),
                                 ensure_ascii=False) + "\n")
 
     # ---- 汇总表 ----
