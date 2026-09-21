@@ -283,6 +283,28 @@ def main() -> int:
           su2["speedup_decode"] is not None and abs(su2["speedup_decode"] - 2.79 / 10.69) < 1e-9)
     check("不稳定 cell：禁止确定加速声明", su2["speedup_claim_allowed"] is False)
 
+    print("\n== 11. probe 级 cell 构造（能抓到“启动即崩”类 bug）==")
+    from . import g5_stability_probe as P
+    pri, ctl_off = P.build_cells()
+    check("probe.build_cells 默认：primary=12 且 AR 全为 target_only",
+          len(pri) == 12 and all(c[3] == (S.PRIMARY_AR_RESIDENCY if c[2] == "AR" else None)
+                                 for c in pri), f"{len(pri)}")
+    check("probe.build_cells 默认：不含 dual control", len(ctl_off) == 0, str(len(ctl_off)))
+    _old = P.INCLUDE_DUAL
+    P.INCLUDE_DUAL = True
+    try:
+        pri2, ctl = P.build_cells()
+    finally:
+        P.INCLUDE_DUAL = _old
+    check("probe.build_cells 开启 dual：control=6 且 residency=dual_control",
+          len(ctl) == 6 and all(c[2] == "AR" and c[3] == S.DIAGNOSTIC_AR_RESIDENCY
+                                for c in ctl), f"{len(ctl)}")
+    check("probe.build_cells：dual 与 primary 不重叠（不计入 12）",
+          len(pri2) == 12 and not (set(ctl) & set(pri2)))
+    check("probe.cell_label 形如 ctx,kv,mode,residency",
+          P.cell_label((8192, "v_fp8", "AR", "target_only")) == "8192,v_fp8,AR,target_only"
+          and P.cell_label((8192, "v_fp8", "SpecDec", None)) == "8192,v_fp8,SpecDec,-")
+
     print(f"\nG5 schema 自测：PASS {len(PASS)} / FAIL {len(FAIL)}")
     if FAIL:
         print("失败项：" + ", ".join(FAIL))

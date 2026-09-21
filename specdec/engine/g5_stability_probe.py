@@ -64,14 +64,21 @@ def med_iqr(vals):
 
 
 def build_cells():
-    """返回 (primary_cells, control_cells)。cell = (ctx, kv, mode, ar_residency|None)。"""
+    """返回 (primary_cells, control_cells)。cell = (ctx, kv, mode, ar_residency|None)。
+
+    注意 `build_dual_controls()` 返回的是 3 元组 `(ctx, kv, "AR")`（与 primary 同形），
+    因此这里必须按 3 元组解包再加 residency —— 之前按 2 元组解包导致启动即崩。
+    """
     primary = []
     for ctx, kv, mode in S.build_primary_matrix(CTX, KVS,
                                                 [m for m in S.MODE_CHOICES if m in MODES]):
         role = S.resolve_condition_role(mode, S.PRIMARY_AR_RESIDENCY if mode == "AR" else None)
         primary.append((ctx, kv, mode, role["ar_residency"]))
-    control = [(c, kv, "AR", S.DIAGNOSTIC_AR_RESIDENCY)
-               for c, kv in S.build_dual_controls(CTX, KVS)] if INCLUDE_DUAL else []
+    control = []
+    if INCLUDE_DUAL:
+        for ctx, kv, mode in S.build_dual_controls(CTX, KVS):
+            role = S.resolve_condition_role(mode, S.DIAGNOSTIC_AR_RESIDENCY)
+            control.append((ctx, kv, mode, role["ar_residency"]))
     return primary, control
 
 
@@ -81,6 +88,11 @@ def cell_label(c) -> str:
 
 
 def main() -> int:
+    import argparse
+    ap = argparse.ArgumentParser(description="G5 稳定性探针")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="只打印条件计划与随机化顺序，不启动子进程、不写 JSONL")
+    args = ap.parse_args()
     run_id = S.default_run_id("g5stab")
     primary, control = build_cells()
     print(f"[g5stab] run_id={run_id} seed={SEED} blocks={BLOCKS} reps={REPS} warm={WARM} "
@@ -98,11 +110,24 @@ def main() -> int:
              maxnew=MAXNEW, chunk=CHUNK, seed=SEED, k=K_PROTOCOL, dual=INCLUDE_DUAL),
         sort_keys=True).encode()).hexdigest()[:12]
     out = S.g5_path(D.G5_DIR, cfg_hash, run_id)
+    all_cells = primary + control
+    if args.dry_run:
+        print(f"\n[g5stab] --dry-run：将执行 {len(primary)} primary + {len(control)} control "
+              f"= {len(all_cells)} 次条件运行 × {BLOCKS} block"
+              f"（**正式 factorial 仍为 {len(primary)} cells**；control 不计入）", flush=True)
+        print(f"[g5stab] 输出文件（dry-run 不创建）= {out}", flush=True)
+        for b in range(BLOCKS):
+            order = D.randomized_order(all_cells, SEED + b)
+            print(f"  block {b}（seed={SEED + b}）执行顺序：", flush=True)
+            for i, c in enumerate(order):
+                tag = "ctl" if c in control else "pri"
+                print(f"    {i:2d}. [{tag}] {cell_label(c)}", flush=True)
+        print("[g5stab] dry-run 结束：未启动任何子进程、未写任何文件", flush=True)
+        return 0
     if out.exists():
         raise SystemExit(f"[拒绝覆盖] {out} 已存在")
     print(f"[g5stab] g5 jsonl = {out}", flush=True)
 
-    all_cells = primary + control
     per_cell: dict = {}
     block_state = []
     for b in range(BLOCKS):
