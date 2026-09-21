@@ -400,6 +400,52 @@ top-1·top-2·margin / round·m·分支 / block-vs-serial max\|Δ\| / FP32 控�
 v_fp8 无速度优势、`base SpecDec` 跨顺序 28.9% 不稳定、运行点显存饱和）；工具链与 62 项 CPU 自测
 通过；三个历史 token 不一致条件的归因**未完成**。**不允许进入 G5 / Pilot / Final。**
 
+### 4.7 target block logits 语义验证 —— **索引错误假设被证伪**（2026-09-21）
+诊断曾对三个条件（`512/base_bf16`、`2048/base_bf16`、`2048/v_fp8`）报 `TARGET_BLOCK_LOGIT_INDEX`，
+并推测实现用 `block_logits[i]` 判 candidate `i`（错位一格）。**代码审查 + 真实模型实测 + 哨兵测试
+三方证据均不支持该假设。**
+
+#### 4.7.1 代码审查（`spec_dec.py` 第 83 行）
+```python
+g = [int(x.argmax()) for x in [saved_next] + [rows[j] for j in range(kp - 1)]]
+```
+即 `candidate 0 ← saved_next`（prefix next logits）、`candidate i≥1 ← rows[i-1] = block_logits[i-1]`、
+`rows[kp-1]` 不判候选而作为下一轮 prefix 行（本设计不产出 bonus）。**这正是规范要求的映射**，
+实现中**不存在** `block_logits[i]` 判 candidate `i`。
+
+#### 4.7.2 真实模型语义实测（`g4_block_logits_semantics`，fp32 CPU，prompt 8 tok + 4 候选）
+| 对照 | max\|Δ\| | argmax 相同 |
+|---|---|---|
+| 同位置 `rows[j]` vs `serial[j]`（j=0..3） | **5.090e-05 / 5.722e-05 / 3.910e-05 / 4.041e-05** | **全 True** |
+| 错位一格 `rows[j]` vs `serial[j-1]`（j=1..3） | **1.725e+01 / 1.408e+01 / 1.403e+01** | 全 False |
+⇒ 语义确认为 `rows[j] = p(·|P, y0..y_j)`；**真错位一格的代价是 14–17 个 logit 单位**，
+比诊断里观察到的 bf16 `block-vs-serial` 0.31 大 **约 50 倍**。
+
+#### 4.7.3 哨兵索引测试（`g4_specdec_index_tests`，CPU，**35/35 PASS**）
+判定行实测为 `[pre-1, pre, pre+1, pre+2]`（= prefix + rows[0..2]）；把同一份捕获数据按
+"buggy 映射"（`block_logits[i]`）重算得 `[6,7,8,9]` ≠ 候选 `[5,6,7,8]` ⇒ **测试有区分力**
+（错的实现会在第 0 个候选就被拒）；mismatch 出现在 i=0/1/2/3、全接受不产出 bonus、
+EOS（候选/替换/尾块）与预算<K 边界全部通过。
+
+#### 4.7.4 归因更正
+诊断中三个条件的 `block-vs-serial max|Δ| = 0.3125 / 0.3086 / 0.5078` 属 **bf16 形状噪声**
+（同位置噪声量级 0.25–0.51），而三处 **fp32 margin = 0.0454 / 0.0179 / 0.0345** 全部
+**小于现场噪声** ⇒ **正确归因 = `BF16_NEAR_TIE`（信号 ≤ 噪声，该位置在 bf16 下不可判定）**。
+诊断脚本的分类器本身有**优先级缺陷**（把"block-vs-serial argmax 不同且 Δ>0.30"排在近贴边判定之前），
+已改为：① 结构性错位检查（判定行是否更贴近**相邻位置**而非自身位置，真错位 ≈14–17）
+② `signal=|fp32 margin|` vs `noise=同位置 block-vs-serial max|Δ|`（**现场实测，不用人为常数**）。
+同时修正 `rounds_from_events` 的事件重建 bug：**全接受轮不调用 `_step`**，下一轮 `saved_next`
+取自本轮 `rows[kp-1]`，原先置 `None` 会产出假证据。
+
+#### 4.7.5 处置
+- `spec_dec.py` / `spec_cache.py` 的索引与 cache 语义**不做修改**（现实现正确；改动会造成真实回归）。
+- §4.6 中"SpecDec 指标全部 INVALIDATED"的处置**暂缓**（`INVALIDATION_PENDING`）：失效前提
+  （索引错位）已被代码审查 + 真实模型实测 + 哨兵测试三方证伪；**不基于被证伪的前提作废有效数据**。
+  SpecDec 的计时数据仍因 §4.6.5 的**显存饱和 / 跨顺序 28.9% 不稳定**而不得进入正式速度主表
+  —— 这是另一条独立且已确立的理由。
+- 待用户在 GPU 上重跑 `python -m specdec.engine.g4_part4_mismatch_diag`（新分类器），
+  若三个条件均给出 `BF16_NEAR_TIE` 且 `off_by_one=False`，则 Part 4 正确性可闭环。
+
 ## 5. 复现设置（每次记录必须带上）
 - seed=42（测试）；性能脚本 seed=0，3 reps 取最优 + warmup；
 - prompt 固定（bench_basic.PROMPT，38 tok）；decode 数 64；
