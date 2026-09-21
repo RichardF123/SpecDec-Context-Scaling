@@ -322,7 +322,7 @@ def main() -> int:
         if ev:
             extra = (f"  first_diff={ev.get('d')} "
                      f"fp32_margin={ev.get('fp32', {}).get('margin')} "
-                     f"bvs_maxΔ={ev.get('block_vs_serial_max_abs')}")
+                     f"bvs_maxΔ={ev.get('noise_own_max_abs')}")
         print(f"  ctx={ctx:<5} {kv:<10} {v}{extra}")
     print("\n注意：若结论为实现错误，必须重跑 G4 B5、G4 B6、三个失败条件与 8K 正确性对照；"
           "若为 bf16 近贴边，上面的 margin 就是证据（不得仅凭猜测豁免）。")

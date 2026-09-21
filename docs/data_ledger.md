@@ -393,10 +393,10 @@ CPU 自测扩展到 **62/62 PASS**（含 NaN 混合/全缺失/单值、`ar_equal
 `512 base_bf16`、`2048 base_bf16`、`2048 v_fp8`。
 定位工具 `g4_part4_mismatch_diag.py` 已就位（输出 first_diff_index / 两侧 token / AR 与判定行
 top-1·top-2·margin / round·m·分支 / block-vs-serial max\|Δ\| / FP32 控制；按 6 类证据门槛归因），
-**尚未在 GPU 上运行** ⇒ 归因**未定**。
+**当时尚未在 GPU 上运行** ⇒ 此处为历史未决状态；后续已由 §4.7.8 闭环。
 
 #### 4.6.7 Part 4 状态
-**CHECK**：8K 隔离复验已完成并**证伪"8K 稳定加速"**（1.286× 不可复现、SpecDec 全面慢于 AR、
+**当时状态（已由 §4.7.8 更新）为 CHECK**：8K 隔离复验已完成并**证伪"8K 稳定加速"**（1.286× 不可复现、SpecDec 全面慢于 AR、
 v_fp8 无速度优势、`base SpecDec` 跨顺序 28.9% 不稳定、运行点显存饱和）；工具链与 62 项 CPU 自测
 通过；三个历史 token 不一致条件的归因**未完成**。**不允许进入 G5 / Pilot / Final。**
 
@@ -462,6 +462,79 @@ exact token-id；总 accepted/proposed = 216/348）**，与 2026-09-15 首次结
 隔离探针（5 rep）恢复直方图段后的实测（四格**完全一致**，跨 KV 档与跨启动顺序皆同）：
 `m=0:5  1:20  2:20  3:0  4:55`，总轮数 100，`sum(m)=280`（每 rep 56），全接受轮占比 **55.0%**。
 ⇒ **决策层（接受/轮数/直方图）完全可复现**，只有**计时**不稳定（§4.6.5 的 28.9%）。
+
+#### 4.7.8 GPU 归因复跑——**Part 4 正确性闭环**（2026-09-21）
+新分类器在同一 GPU 环境下连续运行两次
+`python -m specdec.engine.g4_part4_mismatch_diag`，两次结果完全一致：
+
+| 条件 | first diff | 同位置 block-vs-serial max\|\Delta\| | 相邻位置 max\|\Delta\| | fp32 margin | 归因 |
+|---|---:|---:|---:|---:|---|
+| `512/base_bf16` | 3 | 0.3125 | 8.625 / 12.0625 | 0.0454 | `BF16_NEAR_TIE` |
+| `2048/base_bf16` | 34 | 0.3086 | 11.4688 / 13.6562 | 0.0179 | `BF16_NEAR_TIE` |
+| `2048/v_fp8` | 38 | 0.5078 | 5.5781 / 14.9688 | 0.0345 | `BF16_NEAR_TIE` |
+
+三格均为 `off_by_one=False`、`g_recomputed_ok=True`、`emitted_len_ok=True`、
+`invariant_violations=0`。同位置差异远小于相邻位置，且 fp32 真实决策间隔全部小于
+bf16 形状噪声；因此三处差异均为近贴边 argmax 翻转，**不是索引、cache 或记账错误**。
+
+**最新 Gate：**
+- SpecDec logits 索引 / cache 结构正确性：**PASS**。
+- FP32 端到端 token-id 正确性：**PASS**。
+- BF16 严格 token equality：**CHECK（可解释的 near-tie 形状漂移）**。
+- Part 4 正确性归因：**CLOSED**。
+- Part 4 性能：**CHECK**（显存饱和 + `base SpecDec` 跨顺序 28.9% 计时不稳定）。
+- 允许进入 G5 记录框架/计时稳定化开发：**YES**。
+- 允许启动正式 Pilot / Final：**NO**，先冻结稳定计时协议。
+
+### 4.8 G5 测量稳定化（2026-09-21）—— 工具与 schema 已冻结，**GPU 数据未运行**
+> 协议见 `docs/g5_measurement_protocol.md`（冻结 v1）。本节只登记"已实现/已 CPU 验证"与"未运行"。
+
+#### 4.8.1 G5 结果 schema（`specdec/results_schema.py`，`SCHEMA_VERSION = g5-results-1.0`）
+- 46 个字段（run 身份 / 条件 / token 身份 / 计时 / 接受统计 / 显存 / 遥测 / 正确性 / 状态 / 可用性），
+  `FIELDS` 为唯一定义源；
+- **硬约束（`validate_row` 强制）**：值为 null 的字段必须在 `availability` 里显式 false；
+  遥测字段不得为字符串或 NaN；`availability` 为元字段（不参与自身检查）；
+- `write_g5_run()`：既有文件 + 非 append ⇒ **报错退出，绝不覆盖**；
+- 兼容层 `read_legacy_part4()` / `build_g5_row()`：读旧 Part 4 行并映射
+  （`t_decode_s→decode_seconds`、`gen_sha1→generated_token_hash`、`m_hist→accepted_length_histogram`、
+  旧版字符串遥测强转 float、缺字段置 null），**只读、不改写原文件**（自测校验前后 sha256 相同）；
+- BF16 近贴边判定 `classify_bf16_compare()`：**四条证据全部满足**才返回 `BF16_NEAR_TIE`
+  （结构不变量通过 / `off_by_one=False` / 同位置比相邻更近 / `|fp32 margin| ≤ 现场噪声`），
+  否则 `NEEDS_INSPECTION`（不自动豁免）。
+
+#### 4.8.2 本轮新增工具（全部 **未在 GPU 上运行**）
+| 文件 | 作用 | 关键纪律 |
+|---|---|---|
+| `specdec/engine/g5_driver.py` | 每条件独立子进程编排 + 系统快照 + 固定 seed 随机化 | 父进程只编排，模型加载不计时 |
+| `specdec/engine/g5_stability_probe.py` | Task B：12 条件 × 2 个独立随机 block | warm-up 1 + 5 rep；cooldown 10s 不计时；`>20%` ⇒ `status=CHECK` 不入主表 |
+| `specdec/engine/g5_cost_breakdown.py` | Task C：AR / SpecDec 阶段分解（CUDA Event 外部包装） | **不改冻结文件**；数字不得入正式主表；`kv_cat` 是 forward 子集、不可相加 |
+| `specdec/engine/g5_k_sweep.py` | Task D：k ∈ {1,2,4,8} 诊断扫描 | 正式协议仍 k=4；只输出"修正建议"不自动改配置；不变更 bonus 变体 |
+| `specdec/engine/g4_part4_pilot_measure.py` | 新增 `P4_K`（**默认仍为冻结的 4**）+ 行内记 `k` / `k_is_protocol` | 诊断专用开关 |
+
+#### 4.8.3 CPU 验证（已运行）
+- `python -m specdec.engine.g5_schema_selftest_cpu` → **PASS 43 / FAIL 0**：字段完整性、
+  null↔availability 一致性、遥测字符串/NaN 拒绝、旧 Part 4 映射（含字符串遥测强转）、
+  拒绝覆盖、append、读取不改写（sha256 前后一致）、MAD/IQR（样本不足 → None）、
+  **三个真实历史条件 → `BF16_NEAR_TIE`** + 5 个反例（`off_by_one` / 不变量违反 / signal>noise /
+  同位置不更近 / 缺 margin ⇒ 均不得豁免）、驱动层随机化可复现、快照类型、路径命名；
+- 编译：`py_compile` 6 个文件全过（含 `spec_dec.py` / `spec_cache.py`，**均未修改**）。
+
+#### 4.8.4 未运行（**不得填预期值**）
+`g5_stability_probe` / `g5_cost_breakdown` / `g5_k_sweep` 的 GPU 数据：稳定性
+（median / min / max / MAD / IQR、within-run、between-block）、成本分解（各阶段耗时与占比、闭合残差）、
+k 扫描（acceptance、tok/round、rounds、block、draft、decode tok/s、peak）**全部未运行**。
+
+#### 4.8.5 Gate 回答（本轮）
+```
+G5 schema complete:            YES（43 项 CPU 自测通过，含旧数据兼容层）
+condition randomization:       YES（固定 seed + ≥2 block；工具就绪并 CPU 验证）
+fresh-process isolation:       YES（驱动层强制；8K 隔离实验已按此执行）
+timing variance characterized: NO （需 stability probe 的 GPU 数据）
+cost breakdown:                NO （工具就绪，未运行）
+k=4 retained:                  YES（正式协议；P4_K 仅供诊断）
+correctness gate preserved:    YES（FP32 B6 PASS 保持；未动 spec_dec / spec_cache）
+ready for formal Pilot:        NO
+```
 
 ## 5. 复现设置（每次记录必须带上）
 - seed=42（测试）；性能脚本 seed=0，3 reps 取最优 + warmup；

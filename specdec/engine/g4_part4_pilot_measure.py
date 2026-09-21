@@ -54,7 +54,9 @@ from .g4_b4_cache_tests import load_ours
 
 TARGET = "Qwen/Qwen2.5-1.5B-Instruct"
 DRAFT = "Qwen/Qwen2.5-0.5B-Instruct"
-K = spec_dec.K
+# 正式协议冻结 k=4；P4_K 仅供诊断（k sweep）使用，默认值不变
+K = int(os.environ.get("P4_K", str(spec_dec.K)))
+PROTOCOL_K = spec_dec.K
 KV_CHOICES = ("base_bf16", "v_fp8")
 MODE_CHOICES = ("AR", "SpecDec")
 FORMAL_CTX = (2048, 4096, 8192)
@@ -510,6 +512,8 @@ def run_once(tgt, drf, ids, eos, kv, mode):
                n_generated=len(gen),
                generated_token_hash=gen_sha1(gen),
                generated_token_ids=[int(x) for x in gen],   # max_new<=64，体积可接受
+               k=K,                                          # 实际使用的 k（正式=4）
+               k_is_protocol=(K == PROTOCOL_K),
                # ---- 单条件进程内**没有** AR 对照 ⇒ 不得填 False ----
                ar_equal=None, ar_equal_available=False,
                reserved_semantics=RESERVED_SEMANTICS)
