@@ -117,6 +117,55 @@ INELIGIBLE FOR FORMAL SPEEDUP TABLE**（它可以证明显存饱和与顺序敏�
   6. 可从**稳定 speedup 汇总 / 显著性结论**中排除（并注明排除理由）；
   7. **不得**让该 cell 从报告中消失（也不得用"剔除后平均"冒充整体结论）。
 
+## 7b. 状态分层与 GPU P-state 门禁（v1.1 第二轮，2026-09-22）
+
+### 7b.1 **`exit=0` 不等于测量有效**
+
+| 字段 | 取值 | 含义 |
+|---|---|---|
+| `execution_status` | SUCCESS / ERROR / OOM | **程序**是否跑完 |
+| `measurement_status` | OK / CHECK / ENV_INVALID / NOT_MEASURED | **测量**是否有效 |
+| `status`（兼容） | 执行失败时=执行状态，否则=`measurement_status` | —— |
+
+子进程的 `spread_flag='CHECK:relative-spread>20%'` **必须**把 `measurement_status` 降为 CHECK，
+并把 `within_run_check_reason` / `within_run_rel_spread_pct` 记进行里。
+`returncode==0` 只是"程序成功完成"，**不能**作为 `status=OK` 的依据。
+
+### 7b.2 GPU P-state 预检（独立模块 `gpu_pstate_preflight`）
+
+- **必须在负载期采样**：空闲时 SM≈210–315 MHz / mem≈405 MHz 属正常节能状态，
+  **不得**用空闲快照判资格（否则会把合格机器误判为不合格，反之也不能用空闲时钟高证明合格）；
+- 预检运行在 measured reps **之前**，**不进**正式计时：短固定低显存 CUDA 负载
+  （2048² fp16 matmul ≈ 8 MiB）+ 后台线程采样 `nvidia-smi`；
+- 记录 `samples / median·min·max(SM·mem 时钟、功耗、温度) / duration / 阈值 / verdict`；
+  采样不可用 ⇒ `available=false`（**不填 0 冒充**）；
+- **阈值可配置**（默认是本机经验值，**不是通用 GPU 标准**）：
+  `P5_MIN_ACTIVE_SM_CLOCK_MHZ=2000`、`P5_MIN_ACTIVE_MEM_CLOCK_MHZ=7500`、
+  `P5_PSTATE_PREFLIGHT_SECONDS=5`；功耗只作辅助证据，**不作硬 Gate**；
+- 预检不合格 ⇒ 该 block 标 `env_qualified=false`，`measurement_status=ENV_INVALID`，
+  `speedup_claim_allowed=false`，**并跳过该 block 的正式测量**（避免继续产出整批无效时间数据）；
+  已产生的低功耗数据**保留**（它是定位环境问题的关键证据）。
+
+### 7b.3 运行期 P-state 审计（每 cell）
+
+用每个 measured rep 的 `monitor_start/end` 快照（都在计时区间之外、且 GPU 处于负载）
+汇总 `active_sm_clock_mhz / active_memory_clock_mhz / active_power_w / pstate_qualified /
+pstate_reason`；**不在正式计时区间内轮询 `nvidia-smi`**。
+若某 block 内任一 primary cell 因 P-state 失败 ⇒ 该 block 建议整体重跑，
+**不允许只删慢 rep 保留快 rep**。
+
+### 7b.4 正式 speedup 的声明资格（10 条全满足才允许 `speedup_claim_allowed=true`）
+
+1. 分母是 `AR` 且 `ar_residency=target_only`；2. `speedup_denominator_eligible=true`；
+3. 两侧 `context_actual` / `target_kv` / `max_new_tokens` / **`input_token_hash`** 一致；
+4. 两侧 measured reps 完整；5. 两侧 `measurement_status=OK`；
+6. 两侧 between-block 未超诊断线；7. 无 OOM / NaN / ENV_INVALID；
+8. 生成正确性状态已记录（`tokens_finite=true`）；9. 不是 dual-resident 诊断控制；
+10. 行内未混入 profiling 数据。
+
+任意一项不满足 ⇒ `speedup_claim_allowed=false`，且**必须打印具体原因**
+（`NO CLAIM：AR between-block CHECK` 等），**不得**输出"可作确定声明"。
+
 ## 8. 正确性口径
 
 - **主 Gate**：FP32 `B6` 逐 token 精确相等（当前 PASS：20/20 组合，216/348）；

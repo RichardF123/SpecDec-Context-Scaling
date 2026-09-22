@@ -15,6 +15,8 @@ from __future__ import annotations
 import hashlib
 import json
 import tempfile
+import threading
+import time
 import traceback
 from pathlib import Path
 
@@ -304,6 +306,147 @@ def main() -> int:
     check("probe.cell_label 形如 ctx,kv,mode,residency",
           P.cell_label((8192, "v_fp8", "AR", "target_only")) == "8192,v_fp8,AR,target_only"
           and P.cell_label((8192, "v_fp8", "SpecDec", None)) == "8192,v_fp8,SpecDec,-")
+
+    print("\n== 12. 状态分层 / speedup 资格 / P-state 门禁 ==")
+
+    def _src(**over):
+        s = dict(ctx=2048, target_kv="v_fp8", n_gen=64, t_prefill_s=1.0, t_decode_s=2.0,
+                 t_total_s=3.0, decode_tok_s=20.0, e2e_tok_s=15.0, rounds=0, proposed=0,
+                 accepted=0, target_block_calls=0, draft_calls=0, mismatch_rounds=0,
+                 all_accept_rounds=0, peak_alloc_GiB=5.0, peak_resv_GiB=6.0,
+                 logits_finite=True, reps=5, warm=1, chunk=2048, k=4,
+                 input_token_hash="ih1", certified=True, spread_flag="ok",
+                 decode_tok_s_rel_spread_pct=3.0, t_decode_s_rel_spread_pct=2.0)
+        s.update(over)
+        return s
+
+    def _meta(**over):
+        m = dict(run_id="t", block_index=0, condition_index=0, seed=1, condition_order=["x"],
+                 timestamp_utc="2026-09-22T00:00:00Z", mode="AR",
+                 ar_residency=S.PRIMARY_AR_RESIDENCY, reps_expected=5, returncode=0,
+                 env_qualified=True, pstate_qualified=True, between_block_check=False,
+                 between_block_rel_diff_pct=5.0, max_new_tokens=64)
+        m.update(over)
+        return m
+
+    ar_ok = S.build_g5_row(_src(), _meta())
+    sp_ok = S.build_g5_row(_src(mode="SpecDec"), _meta(mode="SpecDec", ar_residency=None))
+    check("合格行通过 schema 校验", S.validate_row(ar_ok) == [] and S.validate_row(sp_ok) == [],
+          str(S.validate_row(ar_ok)[:2]))
+
+    # T1 exit=0 + spread_flag=CHECK -> measurement_status/status = CHECK
+    ar_spread_bad = S.build_g5_row(
+        _src(spread_flag="CHECK:relative-spread>20%", decode_tok_s_rel_spread_pct=222.4),
+        _meta())
+    check("① exit=0 + spread CHECK -> status=CHECK（不写 OK）",
+          ar_spread_bad["execution_status"] == "SUCCESS"
+          and ar_spread_bad["measurement_status"] == "CHECK"
+          and ar_spread_bad["status"] == "CHECK"
+          and "relative-spread" in (ar_spread_bad["within_run_check_reason"] or ""),
+          f"{ar_spread_bad['execution_status']}/{ar_spread_bad['measurement_status']}")
+    check("① 同时记录 within_run_rel_spread_pct",
+          ar_spread_bad["within_run_rel_spread_pct"] == 222.4)
+    # T2 within-run CHECK -> 不得声明
+    check("② within-run CHECK -> speedup_claim_allowed=false",
+          not S.speedup_claim(ar_spread_bad, sp_ok)["allowed"])
+    # T3/T4 一侧不稳即不得声明
+    sp_spread_bad = S.build_g5_row(
+        _src(mode="SpecDec", spread_flag="CHECK:relative-spread>20%"), 
+        _meta(mode="SpecDec", ar_residency=None))
+    check("③ AR 稳 + Spec within-run CHECK -> NO CLAIM",
+          not S.speedup_claim(ar_ok, sp_spread_bad)["allowed"]
+          and any("SpecDec" in r for r in S.speedup_claim(ar_ok, sp_spread_bad)["reasons"]))
+    check("④ AR within-run CHECK + Spec 稳 -> NO CLAIM",
+          not S.speedup_claim(ar_spread_bad, sp_ok)["allowed"]
+          and any("AR" in r for r in S.speedup_claim(ar_spread_bad, sp_ok)["reasons"]))
+    # T5 between-block >20% -> 不得声明（并被吸收进 measurement_status）
+    ar_bb = S.build_g5_row(_src(), _meta(between_block_check=True,
+                                         between_block_rel_diff_pct=66.0))
+    check("⑤ between-block>20% -> status=CHECK 且 NO CLAIM",
+          ar_bb["status"] == "CHECK" and ar_bb["between_block_check"] is True
+          and not S.speedup_claim(ar_bb, sp_ok)["allowed"])
+    # T6/T7 分母资格
+    check("⑥ 只有 target-only AR 可作分母（speedup_claim 拒绝 dual/非 AR）",
+          not S.speedup_claim(dict(ar_ok, ar_residency="dual_control",
+                                   speedup_denominator_eligible=False), sp_ok)["allowed"])
+    try:
+        S.compute_speedup(dict(ar_ok, ar_residency="dual_control",
+                               speedup_denominator_eligible=False), sp_ok)
+        check("⑦ dual-control 不得作为正式分母（ValueError）", False)
+    except ValueError:
+        check("⑦ dual-control 不得作为正式分母（ValueError）", True)
+    # T8 ENV_INVALID 永远不得声明
+    ar_env = S.build_g5_row(_src(), _meta(pstate_qualified=False))
+    check("⑧ P-state 不合格 -> measurement_status=ENV_INVALID 且 NO CLAIM",
+          ar_env["measurement_status"] == "ENV_INVALID"
+          and not S.speedup_claim(ar_env, sp_ok)["allowed"])
+    # T9/T10/T11/T12 P-state 判定
+    v_none = D.pstate_verdict([])
+    check("⑨ P-state 采样缺失 -> available=false（不填 0）",
+          v_none["available"] is False and v_none["qualified"] is None, str(v_none))
+    lo = [dict(clock_sm_MHz="630", clock_mem_MHz="6000", power_W="17", temp_C="62")] * 5
+    hi = [dict(clock_sm_MHz="2520", clock_mem_MHz="8000", power_W="60", temp_C="70")] * 5
+    v_lo = D.pstate_verdict(lo)
+    check("⑩ 低于阈值 -> qualified=false 且 reason 含 ENV_INVALID",
+          v_lo["qualified"] is False and "ENV_INVALID" in v_lo["reason"], str(v_lo["reason"]))
+    check("⑪ 高性能样本通过资格判定", D.pstate_verdict(hi)["qualified"] is True)
+    idle_only = [dict(clock_sm_MHz="210", clock_mem_MHz="405", power_W="3", temp_C="45")] * 5
+    from . import gpu_pstate_preflight as PF
+    v_idle = PF.verdict_from_sampler([], dict(clock_sm_MHz="315"))
+    check("⑫ 空闲样本不得作为判定输入（无负载样本 -> available=false）",
+          v_idle["available"] is False and v_idle["verdict_input"] == "load_samples_only"
+          and D.pstate_verdict(idle_only)["available"] is True, str(v_idle["reason"]))
+    # T13/T14 不稳定 cell 仍在报告中 + 输出拒绝原因
+    su_bad = S.compute_speedup(ar_bb, sp_ok)
+    check("⑬ unstable cell 仍产出数字（不从报告消失）",
+          su_bad["speedup_decode"] is not None)
+    check("⑭ 拒绝时输出具体原因（NO CLAIM: ...）而非静默",
+          su_bad["speedup_claim_allowed"] is False and su_bad["speedup_claim_blockers"]
+          and all(r.startswith("NO CLAIM") for r in su_bad["speedup_claim_blockers"]),
+          str(su_bad["speedup_claim_blockers"][:2]))
+    # T15 条件不一致禁止比较
+    sp_other_ctx = S.build_g5_row(_src(mode="SpecDec", ctx=8192),
+                                  _meta(mode="SpecDec", ar_residency=None,
+                                        context_actual=8192))
+    try:
+        S.compute_speedup(ar_ok, sp_other_ctx)
+        check("⑮ context 不一致禁止比较", False)
+    except ValueError:
+        check("⑮ context 不一致禁止比较", True)
+    sp_hash_bad = S.build_g5_row(_src(mode="SpecDec", input_token_hash="ih2"),
+                                 _meta(mode="SpecDec", ar_residency=None))
+    c = S.speedup_claim(ar_ok, sp_hash_bad)
+    check("⑮ input_token_hash 不一致 -> NO CLAIM",
+          not c["allowed"] and any("input_token_hash" in r for r in c["reasons"]),
+          str(c["reasons"][:1]))
+    # T16–T18 Sampler 生命周期
+    # 回归来源：Sampler 把 Event 存在 self._stop 上 → 覆盖 threading.Thread._stop 方法
+    # → Thread.join() 内部 self._stop() 抛 TypeError: 'Event' object is not callable。
+    # 教训：自测必须**跑真实入口**（含线程 stop/join），只测纯函数抓不到这类崩溃。
+    check("⑯ Sampler 不得覆盖 Thread._stop（否则 join 必崩）",
+          callable(getattr(PF.Sampler, "_stop", None))
+          and not isinstance(getattr(PF.Sampler, "_stop", None), threading.Event))
+    _real_snap = D.system_snapshot
+    try:
+        D.system_snapshot = lambda: {"available": True, "clock_sm_MHz": "2520",
+                                     "clock_mem_MHz": "8000", "power_W": "60", "temp_C": "70"}
+        s_ok = PF.Sampler(0.01)
+        s_ok.start()
+        time.sleep(0.15)
+        s_ok.stop()
+        check("⑰ Sampler.stop() 正常返回并已采集样本",
+              not s_ok.is_alive() and len(s_ok.samples) >= 1 and s_ok.failures == 0,
+              f"samples={len(s_ok.samples)} failures={s_ok.failures}")
+        D.system_snapshot = lambda: {"available": False, "reason": "no nvidia-smi"}
+        s_bad = PF.Sampler(0.01)
+        s_bad.start()
+        time.sleep(0.15)
+        s_bad.stop()
+        check("⑱ 快照不可用时计入 failures，不崩溃也不造数",
+              not s_bad.is_alive() and not s_bad.samples and s_bad.failures >= 1,
+              f"samples={len(s_bad.samples)} failures={s_bad.failures}")
+    finally:
+        D.system_snapshot = _real_snap
 
     print(f"\nG5 schema 自测：PASS {len(PASS)} / FAIL {len(FAIL)}")
     if FAIL:

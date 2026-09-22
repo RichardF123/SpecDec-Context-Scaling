@@ -595,6 +595,99 @@ P4_AR_RESIDENCY=target_only` → exit 0；日志出现 `[stage] draft 不加载�
 （那需要 stability probe 的 warm-up + reps 数据）。
 反向守卫亦已实测：无过滤（AR+SpecDec 同进程 + target_only）**立即报错退出、不加载任何模型**。
 
+### 4.11 G5 stability probe 第 1 次运行（2026-09-21/22）—— **环境不合格（P-state）**，代码门禁已修复
+**登记产物（**保留，不得覆盖/删除**）**
+- `output/g5/g5_g5-results-1.1_5dc7b5eeacd1_g5stab_20260921T090033Z.jsonl`（24 行）
+- `output/part4/part4_*_g5stab_b[01]_c*_pri_*.jsonl`（24 个子进程产物，每个 5 measured reps）
+
+**已成功建立的部分**
+- **AR target-only 正式主基线口径已生效**：`resident_models=['target']`、`weights_resident ≈ 2.88 GiB`
+  （对比旧 dual-resident 3.81 GiB）；8K target-only AR `peak_allocated` = base 5.14 / v_fp8 5.09 GiB；
+- 12 个 primary cell × 2 随机 block × (warm-up 1 + 5 reps) 全部跑完；`execution_status` 全 SUCCESS。
+
+**结果：STABILITY FAIL / ENVIRONMENT NOT QUALIFIED**
+| 现象 | 数值 |
+|---|---|
+| between-block 相对差 >20% 的 cell | **7/12**：2048 base AR 66.0%、2048 base Spec 66.9%、4096 base AR 69.9%、4096 v_fp8 Spec 68.5%、8192 base AR 67.4%、8192 v_fp8 AR 68.8%、8192 v_fp8 Spec 24.8% |
+| within-run 相对离散 >220% 的 cell | **2 个**：4096 base SpecDec blk0 **222.1%**、8192 base AR blk0 **222.4%** |
+| SM 时钟跨度 | **435–2535 MHz**（3.75×） |
+| 低频 block（SM<2000MHz，9 个）吞吐中位 | **6.16 tok/s** |
+| 高频 block（SM≥2000MHz，15 个）吞吐中位 | **17.67 tok/s（2.9×）** |
+| 温度 | 慢运行 61–68 °C、快运行 69–81 °C ⇒ **非热降频** |
+| 功耗 / 显存频率 | 慢：15.8–28 W、mem 6000 MHz；快：40–86 W、mem 8000 MHz |
+
+**归因（截至本轮证据）**：GPU 在部分条件进入**低功耗 P-state**（供电/DVFS 层面），
+与 Windows 电源模式 / NVIDIA Battery Boost·Whisper Mode / 厂商工具模式 / 供电状态有关；
+**在获得新证据前不进一步断言是哪一个外部设置**。
+修正此前表述：**8K 显存饱和仍是风险**，但本次 2K/4K/8K 的大幅跨 block 波动
+**直接伴随 GPU 时钟与功耗档位变化**。
+
+**clock-matched 子集（唯一可读的加速比）**：仅取 AR 与 SpecDec 双方 SM 均 ≥2400 MHz 的 block
+（3 对）→ decode speedup 中位 **0.284**（0.200–0.684）、e2e 中位 0.152 ⇒ **全部 <1**。
+**严格按 20% 诊断线**（不含 P-state 阈值）只有 `2048/v_fp8` 一对可入资格，decode ≈ **0.536×**、
+e2e ≈ **0.540×**——但按**已实现的门禁**（SM ≥ 2000 MHz）它**也不合格**：该档 SpecDec 两 block 的
+SM 中位为 1950 / 2070 MHz（< 满频 2520）。**不为了得到合格结论而调低阈值**；
+若确要改阈值，必须在**下次运行之前**预登记。
+
+**本轮数据的定性**：**VALID EXPLORATORY / ENVIRONMENT-DIAGNOSTIC DATA —
+INELIGIBLE FOR FORMAL SPEEDUP CLAIM**（它成功揭示了 P-state 切换，不是"无效数据"）。
+
+**代码门禁（本轮修复，CPU 自测 92/92）**
+- **状态分层**：`execution_status`(SUCCESS/ERROR/OOM) 与 `measurement_status`(OK/CHECK/ENV_INVALID/NOT_MEASURED)
+  分离；**子进程 `spread_flag=CHECK` 必须把 measurement_status 降为 CHECK**（`exit=0` 不再写成 OK）；
+  记录 `within_run_check_reason` / `within_run_rel_spread_pct`；
+- **speedup 声明资格**：`speedup_claim()` 强制 10 条（target-only 分母、条件/hash 一致、reps 完整、
+  两侧 measurement OK、between-block 合规、无 OOM/NaN/ENV_INVALID、正确性已记录、非诊断控制、
+  无 profiling 混入）；不满足时输出 `NO CLAIM：<原因>`，**不再打印"可作确定声明"**；
+- **P-state 预检** `specdec/engine/gpu_pstate_preflight.py`：负载期采样（空闲时钟**不参与判定**）、
+  可配置阈值、`available=false` 不填 0、不合格即中止该 block；独立可复用；**已在 GPU 上实测**（见 §4.12）；
+- **运行期审计**：每 cell 由 `monitor_start/end`（计时区间外）汇总
+  `active_sm_clock_mhz / active_memory_clock_mhz / active_power_w / pstate_qualified / pstate_reason`；
+- **平台门禁**：AC 供电 + 电源方案（**不使用空闲时钟**，空闲 315 MHz 属正常）；
+- **离线复核** `scripts/g5_report_from_run.py`：对历史 run 复算 within/between/P-state 与
+  NO CLAIM 原因（只读）。
+
+**当前 Gate**
+```
+target-only AR baseline:        PASS（口径已生效且有实机证据；性能数据本身受环境污染）
+within-run status propagation:  PASS（代码 + 测试）
+speedup claim gating:           PASS（代码 + 测试；本轮 6/6 对全部 NO CLAIM）
+GPU P-state preflight:          PASS（2026-09-22T03:58:05Z 实测 QUALIFIED；工具已修复 1 个真实缺陷）
+STABILITY (run #1):             FAIL
+ENVIRONMENT (run #1):           NOT QUALIFIED
+ENVIRONMENT (当前时刻):          QUALIFIED（预检通过；是否在下一次长实验中保持合格仍需 block 级复检）
+formal Pilot:                   HOLD（等缩小版复验）
+```
+
+### 4.12 GPU P-state 预检首次实机运行（2026-09-22T03:58:05Z）—— **发现并修复 1 个真实缺陷，复跑 QUALIFIED**
+
+**产物**：`output/g5/pstate_preflight_pstate_20260922T035805Z.json`（2227 B，唯一命名，不覆盖）
+
+**发现缺陷（工具级，非测量结果）**
+- 第 1 次运行**崩溃**：`TypeError: 'Event' object is not callable`（`threading.py:1141 _wait_for_tstate_lock`）。
+- **根因**：`Sampler.__init__` 把停止信号存在 `self._stop`，**覆盖了 `threading.Thread._stop` 方法**；
+  `Thread.join()` 内部会调用 `self._stop()`，于是把 `Event` 当函数调用。
+- **教训（已写入测试）**：自测此前只覆盖 `verdict_from_sampler`（纯函数），**没有跑真实入口的线程 start/stop/join**；
+  这与"必须测工具自身入口"是同一条教训的第二次出现 ⇒ 新增 3 项 CPU 测试（⑯ 断言 `Sampler._stop` 未被覆盖、
+  ⑰ 真实 start/sleep/stop 并断言采到样本、⑱ 快照不可用时计入 `failures` 而非造数）。
+- **修复**：属性改名 `_stop_flag`（`specdec/engine/gpu_pstate_preflight.py`）。
+
+**修复后实测（run_id `pstate_20260922T035805Z`）**
+| 项 | 值 |
+|---|---|
+| 空闲快照（**不参与判定**） | SM 210 MHz / mem 405 MHz / 6.01 W（证明"用空闲时钟判资格"会误杀） |
+| 负载期样本 | n=11，采样失败 0 次；负载 8717 次 2048² fp16 matmul / 5.63 s（≈1549 matmul/s） |
+| SM clock | median **2355**，min 210（仅首个仍在爬频的样本），max 2460 MHz |
+| mem clock | median **8000**，min 405，max 8000 MHz |
+| 功耗 / 温度 | median 89.58 W / 82.0 °C |
+| **verdict** | **QUALIFIED（可进入正式计时）**，退出码 0 |
+
+**说明与边界**
+- 该 JSON 是**环境证据，不是性能数据**；`matmul_per_s` 只用于证明负载真实发生，**不得**作为任何吞吐结论。
+- 阈值（SM≥2000 / mem≥7500 MHz）是**本机经验值**，非通用 GPU 标准；**本轮未修改任何阈值**。
+- 预检通过**只说明当下合格**；长实验中仍须依赖 stability probe 的 **block 级前置复检**（不合格则该 block 跳过），
+  这已在 §4.11 的 run #1 中体现（当时的失败正是靠 cell 级审计发现的）。
+
 ## 5. 复现设置（每次记录必须带上）
 - seed=42（测试）；性能脚本 seed=0，3 reps 取最优 + warmup；
 - prompt 固定（bench_basic.PROMPT，38 tok）；decode 数 64；

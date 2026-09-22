@@ -92,7 +92,22 @@ FIELDS: dict[str, tuple[str, str]] = {
     "ar_equal": ("bool", "生成序列是否与同档 AR 完全相同（无对照时 null）"),
     "ar_equal_certified": ("bool", "前提（ctx/max_new/eos/input_token_hash）是否全部满足"),
     "first_diff_index": ("int", "首个不同 token 位置（不等时）"),
-    "status": ("str", "OK | OOM | CHECK | SKIP"),
+    "status": ("str", "[兼容字段] 执行失败时=OOM/ERROR，否则=measurement_status"),
+    "execution_status": ("str", "SUCCESS | ERROR | OOM（程序是否跑完）"),
+    "measurement_status": ("str", "OK | CHECK | ENV_INVALID | NOT_MEASURED（测量是否有效）"),
+    "within_run_check_reason": ("str", "within-run 被判 CHECK 的原因（来自子进程 spread_flag）"),
+    "within_run_rel_spread_pct": ("float", "子进程内的相对离散（decode/t_decode 取大者）"),
+    "between_block_rel_diff_pct": ("float", "同 cell 两 block 中位数相对差"),
+    "between_block_check": ("bool", "between-block 是否超过预登记诊断线"),
+    "reps_measured": ("int", "实际用于统计的 measured reps 数"),
+    "reps_expected": ("int", "协议要求的 measured reps 数"),
+    "active_sm_clock_mhz": ("float", "**负载期间**采样的 SM 时钟中位数"),
+    "active_memory_clock_mhz": ("float", "负载期间显存时钟中位数"),
+    "active_power_w": ("float", "负载期间功耗中位数"),
+    "pstate_qualified": ("bool", "该 cell 是否处于合格 active P-state"),
+    "pstate_reason": ("str", "P-state 判定原因（含实测时钟/阈值）"),
+    "env_qualified": ("bool", "整批/该 block 的环境资格（预检 + 全 cell P-state）"),
+    "speedup_claim_blockers": ("list", "不允许 speedup 声明的具体原因列表"),
     # ---- 资源口径（v1.1 新增）：谁是主要条件、谁占了多少资源、谁配当分母 ----
     "resident_models": ("list", "实际驻留的模型，如 ['target'] 或 ['target','draft']"),
     "ar_residency": ("str", "AR 的驻留模式：target_only | dual_control（SpecDec 为 null）"),
@@ -148,7 +163,7 @@ def build_dual_controls(ctxs, kvs) -> list[tuple]:
     return [(c, kv, "AR") for c in ctxs for kv in kvs]
 
 
-def compute_speedup(ar_row: dict, spec_row: dict) -> dict:
+def compute_speedup(ar_row: dict, spec_row: dict, *, rel_limit: float = 20.0) -> dict:
     """统一方向：speedup = T_AR / T_Spec（>1 表示 SpecDec 更快，<1 表示更慢）。
 
     强制：AR 行必须是 **target_only primary**（否则抛错，防止诊断控制混入分母）；
@@ -172,8 +187,9 @@ def compute_speedup(ar_row: dict, spec_row: dict) -> dict:
             out[f"speedup_{key}"] = t_ar / t_spec
         else:
             out[f"speedup_{key}"] = None
-    out["speedup_claim_allowed"] = bool(
-        ar_row.get("speedup_claim_allowed") and spec_row.get("speedup_claim_allowed"))
+    claim = speedup_claim(ar_row, spec_row, rel_limit=rel_limit)
+    out["speedup_claim_allowed"] = claim["allowed"]
+    out["speedup_claim_blockers"] = claim["reasons"]
     return out
 
 
@@ -223,6 +239,90 @@ def plan_process(conditions, ar_residency: str | None = None) -> dict:
     return dict(load_draft=need_draft,
                 resident_models=["target"] + (["draft"] if need_draft else []),
                 ar_residency=ar_residency, n_conditions=len(conditions))
+
+
+EXECUTION_STATUSES = ("SUCCESS", "ERROR", "OOM")
+MEASUREMENT_STATUSES = ("OK", "CHECK", "ENV_INVALID", "NOT_MEASURED")
+
+
+def derive_statuses(*, returncode: int | None, oom: bool, spread_flag: str | None,
+                    pstate_qualified: bool | None = None) -> dict:
+    """把"程序跑完了吗"与"测量有效吗"**彻底分开**。
+
+    - `execution_status`：SUCCESS / ERROR / OOM
+    - `measurement_status`：OK / CHECK / ENV_INVALID / NOT_MEASURED
+    - `status`：兼容字段 = 执行失败时取执行状态，否则取 measurement_status
+
+    **关键**：`returncode == 0` 只说明程序成功完成，**不代表**性能稳定 —— 子进程的
+    `spread_flag='CHECK:relative-spread>20%'` 必须把 measurement_status 降为 CHECK。
+    """
+    if oom or (returncode is not None and returncode not in (0,)):
+        exec_status = "OOM" if oom else "ERROR"
+    elif returncode is None:
+        exec_status = "ERROR"
+    else:
+        exec_status = "SUCCESS"
+    if exec_status != "SUCCESS":
+        meas = "NOT_MEASURED"
+        reason = f"执行未成功（{exec_status}）"
+    elif pstate_qualified is False:
+        meas = "ENV_INVALID"
+        reason = "GPU P-state 不合格"
+    elif spread_flag and "CHECK" in str(spread_flag):
+        meas = "CHECK"
+        reason = str(spread_flag)
+    else:
+        meas = "OK"
+        reason = None
+    return dict(execution_status=exec_status, measurement_status=meas,
+                status=(meas if exec_status == "SUCCESS" else exec_status),
+                within_run_check_reason=reason)
+
+
+def speedup_claim(ar: dict, spec: dict, *, rel_limit: float = 20.0) -> dict:
+    """**正式 speedup 声明资格**（10 条全满足才允许）。返回 allowed + 具体拒绝原因。"""
+    r: list[str] = []
+    if ar.get("mode") != "AR" or spec.get("mode") != "SpecDec":
+        r.append("NO CLAIM：分子/分母模式不对（需 AR ÷ SpecDec）")
+    if ar.get("ar_residency") != PRIMARY_AR_RESIDENCY:
+        r.append("NO CLAIM：AR 不是 target_only（正式主基线口径）")
+    if not ar.get("speedup_denominator_eligible"):
+        r.append("NO CLAIM：AR 无分母资格")
+    if "diagnostic_control" in (ar.get("condition_role"), spec.get("condition_role")):
+        r.append("NO CLAIM：dual-resident 诊断控制不得参与正式 speedup")
+    for fld, name in (("context_actual", "context"), ("target_kv", "KV"),
+                      ("max_new_tokens", "max_new"), ("input_token_hash", "input_token_hash")):
+        a, s = ar.get(fld), spec.get(fld)
+        if a is None or s is None:
+            r.append(f"NO CLAIM：{name} 缺失，可比性无法确认")
+        elif a != s:
+            r.append(f"NO CLAIM：{name} 不一致（AR={a!r} / Spec={s!r}）")
+    for row, who in ((ar, "AR"), (spec, "SpecDec")):
+        if row.get("reps_expected") and row.get("reps_measured") is not None \
+                and row["reps_measured"] < row["reps_expected"]:
+            r.append(f"NO CLAIM：{who} measured reps 不完整"
+                     f"（{row['reps_measured']}/{row['reps_expected']}）")
+        if row.get("measurement_status") == "ENV_INVALID":
+            r.append(f"NO CLAIM：{who} ENV_INVALID（P-state/环境不合格）")
+        elif row.get("measurement_status") != "OK":
+            r.append(f"NO CLAIM：{who} within-run {row.get('measurement_status')}"
+                     f"（{row.get('within_run_check_reason') or '未记录原因'}）")
+        if row.get("between_block_check"):
+            rel = row.get("between_block_rel_diff_pct")
+            r.append(f"NO CLAIM：{who} between-block CHECK"
+                     f"（{rel:.1f}% > {rel_limit:g}%）" if isinstance(rel, (int, float))
+                     else f"NO CLAIM：{who} between-block CHECK")
+        if row.get("execution_status") in ("ERROR", "OOM"):
+            r.append(f"NO CLAIM：{who} 执行 {row['execution_status']}")
+        for fld in ("decode_seconds", "total_seconds"):
+            v = row.get(fld)
+            if isinstance(v, float) and v != v:
+                r.append(f"NO CLAIM：{who} {fld} 为 NaN")
+        if row.get("tokens_finite") is not True:
+            r.append(f"NO CLAIM：{who} 正确性状态未记录或非 finite")
+        if row.get("profile"):
+            r.append(f"NO CLAIM：{who} 行内混入 profiling 数据")
+    return dict(allowed=(not r), reasons=r, rel_limit_pct=rel_limit)
 
 
 def finalize_row(row: dict) -> dict:
@@ -314,6 +414,34 @@ def validate_row(row: dict) -> list[str]:
         errs.append("SpecDec 的 ar_residency 必须为 null")
     if row.get("status") not in (None, "OK") and row.get("speedup_claim_allowed") is True:
         errs.append(f"status={row.get('status')} 的 cell 不得 speedup_claim_allowed=true")
+    # ---- 状态分层 / 环境资格 / 加速声明资格（v1.1 第二轮）----
+    ex, ms = row.get("execution_status"), row.get("measurement_status")
+    if ex is not None and ex not in EXECUTION_STATUSES:
+        errs.append(f"execution_status 非法: {ex!r}（可选 {EXECUTION_STATUSES}）")
+    if ms is not None and ms not in MEASUREMENT_STATUSES:
+        errs.append(f"measurement_status 非法: {ms!r}（可选 {MEASUREMENT_STATUSES}）")
+    if ex is not None and ms is not None:
+        want = ms if ex == "SUCCESS" else ex
+        if row.get("status") != want:
+            errs.append(f"status={row.get('status')!r} 与 execution_status={ex}/"
+                        f"measurement_status={ms} 不一致（应为 {want!r}）")
+        if ex != "SUCCESS" and ms != "NOT_MEASURED":
+            errs.append(f"执行未成功时 measurement_status 必须为 NOT_MEASURED，实际 {ms!r}")
+    if row.get("pstate_qualified") is False and ms == "OK":
+        errs.append("pstate_qualified=false 时 measurement_status 不得为 OK")
+    if row.get("speedup_claim_allowed") is True:
+        if ms != "OK":
+            errs.append(f"measurement_status={ms} 不得 speedup_claim_allowed=true")
+        if row.get("between_block_check") is True:
+            errs.append("between_block CHECK 不得 speedup_claim_allowed=true")
+        if row.get("env_qualified") is False:
+            errs.append("env_qualified=false 不得 speedup_claim_allowed=true")
+    blockers = row.get("speedup_claim_blockers")
+    if isinstance(blockers, list) and blockers and row.get("speedup_claim_allowed") is True:
+        errs.append("存在 speedup_claim_blockers 时不得 speedup_claim_allowed=true")
+    rp, re_ = row.get("reps_measured"), row.get("reps_expected")
+    if isinstance(rp, int) and isinstance(re_, int) and rp > re_:
+        errs.append(f"reps_measured({rp}) > reps_expected({re_})")
     return errs
 
 
@@ -398,7 +526,13 @@ def build_g5_row(src: dict, meta: dict | None = None) -> dict:
             row[dst_key] = None
     row["tokens_finite"] = src.get("logits_finite") if "logits_finite" in src else \
         src.get("prefill_logits_finite")
-    row["status"] = "OOM" if src.get("oom") else "OK"
+    # ---- 状态分层：**exit=0 不等于测量有效** ----
+    rels = [v for v in (src.get("decode_tok_s_rel_spread_pct"),
+                        src.get("t_decode_s_rel_spread_pct"))
+            if isinstance(v, (int, float)) and v == v]
+    row["within_run_rel_spread_pct"] = max(rels) if rels else None
+    row["reps_measured"] = src.get("reps", meta.get("reps_measured"))
+    row["reps_expected"] = meta.get("reps_expected", src.get("reps_expected"))
     row["k"] = src.get("k", meta.get("k"))
     row["warmup"] = src.get("warm", meta.get("warmup"))
     row["chunk_size"] = src.get("chunk", meta.get("chunk_size"))
@@ -431,7 +565,19 @@ def build_g5_row(src: dict, meta: dict | None = None) -> dict:
             row[fld] = None
         if role_src is not None:
             row["condition_role"] = role_src
-    row["speedup_claim_allowed"] = (row["status"] == "OK")
+    # 状态分层（在 meta 合并之后算，使用最终 spread_flag / pstate 信息）
+    st = derive_statuses(returncode=meta.get("returncode", 0),
+                         oom=bool(src.get("oom")), spread_flag=src.get("spread_flag"),
+                         pstate_qualified=row.get("pstate_qualified"))
+    row.update(st)
+    if row.get("between_block_check") is True and row["measurement_status"] == "OK":
+        row["measurement_status"] = "CHECK"
+        row["status"] = "CHECK"
+        row["within_run_check_reason"] = (row.get("within_run_check_reason") or "") + \
+            " | between-block CHECK"
+    row["speedup_claim_allowed"] = (row["measurement_status"] == "OK"
+                                    and row.get("between_block_check") is not True
+                                    and row.get("env_qualified") is not False)
     return finalize_row(row)
 
 
@@ -498,21 +644,28 @@ def classify_bf16_compare(ev: dict, *, noise_floor: float = 0.0) -> str:
 
 
 def git_meta(cwd: Path | None = None) -> dict:
-    """run 级元数据：commit / dirty。取不到 -> None（不编造）。"""
+    """run 级元数据：commit / dirty。取不到 -> None（不编造）。
+
+    注意：Windows 上必须显式 `encoding='utf-8'`，否则 git 输出的 UTF-8 路径会被系统代码页
+    （GBK）解码而在读取线程里抛 UnicodeDecodeError。
+    """
     import subprocess
     cwd = str(cwd or Path.cwd())
     out = {"git_commit": None, "dirty_worktree": None}
-    try:
-        c = subprocess.run(["git", "rev-parse", "HEAD"], cwd=cwd, capture_output=True,
-                           text=True, timeout=15)
-        if c.returncode == 0:
-            out["git_commit"] = c.stdout.strip()
-        d = subprocess.run(["git", "status", "--porcelain"], cwd=cwd, capture_output=True,
-                           text=True, timeout=15)
-        if d.returncode == 0:
-            out["dirty_worktree"] = bool(d.stdout.strip())
-    except Exception:  # noqa: BLE001
-        pass
+
+    def _run(args):
+        try:
+            return subprocess.run(args, cwd=cwd, capture_output=True, text=True,
+                                  encoding="utf-8", errors="replace", timeout=15)
+        except Exception:  # noqa: BLE001
+            return None
+
+    c = _run(["git", "rev-parse", "HEAD"])
+    if c is not None and c.returncode == 0:
+        out["git_commit"] = c.stdout.strip()
+    d = _run(["git", "status", "--porcelain"])
+    if d is not None and d.returncode == 0:
+        out["dirty_worktree"] = bool(d.stdout.strip())
     return out
 
 
