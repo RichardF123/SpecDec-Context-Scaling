@@ -41,9 +41,20 @@ from .. import results_schema as S
 from . import g5_driver as D
 from . import gpu_pstate_preflight as PF
 
-CTX = [int(x) for x in os.environ.get("P5_CTX", "2048,4096,8192").split(",") if x.strip()]
-KVS = [x for x in os.environ.get("P5_KV", "base_bf16,v_fp8").split(",") if x.strip()]
-MODES = [x for x in os.environ.get("P5_MODE", "AR,SpecDec").split(",") if x.strip()]
+def _env_list(name: str, default: str) -> list[str]:
+    """逗号分隔的环境变量列表；**逐项 strip**。
+
+    为什么必须 strip：在 cmd 里写 `set P5_MODE=AR,SpecDec & set P5_BLOCKS=2` 时，
+    `&` 前的空格会被并进变量值，得到 `'AR,SpecDec '` ⇒ 拆出 `' SpecDec'`。
+    若不 strip，后面用 `m in MODES` 匹配会**静默丢掉整个 SpecDec**，
+    于是"缩小版复验"实际只跑了 AR——**看起来成功、其实条件不全**，这是最危险的一类错误。
+    """
+    return [x.strip() for x in os.environ.get(name, default).split(",") if x.strip()]
+
+
+CTX = [int(x) for x in _env_list("P5_CTX", "2048,4096,8192")]
+KVS = _env_list("P5_KV", "base_bf16,v_fp8")
+MODES = _env_list("P5_MODE", "AR,SpecDec")
 BLOCKS = int(os.environ.get("P5_BLOCKS", "2"))
 REPS = int(os.environ.get("P5_REPS", "5"))
 WARM = int(os.environ.get("P5_WARM", "1"))
@@ -55,6 +66,35 @@ INCLUDE_DUAL = S.env_flag("P5_INCLUDE_DUAL_AR_CONTROL", False)
 REQUIRE_AC = S.env_flag("P5_REQUIRE_AC", True)
 ALLOW_UNSTABLE = S.env_flag("P5_ALLOW_UNSTABLE_CLOCK", False)
 K_PROTOCOL = 4
+
+
+def validate_requested(ctypes: list[int] | None = None, kvs: list[str] | None = None,
+                       modes: list[str] | None = None) -> None:
+    """把**无法识别的**请求项变成硬错误，而不是静默少跑条件。
+
+    `build_primary_matrix` 用的是 `m in MODES` 这种包含判断，未知 token 会被无声忽略；
+    因此必须在入口处显式校验，避免"跑完了但条件不全"。
+    """
+    ctypes = CTX if ctypes is None else ctypes
+    kvs = KVS if kvs is None else kvs
+    modes = MODES if modes is None else modes
+    bad = []
+    # 空列表同样是危险状态：会静默跑出"0 个条件"的假成功
+    for label, seq in (("P5_CTX", ctypes), ("P5_KV", kvs), ("P5_MODE", modes)):
+        if not seq:
+            bad.append(f"{label} 解析后为空（全空白或只写了逗号）⇒ 会跑出 0 个条件")
+    for c in ctypes:
+        if c not in S.CTX_CHOICES:
+            bad.append(f"P5_CTX 含未知长度 {c}（允许 {S.CTX_CHOICES}）")
+    for kv in kvs:
+        if kv not in S.KV_CHOICES:
+            bad.append(f"P5_KV 含未知格式 {kv!r}（允许 {S.KV_CHOICES}）")
+    for m in modes:
+        if m not in S.MODE_CHOICES:
+            bad.append(f"P5_MODE 含未知模式 {m!r}（允许 {S.MODE_CHOICES}）")
+    if bad:
+        raise SystemExit("[g5stab] 环境变量校验失败（拒绝静默少跑条件）：\n  - "
+                         + "\n  - ".join(bad))
 REL_LIMIT = 20.0
 
 
@@ -103,6 +143,8 @@ def main() -> int:
     args = ap.parse_args()
 
     run_id = S.default_run_id("g5stab")
+    stamp = run_id.split("_", 1)[1] if "_" in run_id else run_id
+    validate_requested()          # 拒绝未知条件名（防"跑完但条件不全"）
     primary, control = build_cells()
     print(f"[g5stab] run_id={run_id} seed={SEED} blocks={BLOCKS} reps={REPS} warm={WARM} "
           f"k={K_PROTOCOL}(协议冻结)", flush=True)
@@ -175,7 +217,13 @@ def main() -> int:
         for ci, cell in enumerate(order):
             ctx, kv, mode, res = cell
             tag = "ctl" if cell in control else "pri"
-            cid = f"g5stab_b{b}_c{ci}_{tag}_{ctx}_{kv}_{mode}_{res or 'na'}"
+            # **必须**把本次 run 的 UTC 时间戳放进子进程 run_id：否则两次相同配置的探针
+            # 会产生**同名**分片文件，而测量核心在 P4_ONLY 模式下是**追加**写，
+            # 于是第二次运行的数据会被追加进第一次的分片里（污染受保护数据 + 混两个环境）。
+            cid = (f"g5stab_{stamp}_b{b}_c{ci}_{tag}_{ctx}_{kv}_{mode}_{res or 'na'}")
+            prior = sorted(D.PART4_DIR.glob(f"part4_*_{cid}.jsonl"))
+            if prior:
+                raise SystemExit(f"[g5stab] 拒绝写入已存在的分片（防跨 run 追加污染）：{prior[0]}")
             info = D.spawn_condition(ctx=ctx, kv=kv, mode=mode, run_id=cid, reps=REPS,
                                      warm=WARM, maxnew=MAXNEW, chunk=CHUNK, k=K_PROTOCOL,
                                      order=f"b{b}", ar_residency=res)

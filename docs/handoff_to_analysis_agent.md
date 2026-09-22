@@ -119,7 +119,8 @@ Report & Presentation 15% / Creativity 10%。截止：提案 **10/7**、演示 W
 | `g5_cost_breakdown.py` | Task C：SpecDec/AR 阶段分解（外部 CUDA Event，不改冻结文件）；AR 主基线先以 target-only 跑完 | **未运行（等环境 Gate）** |
 | `g5_k_sweep.py` | Task D：k∈{1,2,4,8} 诊断扫描（只出建议）；每 ctx 一个 target-only AR 分母 | **未运行（等环境 Gate）** |
 | `g5_schema_selftest_cpu.py` / `g4_part4_selftest_cpu.py` | CPU 自测 **92/92** / **62/62** | 已运行 |
-| `scripts/g5_report_from_run.py` | **只读离线报表**：within-block / between-block / speedup / 遥测 / 时钟-吞吐对照 / 时钟匹配 speedup / **[8] 声明门控（打印 `NO CLAIM：<原因>`）** | 已运行（第 1 次探针数据） |
+| `scripts/g5_report_from_run.py` | **只读离线报表**：within-block / between-block / speedup / 遥测 / 时钟-吞吐对照 / 时钟匹配 speedup / **[8] 声明门控（打印 `NO CLAIM：<原因>`）**；**无参数或 `latest` = 只取最新一次 run**（不混多次 run） | 已运行（第 1 次探针数据，`[8]` 6/6 对全部 NO CLAIM） |
+| `scripts/run_g5_reduced.cmd` | **一键缩小版复验**：预检 → 干跑 → 复验 → 离线报表；用 `set "VAR=value"` 避免尾随空格污染条件名 | **已干跑验证（4 primary × 2 block 计划正确）** |
 
 ---
 
@@ -190,7 +191,8 @@ Report & Presentation 15% / Creativity 10%。截止：提案 **10/7**、演示 W
 20. **target-only AR 口径实测可跑**：`resident_models=['target']`、`weights_resident≈2.88 GiB`
     （对比双驻留 3.85 GiB）；8K `peak_allocated` base 5.14 / v_fp8 5.09 GiB ⇒ 少驻留一个模型**并未**带来显存压力。
 21. **时钟匹配后的 speedup（两侧均 ≥2400 MHz，3 对）**：decode 中位 **0.284**（0.200–0.684）、
-    e2e 中位 **0.152**，**全部 <1**。仅按 20% 规则时 2048/v_fp8 会给出 decode≈**0.536×** / e2e≈**0.540×**，
+    e2e 中位 **0.152**，**全部 <1**。仅按 20% 规则时 2048/v_fp8 会给出
+    逐 block decode **0.533 / 0.538**（10 rep 合并中位 **0.533**）、e2e 0.538 / 0.541，
     但按已实现的 **SM≥2000 MHz** 门槛该 cell 判 `ENV_INVALID`（SpecDec 侧 1950/2070 MHz）⇒ **不得声明**。
 22. **环境预检实测（2026-09-22T03:58:05Z）**：idle SM 210 / mem 405 MHz（**不得用于判定**）；
     加载 5.63 s 后负载期 SM **median 2355**、mem **8000** MHz、**89.58 W**、**82 °C** ⇒ **QUALIFIED**，退出码 0。
@@ -283,16 +285,20 @@ b2ec86e  docs: 19-page PDF explaining speculative decoding + md source + generat
 ## 12. 给分析 Agent 的下一步（推荐顺序）
 
 **A. 先拿数据（人运行 GPU，串行）**
-0. **`python -m specdec.engine.gpu_pstate_preflight`**（<1 min）→ 退出码 0 才继续；
-   非 0 先插电/切高性能电源方案/关掉占显存程序，**不要在未通过时开跑计时实验**
-1. `P5_CTX=2048,8192  P5_KV=base_bf16  P5_MODE=AR,SpecDec  P5_BLOCKS=2` 的**缩小版稳定性复验**
-   （`python -m specdec.engine.g5_stability_probe`，约 8–12 min）→ 验证 P-state 是否已稳定
-2. 全量 `python -m specdec.engine.g5_stability_probe`（12 条件 × 2 block，25–40 min）→ 量化 within-run 与 between-block
-3. `python -m specdec.engine.g5_cost_breakdown`（5–15 min）→ 阶段归因，解释 12 AR 步/轮的构成
-4. `python -m specdec.engine.g5_k_sweep`（20–40 min）→ k 曲线（若某 k 明显更好，**只提交修正建议**）
+0. **`scripts\run_g5_reduced.cmd`**（推荐；等价于下面 1–2 步，且不会写错环境变量）
+   或手动：`python -m specdec.engine.gpu_pstate_preflight`，
+   非 0 先插电/切高性能电源方案/关掉占显存程序，**不要在未通过时开跑计时实验**；
+1. 用**带引号**的形式设置（`set "P5_CTX=2048,8192"` 逐行一条，**不要**用 `&` 串联——
+   `&` 前的空格会被并进变量值，导致条件名匹配不上而**静默少跑**）：
+   `P5_CTX=2048,8192`、`P5_KV=base_bf16`、`P5_MODE=AR,SpecDec`、`P5_BLOCKS=2` 的**缩小版复验**
+   （`python -m specdec.engine.g5_stability_probe`，约 8–12 min；先加 `--dry-run` 看一眼计划）
+   → 验证 P-state 是否已稳定；
+2. 全量 `python -m specdec.engine.g5_stability_probe`（12 条件 × 2 block，25–40 min）→ 量化 within-run 与 between-block；
+3. `python -m specdec.engine.g5_cost_breakdown`（5–15 min）→ 阶段归因，解释 12 AR 步/轮的构成；
+4. `python -m specdec.engine.g5_k_sweep`（20–40 min）→ k 曲线（若某 k 明显更好，**只提交修正建议**）。
 
 **A'. 报表（可在任意时刻离线跑，不需要 GPU）**
-- `python scripts/g5_report_from_run.py <stamp|latest>` → 打印 `[8]` 声明门控；出现 `NO CLAIM：<原因>` 即代表该条件**不得**进正式主表。
+- `python scripts/g5_report_from_run.py latest` → 打印 `[8]` 声明门控；出现 `NO CLAIM：<原因>` 即代表该条件**不得**进正式主表。
 
 **B. 拿到数据后分析 Agent 应产出**
 - 稳定性判定：哪些条件可入正式主表、哪些必须标 `CHECK`、哪些是 `ENV_INVALID`；

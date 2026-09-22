@@ -15,7 +15,9 @@
   4. peak_allocated 与系统遥测（温度/功耗/时钟/nvidia-smi used）
   5. 不稳定 cell 清单（between-block > 20%）与预登记处理说明
 
-用法：python scripts/g5_report_from_run.py [runid 子串，默认取最新]
+用法：python scripts/g5_report_from_run.py [latest | runid 子串]
+      - 不给参数或给 `latest`：**只看最新一次 run**（不会把多次 run 混在一起）
+      - 给子串（如 `20260921T090033Z`）：按子串过滤，可命中多个 run
 """
 from __future__ import annotations
 
@@ -34,6 +36,34 @@ PAT = re.compile(r"part4_[0-9a-f]+_(?P<rid>g5stab(?:_[A-Za-z0-9]+)?)_b(?P<b>\d+)
                  r"(?P<role>pri|ctl)_(?P<ctx>\d+)_(?P<kv>[a-z0-9_]+)_(?P<mode>AR|SpecDec)_"
                  r"(?P<res>target_only|dual_control|na)\.jsonl$")
 REL_LIMIT = 20.0
+LATEST = ("latest", "all", "-")      # 这些参数值 = "取最新一次 run"
+
+
+def available_runids() -> list[str]:
+    ids = set()
+    for f in glob.glob(str(ROOT / "output" / "part4" / "part4_*_g5stab*.jsonl")):
+        m = PAT.search(Path(f).name)
+        if m:
+            ids.add(m.group("rid"))
+    return sorted(ids)
+
+
+def resolve_filter(arg: str | None) -> tuple[str | None, str]:
+    """把命令行参数解析成 (rid 过滤子串, 说明)。
+
+    **默认（无参数）与 `latest` 都只取最新一次 run**，绝不把多次 run 的分片混在一起：
+    分片名里的时间戳是 UTC 且等长，故字典序最大者即最新。
+    若显式给了子串，则按子串过滤（可匹配多个 run，会在说明里注明）。
+    """
+    ids = available_runids()
+    if not ids:
+        return None, "无"
+    if arg is None or arg.strip().lower() in LATEST:
+        return ids[-1], f"最新 run={ids[-1]}（可用：{', '.join(ids)}）"
+    hits = [i for i in ids if arg in i]
+    if not hits:
+        return arg, f"未匹配任何 run（可用：{', '.join(ids)}）"
+    return arg, f"子串过滤 {arg!r} -> {', '.join(hits)}"
 
 
 def load_cells(rid_filter: str | None):
@@ -74,12 +104,12 @@ def fmt(v, nd=2):
 
 
 def main() -> int:
-    rid = sys.argv[1] if len(sys.argv) > 1 else None
+    rid, note = resolve_filter(sys.argv[1] if len(sys.argv) > 1 else None)
     cells = load_cells(rid)
     if not cells:
-        print("未找到匹配的 g5stab 产物")
+        print(f"未找到匹配的 g5stab 产物（{note}）")
         return 2
-    print(f"[report] 共 {len(cells)} 个 cell（runid 过滤={rid or '最新全部'}）")
+    print(f"[report] 共 {len(cells)} 个 cell｜{note}")
 
     print("\n== [1] within-block（每 cell 每 block，measured reps）==")
     print("ctx    kv         mode     residency      blk n  dec_tok/s  min     max     MAD   IQR   rel%   peak_alloc")

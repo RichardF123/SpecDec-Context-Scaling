@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import tempfile
 import threading
 import time
@@ -447,6 +448,37 @@ def main() -> int:
               f"samples={len(s_bad.samples)} failures={s_bad.failures}")
     finally:
         D.system_snapshot = _real_snap
+
+    # ---- 13. 环境变量解析（回归：cmd 的 `set X=v & set Y=w` 会把尾随空格带进值里）
+    # 若不 strip，`m in MODES` 会静默丢掉 SpecDec ⇒ "跑完但条件不全"，属于最危险的一类错误。
+    _real_env = os.environ.get("P5_MODE")
+    try:
+        os.environ["P5_MODE"] = "AR,SpecDec "
+        check("⑲ _env_list 逐项 strip（'AR,SpecDec ' -> ['AR','SpecDec']）",
+              P._env_list("P5_MODE", "") == ["AR", "SpecDec"],
+              str(P._env_list("P5_MODE", "")))
+        check("⑲ 带尾随空格时 SpecDec **不会**被静默丢掉",
+              "SpecDec" in [m for m in S.MODE_CHOICES if m in P._env_list("P5_MODE", "")])
+        os.environ["P5_MODE"] = ", ,"
+        check("⑲ 全空白项被丢弃（解析为空列表，而不是 ['','']）",
+              P._env_list("P5_MODE", "AR") == [])
+    finally:
+        if _real_env is None:
+            os.environ.pop("P5_MODE", None)
+        else:
+            os.environ["P5_MODE"] = _real_env
+    # ⑳ 未知条件名 / 空列表 -> 硬错误（不静默少跑）
+    for bad_kw, name in ((dict(modes=["AR", "SpecEdc"]), "P5_MODE 拼写错误"),
+                         (dict(kvs=["base_bf16 "]), "P5_KV 未 strip 的余量"),
+                         (dict(ctypes=[2048, 16384]), "P5_CTX 未知长度"),
+                         (dict(modes=[]), "P5_MODE 解析为空（0 个条件的假成功）")):
+        try:
+            P.validate_requested(**bad_kw)
+            check(f"⑳ 非法配置必须报错（{name}）", False)
+        except SystemExit as e:
+            check(f"⑳ 非法配置必须报错（{name}）", "校验失败" in str(e))
+    P.validate_requested(ctypes=[2048, 8192], kvs=["base_bf16"], modes=["AR", "SpecDec"])
+    check("⑳ 合法配置不报错（缩小版复验的实际参数）", True)
 
     print(f"\nG5 schema 自测：PASS {len(PASS)} / FAIL {len(FAIL)}")
     if FAIL:

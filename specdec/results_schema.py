@@ -32,6 +32,8 @@ SCHEMA_VERSION = "g5-results-1.1"
 #   v1.0 行仍可由 build_g5_row() 只读映射，新字段一律 null + availability=false（**不猜**）。
 
 MODE_CHOICES = ("AR", "SpecDec")
+KV_CHOICES = ("base_bf16", "v_fp8")           # 冻结的两种 KV 口径
+CTX_CHOICES = (2048, 4096, 8192)              # 冻结的 12 条件 factorial 长度
 AR_RESIDENCY_CHOICES = ("target_only", "dual_control")
 PRIMARY_AR_RESIDENCY = "target_only"          # 正式主基线
 DIAGNOSTIC_AR_RESIDENCY = "dual_control"      # 诊断控制（不计入 factorial）
