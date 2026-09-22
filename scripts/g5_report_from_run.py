@@ -287,18 +287,30 @@ def main() -> int:
                 clk_ok = all(D.clock_stats(d["runs"]).get("stable") for d in recs.values())
                 bt = between.get((ctx, kv, mode, res), {})
                 rs = [r for d in recs.values() for r in d["runs"]]
-                ms = ("OK" if (rel <= REL_LIMIT and bt.get("flag", "ok") == "ok" and clk_ok)
-                      else ("ENV_INVALID" if not clk_ok else "CHECK"))
+                # **分层**（v1.2）：within-run 只看 rel，环境只看时钟，between-block 单列，
+                # 三者绝不混成一句"within-run CHECK"。
+                within = "OK" if rel <= REL_LIMIT else "CHECK"
+                env = "OK" if clk_ok else "ENV_INVALID"
+                bb = bt.get("flag", "").startswith("CHECK")
+                ms = ("ENV_INVALID" if env == "ENV_INVALID"
+                      else ("CHECK" if (within == "CHECK" or bb) else "OK"))
                 return dict(mode=mode, ar_residency=res, context_actual=ctx, target_kv=kv,
                             max_new_tokens=64,
                             input_token_hash=(rs[0].get("input_token_hash") if rs else None),
                             reps_measured=min(len(d["runs"]) for d in recs.values()),
                             reps_expected=5, execution_status="SUCCESS",
                             measurement_status=ms, tokens_finite=True, profile=None,
-                            condition_role="primary",
+                            condition_role=S.PRIMARY_ROLE,
+                            formal_factorial_member=True,
                             speedup_denominator_eligible=(mode == "AR"),
-                            between_block_check=(bt.get("flag", "").startswith("CHECK")),
+                            between_block_check=bb,
                             between_block_rel_diff_pct=bt.get("rel"),
+                            between_block_status=("CHECK" if bb else "OK"),
+                            between_block_check_reason=(
+                                f"between-block 相对差 {bt.get('rel'):.1f}% > {REL_LIMIT:g}%"
+                                if bb and isinstance(bt.get("rel"), (int, float)) else None),
+                            within_run_status=within,
+                            environment_status=env,
                             within_run_check_reason=(None if rel <= REL_LIMIT
                                                      else f"rel_spread={rel:.1f}%"),
                             decode_seconds=stat([r["t_decode_s"] for r in rs])["median"],

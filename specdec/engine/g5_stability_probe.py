@@ -135,6 +135,16 @@ def median_of(recs, key):
     return statistics.median(vals) if vals else None
 
 
+def median_of_pairs(runs: list[dict], key: str):
+    """rep 级字段的合并中位数（**与离线报表同一口径**：全部 measured rep 一起取中位数）。
+
+    注意**不要**用 `total - decode` 反推 prefill：中位数之差 ≠ 差的中位数（8K 实测差约 0.03 s）。
+    """
+    vals = [r.get(key) for r in runs
+            if isinstance(r.get(key), (int, float)) and r.get(key) == r.get(key)]
+    return statistics.median(vals) if vals else None
+
+
 def main() -> int:
     import argparse
     ap = argparse.ArgumentParser(description="G5 稳定性探针（含 P-state 门禁）")
@@ -257,8 +267,9 @@ def main() -> int:
         between[cell] = dict(rel=rel, ratio=lo / hi,
                              flag=(f"CHECK:between-block>{REL_LIMIT:g}%" if rel > REL_LIMIT else "ok"))
 
-    # ---------------- 写 G5 行（含状态分层 / P-state / between-block）----------------
-    print(f"\n[g5stab] 写出 G5 行 -> {out}", flush=True)
+    # ---------------- 生成 G5 行（先不写盘，等跨进程等价性填完再写）----------------
+    print(f"\n[g5stab] 生成 G5 行 -> {out}", flush=True)
+    pending: list[dict] = []            # [(row, summary, cell, block)]
     for cell, recs in per_cell.items():
         ctx, kv, mode, res = cell
         for rec in recs:
@@ -291,15 +302,18 @@ def main() -> int:
                            active_memory_clock_mhz=ps.get("mem_median"),
                            active_power_w=ps.get("power_median")))
             src = dict(rec["summary"], **{
-                "decode_tok_s": rec["decode"]["median"], "t_decode_s": rec["dec_s"]["median"],
-                "t_total_s": rec["tot_s"]["median"], "peak_alloc_GiB": rec["peak"]["median"],
-                "peak_resv_GiB": rec["resv"]["median"], "mode": mode, "ctx": ctx,
+                "kind": "summary",
+                "decode_tok_s_med": rec["decode"]["median"],
+                "t_decode_s_med": rec["dec_s"]["median"],
+                "t_total_s_med": rec["tot_s"]["median"],
+                "peak_alloc_GiB_med": rec["peak"]["median"],
+                "peak_resv_GiB_med": rec["resv"]["median"],
+                "mode": mode, "ctx": ctx,
                 "target_kv": kv, "warm": WARM, "chunk": CHUNK, "k": K_PROTOCOL,
                 "monitor_end": (rec["runs"][-1].get("monitor_end") if rec["runs"] else None),
                 "logits_finite": (all(bool(r.get("prefill_logits_finite")) for r in rec["runs"])
                                   if rec["runs"] else None),
-                "n_gen": (rec["runs"][-1].get("n_gen") if rec["runs"] else None),
-                "certified": (rec["summary"].get("certified") if rec["summary"] else None)})
+                "n_gen": (rec["runs"][-1].get("n_gen") if rec["runs"] else None)})
             if not rec["runs"]:
                 src["oom"] = True
             row = S.build_g5_row(src, meta)
@@ -307,7 +321,29 @@ def main() -> int:
                             f"role={rec['role']}; k={K_PROTOCOL}(冻结); cooldown={COOLDOWN}s; "
                             f"clk_stable={clk.get('stable')}; "
                             f"原 {os.path.basename(rec['jsonl'] or 'no-jsonl')}")
-            S.write_g5_run(out, row, append=True)
+            pending.append(dict(row=row, cell=cell, block=b, runs=rec["runs"]))
+
+    # ---------------- 跨进程等价性：**只能由父进程填**（子进程里 AR/SpecDec 不共存）----------------
+    eq = S.fill_cross_process_equality([p["row"] for p in pending])
+    print(f"\n[g5stab] 跨进程 AR↔SpecDec 等价性：已配对 {eq['pairs_compared']} 对，"
+          f"缺对照 {eq['pairs_missing']} 个", flush=True)
+    for d in eq["detail"]:
+        print(f"  key={d['key']} ar_equal={d['ar_equal']} available={d['available']} "
+              f"certified={d['certified']}  ({d['reason']})", flush=True)
+    if eq["pairs_missing"]:
+        print("  !! 有 SpecDec primary 行找不到同 block 的 AR target-only 对照"
+              "（ar_equal 保持 null，**不得**解释为 False）", flush=True)
+
+    # ---------------- 写盘（canonical 自洽校验不通过就拒绝写）----------------
+    row_by_cell_block = {(p["cell"], p["block"]): p["row"] for p in pending}
+    ref_of = {}
+    for key, row in row_by_cell_block.items():
+        cell, b = key
+        ctx, kv, mode, res = cell
+        if mode == "SpecDec" and res is None and row.get("condition_role") == S.PRIMARY_ROLE:
+            ref_of[key] = row_by_cell_block.get(((ctx, kv, "AR", S.PRIMARY_AR_RESIDENCY), b))
+    for p in pending:
+        S.write_g5_run(out, p["row"], append=True, ref_row=ref_of.get((p["cell"], p["block"])))
 
     # ---------------- 报表 ----------------
     def table(cells_list, title):
@@ -355,46 +391,37 @@ def main() -> int:
               f"power={pf.get('power_median')}) reason={pf.get('reason')}")
 
     print("\n== [B4] speedup = T_AR(target-only) / T_Spec（>1 = SpecDec 更快）==")
+    print("  **逐 block** 判定资格；点估计用**全部 measured rep 合并中位数**"
+          "（与离线报表 scripts/g5_report_from_run.py 同一口径）")
     for ctx in CTX:
         for kv in KVS:
             ar_c = (ctx, kv, "AR", S.PRIMARY_AR_RESIDENCY)
             sp_c = (ctx, kv, "SpecDec", None)
             if not per_cell.get(ar_c) or not per_cell.get(sp_c):
                 continue
-            bt_ar = between.get(ar_c, {}).get("flag", "")
-            bt_sp = between.get(sp_c, {}).get("flag", "")
-            ar_rec, sp_rec = per_cell[ar_c][0], per_cell[sp_c][0]
-            base = dict(context_actual=ctx, target_kv=kv, max_new_tokens=MAXNEW,
-                        input_token_hash=(ar_rec["runs"][0].get("input_token_hash")
-                                          if ar_rec["runs"] else None),
-                        reps_measured=min(len(ar_rec["runs"]), len(sp_rec["runs"])),
-                        reps_expected=REPS, tokens_finite=True, profile=None)
-            ar_row = dict(base, mode="AR", ar_residency=S.PRIMARY_AR_RESIDENCY,
-                          condition_role="primary", speedup_denominator_eligible=True,
-                          execution_status="SUCCESS",
-                          measurement_status=("CHECK" if "CHECK" in bt_ar else "OK"),
-                          between_block_check="CHECK" in bt_ar,
-                          between_block_rel_diff_pct=between.get(ar_c, {}).get("rel"),
-                          within_run_check_reason=ar_rec["summary"].get("spread_flag"),
-                          decode_seconds=median_of([r for r in per_cell[ar_c]], "dec_s"),
-                          total_seconds=median_of([r for r in per_cell[ar_c]], "tot_s"))
-            sp_row = dict(base, mode="SpecDec", ar_residency=None, condition_role="primary",
-                          speedup_denominator_eligible=False, execution_status="SUCCESS",
-                          measurement_status=("CHECK" if "CHECK" in bt_sp else "OK"),
-                          between_block_check="CHECK" in bt_sp,
-                          between_block_rel_diff_pct=between.get(sp_c, {}).get("rel"),
-                          within_run_check_reason=sp_rec["summary"].get("spread_flag"),
-                          decode_seconds=median_of([r for r in per_cell[sp_c]], "dec_s"),
-                          total_seconds=median_of([r for r in per_cell[sp_c]], "tot_s"))
-            if ar_rec["pstate"].get("qualified") is False:
-                ar_row["measurement_status"] = "ENV_INVALID"
-            if sp_rec["pstate"].get("qualified") is False:
-                sp_row["measurement_status"] = "ENV_INVALID"
-            su = S.compute_speedup(ar_row, sp_row, rel_limit=REL_LIMIT)
-            verdict = ("CLAIM ALLOWED（全部资格条件满足）" if su["speedup_claim_allowed"]
-                       else "；".join(su["speedup_claim_blockers"]))
-            print(f"  ctx={ctx:<5} {kv:<10} decode×{su['speedup_decode']:.3f} "
-                  f"e2e×{su['speedup_e2e']:.3f}  -> {verdict}")
+            ar_rows = [p["row"] for p in pending if p["cell"] == ar_c]
+            sp_rows = [p["row"] for p in pending if p["cell"] == sp_c]
+            ar_runs = [r for p in pending if p["cell"] == ar_c for r in p["runs"]]
+            sp_runs = [r for p in pending if p["cell"] == sp_c for r in p["runs"]]
+            pooled = None
+            if ar_runs and sp_runs:
+                pooled = dict(
+                    ar_decode=median_of_pairs(ar_runs, "t_decode_s"),
+                    spec_decode=median_of_pairs(sp_runs, "t_decode_s"),
+                    ar_total=median_of_pairs(ar_runs, "t_total_s"),
+                    spec_total=median_of_pairs(sp_runs, "t_total_s"))
+            su = S.speedup_claim_over_blocks(ar_rows, sp_rows, pooled_seconds=pooled,
+                                             rel_limit=REL_LIMIT)
+            per = "  ".join(
+                (f"blk{x['block_index']}:×{x['speedup_decode']:.3f}"
+                 if x.get("speedup_decode") is not None else f"blk{x['block_index']}:n/a")
+                for x in su["per_block"])
+            pd_, pe_ = su["pooled_decode"], su["pooled_e2e"]
+            verdict = ("**CLAIM ALLOWED**（全部资格条件满足）" if su["allowed"]
+                       else "；".join(su["blockers"]))
+            print(f"  ctx={ctx:<5} {kv:<10} {per}  | 合并 decode "
+                  f"{('×%.3f' % pd_) if pd_ is not None else 'n/a'}  e2e "
+                  f"{('×%.3f' % pe_) if pe_ is not None else 'n/a'}  -> {verdict}")
 
     print("\n== [B5] 不稳定 cell（原始数据保留、仍在完整结果表中、标 CHECK、不得作确定声明）==")
     n_bad = 0

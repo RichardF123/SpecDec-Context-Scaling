@@ -196,6 +196,11 @@ def order_stability(medians: dict, limit: float = REL_SPREAD_LIMIT) -> dict:
                 flag=(f"CHECK:between-order>{limit:g}%" if rel > limit else "ok"))
 
 
+def _append_reason(old: str | None, new: str) -> str:
+    """把两条原因用 '；' 拼起来，**不产生**以 ' | ' 开头的半截字符串。"""
+    return new if not old else f"{old}；{new}"
+
+
 def token_compare(ar: dict, spec: dict) -> dict:
     """比较 AR 与 SpecDec 的生成序列（可跨进程/跨条件）。
 
@@ -245,16 +250,47 @@ def token_compare(ar: dict, spec: dict) -> dict:
                     break
             else:
                 out["first_diff_index"] = min(len(a_ids), len(s_ids))
-                out["certified_reason"] = (out["certified_reason"] or "") + \
-                    " | 前缀相同但长度不同"
+                out["certified_reason"] = _append_reason(out["certified_reason"], "前缀相同但长度不同")
         else:
-            out["certified_reason"] = (out["certified_reason"] or "") + \
-                " | 缺 generated_token_ids，无法给出 first_diff_index"
+            # **不再**拼接出以 " | " 开头的半截字符串（旧版会写出 certified_reason=' | 缺 ...'）
+            missing = [n for n, v in (("generated_token_ids(AR)", a_ids),
+                                      ("generated_token_ids(SpecDec)", s_ids)) if v is None]
+            out["certified_reason"] = _append_reason(
+                out["certified_reason"], "缺 " + "、".join(missing) + "，无法给出 first_diff_index")
     return out
 
 
+NO_REF_REASON = ("本进程未运行同档 AR 对照（一条件一进程，AR/SpecDec 不共存）"
+                 "=> 由父进程跨进程比较填入")
+
+
+def in_process_equality(ref_gen: dict, ctx: int, kv: str, runs: list[dict], eos,
+                        max_new: int | None = None) -> dict:
+    """**进程内** AR↔SpecDec 等价性判定（可单独测试的接缝）。
+
+    铁律：`ref_gen` 里没有同档 AR 序列时**不得判定**，返回
+    `ar_equal=None / ar_equal_available=False`（"没比过" ≠ "不相等"）。
+    2026-09-22 的事故就是这里退化成"拿空序列的 hash 去比"，凭空写出 `ar_equal=False, certified=True`。
+    """
+    ref = ref_gen.get((ctx, kv))
+    if ref is None:
+        return dict(ar_equal=None, ar_equal_available=False, certified=False,
+                    certified_reason=NO_REF_REASON, equality_source=None,
+                    first_diff_index=None)
+    base = dict(ctx=ctx, target_kv=kv, max_new=(MAXNEW if max_new is None else max_new),
+                eos_id=eos,
+                input_token_hash=(runs[0].get("input_token_hash") if runs else None))
+    c = token_compare(
+        dict(base, n_generated=len(ref), generated_token_hash=gen_sha1(ref),
+             generated_token_ids=ref),
+        dict(base, n_generated=(runs[0]["n_gen"] if runs else None),
+             generated_token_hash=(runs[0].get("generated_token_hash") if runs else None),
+             generated_token_ids=(runs[0].get("generated_token_ids") if runs else None)))
+    c["equality_source"] = "in_process"
+    return c
+
+
 def compare_across_conditions(rows: list[dict]) -> dict:
-    """按 (ctx, kv, order) 把 AR 与 SpecDec 配对（跨进程）；只取每条件首个 rep。"""
     idx = {}
     for r in rows:
         key = (r.get("ctx"), r.get("target_kv"), r.get("order"), r.get("mode"))
@@ -828,21 +864,23 @@ def main() -> int:
             summary[(ctx, kv, mode)] = s
             if mode == "AR":
                 ref_gen[(ctx, kv)] = runs[0]["gen"]
-            if only is None and mode == "SpecDec":     # 同进程内才有 AR 对照可判
-                base = dict(ctx=ctx, target_kv=kv, max_new=MAXNEW, eos_id=eos,
-                            input_token_hash=runs[0].get("input_token_hash"))
-                c = token_compare(
-                    dict(base, n_generated=len(ref_gen.get((ctx, kv), [])),
-                         generated_token_hash=gen_sha1(ref_gen.get((ctx, kv), [])),
-                         generated_token_ids=ref_gen.get((ctx, kv))),
-                    dict(base, n_generated=runs[0]["n_gen"],
-                         generated_token_hash=runs[0].get("generated_token_hash"),
-                         generated_token_ids=runs[0].get("generated_token_ids")))
-                s["ar_equal"] = c["ar_equal"]
-                s["ar_equal_available"] = c["ar_equal_available"]
-                s["certified"] = c["certified"]
-                s["certified_reason"] = c["certified_reason"]
-                s["ar_equal_source"] = "同进程 token_compare"
+            if mode == "SpecDec":
+                # **只有本进程真的跑过同档 AR，才有资格在进程内判定**。
+                # 旧版判断条件是 `only is None and mode == "SpecDec"`，但驱动器按"一条件一进程"
+                # 启动时只会给单一 P4_MODE（AR 与 SpecDec 从不在同一进程），于是 ref_gen 为空，
+                # 却仍然拿 `gen_sha1([])` 去比 —— 得出 `ar_equal=False` 且 `certified=True`
+                # 的**凭空否定**结论（2026-09-22 的 canonical 就是这样错的）。
+                eq = in_process_equality(ref_gen, ctx, kv, runs, eos, max_new=MAXNEW)
+                s["ar_equal"] = eq["ar_equal"]
+                s["ar_equal_available"] = eq["ar_equal_available"]
+                s["certified"] = eq["certified"]
+                s["certified_reason"] = eq["certified_reason"]
+                if eq.get("equality_source"):
+                    s["equality_source"] = eq["equality_source"]
+                    s["ar_equal_source"] = "同进程 token_compare"
+                else:
+                    # 显式说明"本进程没有对照"，避免下游把 null 当成"没测"或"不等"
+                    s["ar_equal_source"] = "无（本进程无 AR 对照）"
             print(f"  [{tag}] pref={s['t_prefill_s_med']:.2f}s "
                   f"dec={s['t_decode_s_med']:.2f}s[{s['t_decode_s_min']:.2f}.."
                   f"{s['t_decode_s_max']:.2f}] rel%="

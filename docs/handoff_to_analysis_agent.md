@@ -10,13 +10,14 @@
 ## 0. 一句话现状
 
 自研 Qwen2 推理引擎（含 Asymmetric V-only FP8 KV）与贪心投机解码实现**正确性已闭环**
-（FP32 逐 token 等价 20/20；索引语义经哨兵 + 真实模型 + 端到端三方验证）；
-**但性能结论仍是"负 + 不稳定"**：SpecDec 比 AR 慢 3–4 倍、V-FP8 无可复现速度优势、
-计时受显存饱和、启动顺序与 **GPU P-state 漂移**支配。G5 测量协议与 schema 已升级到
-`g5-results-1.1`（状态分层 + P-state 预检 + 10 条 speedup 声明规则）并通过 **92 项 CPU 自测**。
-**第 1 次稳定性探针已运行，但环境不合格（SM 时钟 435–2535 MHz）⇒ 全部单元格仅作环境诊断证据、
-不得用于正式速度声明**；**P-state 预检工具已实机修复并 QUALIFIED（2026-09-22T03:58:05Z）**；
-成本分解 / k 扫描**仍未运行** ⇒ **正式 Pilot 仍被禁止**。
+（FP32 逐 token 等价 20/20；索引语义经哨兵 + 真实模型 + 端到端三方验证）。
+**性能结论已从"负 + 不稳定"收敛为"可分的两部分"**：
+- **2K base_bf16 已可声明**：decode **0.406×**、e2e **0.434×**（`CLAIM ALLOWED`，缩小版口径）；
+- **8K base_bf16 只能记录方向**：AR target-only 极稳（0.6%），但 **SpecDec 跨 block 差 42.7%**
+  ⇒ 在原因定位前**不得声明 8K 的正式倍数**。
+G5 协议与 schema 已升级到 **`g5-results-1.2`**（状态分层 + P-state 门禁 + 跨进程等价性 +
+canonical 自洽校验），CPU 自测 **151/151 + 68/68**。
+**下一步唯一动作：跑 `g5_8k_spec_variance_probe` 定位 8K 双档；正式 Pilot 仍被禁止。**
 
 ---
 
@@ -64,10 +65,13 @@ Report & Presentation 15% / Creativity 10%。截止：提案 **10/7**、演示 W
 | Part 4 正确性归因 | **CLOSED** | 三条件 = `BF16_NEAR_TIE`，`off_by_one=False` |
 | **AR 正式基线（target-only）** | **口径已生效，第 1 次数据 ENV_INVALID** | §1 表；历史 AR 数据是 `AR-dual-resident exploratory`，**不能当正式分母**；新探针已实测 target-only 可运行（`resident_models=['target']`，`weights_resident≈2.88 GiB`） |
 | Part 4 性能数据 | **VALID EXPLORATORY DATA / INELIGIBLE FOR FORMAL SPEEDUP TABLE** | 两个原因：① AR 是双驻留口径，不符合正式主基线；② 8K 显存饱和 + between-block 28.9% 不稳定。**数据有效（它证明显存饱和与顺序敏感），只是不符合正式主基线口径** |
-| G5 schema / 协议 | **已冻结（v1.1）** | `docs/g5_measurement_protocol.md` §7b；`results_schema.py`（**92 项** CPU 自测 PASS） |
-| GPU P-state 预检 | **PASS（2026-09-22T03:58:05Z 实测 QUALIFIED）** | `specdec/engine/gpu_pstate_preflight.py`；ledger §4.12；阈值 `SM≥2000 MHz`、`mem≥7500 MHz`、负载期采样 5 s（idle 仅记录不判定）。**注意：预检通过只代表当下合格，长实验中仍靠 block 级复检** |
+| G5 schema / 协议 | **已冻结（v1.2）** | `docs/g5_measurement_protocol.md` §7b/§7c；`results_schema.py`（**151 项** CPU 自测 PASS；part4 68 项） |
+| GPU P-state 预检 | **PASS（2026-09-22 两次实测 QUALIFIED）** | `specdec/engine/gpu_pstate_preflight.py`；ledger §4.12；阈值 `SM≥2000 MHz`、`mem≥7500 MHz`、负载期采样 5 s（idle 仅记录不判定）。**预检通过只代表当下合格，长实验中仍靠 block 级复检** |
 | G5 稳定性探针（第 1 次） | **ENV_INVALID（7/12 条件 between-block >20%）** | ledger §4.11；`output/g5/g5_g5-results-1.1_5dc7b5eeacd1_g5stab_20260921T090033Z.jsonl` + 24 个 part4 分片 |
-| G5 成本分解 / k 扫描 | **未运行** | ledger §4.8.4（**必须在环境 Gate 通过后才可开跑**） |
+| **G5 缩小版（`g5stab_20260922T040625Z`）** | **P-state PASS；2K `CLAIM ALLOWED`；8K SpecDec `between-block CHECK`** | ledger §4.14；1.2 canonical `g5_g5-results-1.2_re44bd9ca4bb_g5stab_20260922T040625Z.jsonl` |
+| canonical 记账（映射/等价性/分层/声明纪律） | **PASS（写盘前强制校验）** | ledger §4.14⑤；协议 §7c |
+| **8K SpecDec 速度双档原因** | **未定位（唯一未闭环项）** | 下一步 `g5_8k_spec_variance_probe` |
+| G5 成本分解 / k 扫描 | **未运行** | ledger §4.8.4（**必须在环境 Gate 与 8K 定位之后**） |
 | 正式 Pilot / Final | **禁止** | 见 §9 |
 
 ---
@@ -118,9 +122,11 @@ Report & Presentation 15% / Creativity 10%。截止：提案 **10/7**、演示 W
 | `g5_stability_probe.py` | Task B：12 条件 × 2 随机 block（warm-up 1 + 5 rep、cooldown 不计时）；**每 block 前置 P-state 预检（不合格则跳过该 block）**、每 cell 事后 P-state 审计、状态分层传播、between-block 在全部 block 结束后计算、G5 行在最后统一落盘 | **已运行 1 次（ENV_INVALID）** |
 | `g5_cost_breakdown.py` | Task C：SpecDec/AR 阶段分解（外部 CUDA Event，不改冻结文件）；AR 主基线先以 target-only 跑完 | **未运行（等环境 Gate）** |
 | `g5_k_sweep.py` | Task D：k∈{1,2,4,8} 诊断扫描（只出建议）；每 ctx 一个 target-only AR 分母 | **未运行（等环境 Gate）** |
-| `g5_schema_selftest_cpu.py` / `g4_part4_selftest_cpu.py` | CPU 自测 **92/92** / **62/62** | 已运行 |
-| `scripts/g5_report_from_run.py` | **只读离线报表**：within-block / between-block / speedup / 遥测 / 时钟-吞吐对照 / 时钟匹配 speedup / **[8] 声明门控（打印 `NO CLAIM：<原因>`）**；**无参数或 `latest` = 只取最新一次 run**（不混多次 run） | 已运行（第 1 次探针数据，`[8]` 6/6 对全部 NO CLAIM） |
-| `scripts/run_g5_reduced.cmd` | **一键缩小版复验**：预检 → 干跑 → 复验 → 离线报表；用 `set "VAR=value"` 避免尾随空格污染条件名 | **已干跑验证（4 primary × 2 block 计划正确）** |
+| `g5_8k_spec_variance_probe.py` | **8K SpecDec 跨进程速度双档专项定位**：role×procs 个独立进程（spec / ar_target / ar_dual），每进程先跑**无插桩正式 pass**、再跑**单独插桩 pass**；阶段= draft 提议/块验证/修复步×2/cache 裁剪/kv_cat/残差；含 allocator 段状态、`inactive_split`、allocation retries、`mem_get_info`、**尽力**采集 WDDM/共享显存计数器 | **已实现并干跑，未运行** |
+| `g5_schema_selftest_cpu.py` / `g4_part4_selftest_cpu.py` | CPU 自测 **151/151** / **68/68** | 已运行 |
+| `scripts/g5_report_from_run.py` | **只读离线报表**：within-block / between-block / speedup / 遥测 / 时钟-吞吐对照 / 时钟匹配 speedup / **[8] 声明门控（打印 `NO CLAIM：<原因>`）**；**无参数或 `latest` = 只取最新一次 run**（不混多次 run） | 已运行（`[8]`：2K CLAIM ALLOWED / 8K NO CLAIM） |
+| `scripts/g5_recanonicalize_run.py` | **只读分片重建 canonical**（修正映射后重新记账；**不重新测量**；不覆盖旧文件） | 已运行（生成 1.2 canonical） |
+| `scripts/run_g5_reduced.cmd` | **一键缩小版复验**：预检 → 干跑 → 复验 → 离线报表；用 `set "VAR=value"` 避免尾随空格污染条件名 | **已干跑验证** |
 
 ---
 
@@ -135,6 +141,9 @@ Report & Presentation 15% / Creativity 10%。截止：提案 **10/7**、演示 W
 | `output/g5/g5_g5-results-1.1_5dc7b5eeacd1_g5stab_20260921T090033Z.jsonl` | **第 1 次稳定性探针**：12 primary 条件 × 2 随机 block 的 G5 行（97557 B） | **受保护**；`ENV_INVALID`，仅作环境诊断证据（§6.16–6.20） |
 | `output/part4/part4_*_g5stab_b[01]_c*_pri_*.jsonl`（24 文件） | 上述探针的每条件原始分片（每 cell 独立子进程，含 token 哈希与 P-state 字段） | **受保护**；离线报表 `scripts/g5_report_from_run.py` 的输入 |
 | `output/g5/pstate_preflight_pstate_20260922T035805Z.json` | **环境预检结果**（2227 B）：负载期 SM median 2355 / mem 8000 MHz、89.58 W、82 °C、verdict **QUALIFIED** | **受保护**；**是环境证据，不是性能数据**（§6.22） |
+| `output/g5/g5_g5-results-1.1_0e4ed83b6fb3_g5stab_20260922T040625Z.jsonl`（58009 B） | 缩小版 run 的 **1.1 版 canonical（含 4 类错记）** | **受保护 / 保留作审计证据**；sha256 `10045ba8331afe...` |
+| `output/g5/g5_g5-results-1.2_re44bd9ca4bb_g5stab_20260922T040625Z.jsonl`（61448 B） | 同一批测量的 **1.2 版 canonical（修正后重建）** | 由只读分片重建；**未重新测量** |
+| `output/part4/part4_*_g5stab_20260922T040625Z_*.jsonl`（12 文件） | 缩小版 run 的原始分片（6 条件 × 2 block） | **受保护** |
 | `docs/data_ledger.md` | **唯一数据台账**：§3.4 G1、§3.5.x FP8 KV、§4.5.x G2/B3/B4/B5/B6、§4.6 Part 4、§4.7 索引语义与 B6 复跑、§4.8 G5 | —— |
 | `docs/g5_measurement_protocol.md` | G5 测量协议冻结 v1 | —— |
 | `docs/plan_v7_1_protocol_freeze.md` | 实验协议 v7.1 + **Amendment v7.2**（Compute=BF16、KV 因子、12 conditions） | 权威 |
@@ -198,6 +207,31 @@ Report & Presentation 15% / Creativity 10%。截止：提案 **10/7**、演示 W
     加载 5.63 s 后负载期 SM **median 2355**、mem **8000** MHz、**89.58 W**、**82 °C** ⇒ **QUALIFIED**，退出码 0。
     **这是环境证据，不是性能数据**（`matmul_per_s` 不得引用为吞吐）。
 
+**G5 缩小版 run（`g5stab_20260922T040625Z`；2 长度 × 1 KV × 2 模式 + dual 控制 × 2 block）**
+23. **P-state 已修复**：正式条件运行期间 SM **2490–2520 MHz**、mem **8000 MHz**、`pstate_ok=true`；
+    第 1 次的 480–1300 MHz / 6000 MHz **未复现**；温度 ≈82 °C、功耗 68–70 W。
+24. **2K base_bf16（可声明）**：
+    AR target-only decode **33.04 / 29.69** tok/s（between-block **10.1%**）；
+    SpecDec **13.26 / 12.79** tok/s（**3.5%**）⇒
+    `decode speedup 0.406×`、`e2e speedup 0.434×`、**`speedup_claim_allowed=true`**
+    （SpecDec decode 慢 **2.46×**、端到端慢 **2.30×**，合并全 rep 中位数口径）。
+    **这是缩小版 stability probe，不是 16-family 正式矩阵。**
+25. **8K base_bf16（只说方向，不声明倍数）**：AR target-only **29.33 / 29.51** tok/s（**0.6%**，极稳）；
+    SpecDec **9.53 / 5.46** tok/s（**42.7% ⇒ CHECK**）。合并口径 decode ×0.236、e2e ×0.136，
+    **该比值未通过稳定性 Gate，禁止写成"8K 正式 speedup"**。
+26. **8K 波动的排除项（实测）**：两 block 的 SM 2520 MHz / mem 8000 MHz / ≈82 °C / 68–70 W
+    **完全相同**；prefill **31.958 vs 32.000 s**（几乎相同）；SpecDec within-run **1.9% / 2.0%（OK）**；
+    ⇒ **不是**低功耗 P-state、**不是**热降频、**不是** prefill 波动、**不是** token 随机性。
+    只有 decode **6.72 s → 11.72 s**。**原因尚未定位**。
+27. **residency 效应（支持"正式 AR 必须 target-only"）**：2K 时 dual-control 与 target-only 接近
+    （30.4–32.0 vs 29.7–33.0 tok/s）；**8K 时 dual-control 仅 23.1 tok/s vs target-only 29.4** ⇒
+    仅多驻留 draft 就让 8K AR decode 慢 **≈21%**（`residency_penalty ≈ 0.79`）。
+    dual-control **只作显存压力诊断**、**永不作分母**。
+28. **canonical 记账已修正（1.1 → 1.2）**：见 §2 表与协议 §7c。1.1 的 4 类错记中，
+    最严重的是**跨进程等价性凭空判否**——8192 两侧 `generated_token_hash` 都是
+    `610d0002bdfdcb37`，1.1 却写 `ar_equal=False, certified=True`；2.0/1.2 修正后为
+    **8192 `ar_equal=True`**、**2048 `ar_equal=False`（`first_diff_index=34`，与已知 BF16 near-tie 一致）**。
+
 ---
 
 ## 7. 推断（方向可信，机制未隔离）
@@ -212,16 +246,17 @@ Report & Presentation 15% / Creativity 10%。截止：提案 **10/7**、演示 W
 
 ## 8. 未验证 / 未运行（**明确清单，不得填预期值**）
 
-1. `g5_stability_probe`：**第 1 次已运行但环境不合格**（7/12 条件 between-block >20%，SM 435–2535 MHz）
-   ⇒ 需要**在合格 P-state 下重跑**才能得到可入表的稳定性判定；2048/4096 首次测得（探针里），但不合格。
+1. `g5_stability_probe` 全量 12 条件：第 1 次 ENV_INVALID；缩小版（2 长度 × 1 KV）已通过 P-state，
+   但**全量 12 条件仍未在合格环境下跑过**；2048 base_bf16 已有可声明数据。
 2. `g5_cost_breakdown`：阶段单价（draft 提议 / 块验证 / 修复步 / cache 裁剪 / KV cat / control）与闭合残差。
 3. `g5_k_sweep`：k∈{1,2,4,8} 的 acceptance/tok-per-round/rounds/decode/peak。
 4. 生成口径的质量对照（base vs v_fp8 的输出一致率 / NLL）——目前质量证据是**离线 teacher-forcing**（G3）。
 5. 16 个 prompt family 的正式运行（manifest 是**草案**，4 项待定稿）。
 6. G5 的 ≥16 families × 12 conditions × ≥5 reps 正式矩阵。
 7. `input_token_hash` 认证：8K 隔离 run 早于该字段加入 ⇒ `certified=false`（新 run 自动带上）。
-8. **合格 P-state 下的正式 speedup 数值本身尚未存在**：目前所有 speedup 数字要么口径不符（双驻留 AR），
-   要么环境不合格（ENV_INVALID）⇒ §6.21 只能表述为"时钟匹配子集下仍 <1"，**不能**给出 RQ1 的区间结论。
+8. **8K SpecDec 速度双档的原因**：唯一未闭环的性能问题；`g5_8k_spec_variance_probe` 已就绪但**未运行**。
+   在它给出阶段级证据前，**不得**把原因写成 WDDM paging / allocator / cache 增长中的任一项。
+9. V-FP8 在缩小版里**未测**（`P5_KV=base_bf16`），RQ3 目前仍无新证据。
 
 ---
 
@@ -229,13 +264,14 @@ Report & Presentation 15% / Creativity 10%。截止：提案 **10/7**、演示 W
 
 | # | 阻塞项 | 最小解法 | 命令（**GPU，需人运行**） |
 |---|---|---|---|
-| **0** | ~~GPU 掉进低功耗 P-state~~ → **已定位并已具备门禁工具**（实测 SM 435–2535 MHz，低频 block 吞吐仅为高频的 1/2.9）⇒ 整批计时必须带 P-state 资格 | 已解决：预检工具 + block 级复检；**跑前必须预检通过** | `python -m specdec.engine.gpu_pstate_preflight`（**当前状态 QUALIFIED**） |
-| 1 | 正式 AR 主基线（target-only）尚无**合格**数据（口径已生效，但第 1 次运行环境不合格） | 预检通过后跑缩小版稳定性复验 | 见 §12 |
-| 2 | 跨顺序不稳定未量化到 12 条件 | 随机化 2 block 探针（可选加 6 个 dual control） | 同上 |
-| 3 | "为什么慢"缺阶段归因 | 阶段成本分解（**必须在环境 Gate 通过后**才做） | `python -m specdec.engine.g5_cost_breakdown` |
-| 4 | 8K 显存饱和的**协议级处置**未决 | 人工决策 | —— |
-| 5 | k 的收益曲线未知 | k 扫描（**同样需环境 Gate 先通过**） | `python -m specdec.engine.g5_k_sweep` |
-| 6 | family manifest 待定稿 | 人工定稿 | —— |
+| **0** | **8K SpecDec 在同频率下出现两个稳定速度档（42.7%）**，原因未定位 | 跑专项探针得到阶段级证据 | `python -m specdec.engine.g5_8k_spec_variance_probe`（先加 `--dry-run` 看计划） |
+| 1 | ~~GPU 掉进低功耗 P-state~~ | **已解决**：预检工具 + block 级复检；缩小版运行已实测满频 | `python -m specdec.engine.gpu_pstate_preflight`（当前 QUALIFIED） |
+| 2 | ~~正式 AR 主基线无合格数据~~ | **2K 已有 `CLAIM ALLOWED`**；8K 待双档定位后重跑 | 见 §12 |
+| 3 | V-FP8 在缩小版里未测（RQ3 无新证据） | 环境稳定后把 `P5_KV` 扩到 `base_bf16,v_fp8` | 见 §12 |
+| 4 | "为什么慢"缺阶段归因 | 阶段成本分解（**必须在 8K 定位与环境 Gate 之后**） | `python -m specdec.engine.g5_cost_breakdown` |
+| 5 | 8K 显存饱和的**协议级处置**未决 | 人工决策（是否把 8K 降级为受限条件） | —— |
+| 6 | k 的收益曲线未知 | k 扫描（**同样需环境 Gate 先通过**） | `python -m specdec.engine.g5_k_sweep` |
+| 7 | family manifest 待定稿 | 人工定稿 | —— |
 
 ---
 
@@ -285,38 +321,43 @@ b2ec86e  docs: 19-page PDF explaining speculative decoding + md source + generat
 ## 12. 给分析 Agent 的下一步（推荐顺序）
 
 **A. 先拿数据（人运行 GPU，串行）**
-0. **`scripts\run_g5_reduced.cmd`**（推荐；等价于下面 1–2 步，且不会写错环境变量）
-   或手动：`python -m specdec.engine.gpu_pstate_preflight`，
+0. `python -m specdec.engine.gpu_pstate_preflight`（<1 min）→ 退出码 0 才继续；
    非 0 先插电/切高性能电源方案/关掉占显存程序，**不要在未通过时开跑计时实验**；
-1. 用**带引号**的形式设置（`set "P5_CTX=2048,8192"` 逐行一条，**不要**用 `&` 串联——
-   `&` 前的空格会被并进变量值，导致条件名匹配不上而**静默少跑**）：
-   `P5_CTX=2048,8192`、`P5_KV=base_bf16`、`P5_MODE=AR,SpecDec`、`P5_BLOCKS=2` 的**缩小版复验**
-   （`python -m specdec.engine.g5_stability_probe`，约 8–12 min；先加 `--dry-run` 看一眼计划）
-   → 验证 P-state 是否已稳定；
-2. 全量 `python -m specdec.engine.g5_stability_probe`（12 条件 × 2 block，25–40 min）→ 量化 within-run 与 between-block；
-3. `python -m specdec.engine.g5_cost_breakdown`（5–15 min）→ 阶段归因，解释 12 AR 步/轮的构成；
-4. `python -m specdec.engine.g5_k_sweep`（20–40 min）→ k 曲线（若某 k 明显更好，**只提交修正建议**）。
+1. **`python -m specdec.engine.g5_8k_spec_variance_probe --dry-run`** 看计划（不跑 GPU 条件），
+   然后 `python -m specdec.engine.g5_8k_spec_variance_probe`
+   （**约 60–90 min**；12 个独立进程 = 3 角色 × 4；先缩小可设 `P5V_PROCS=3 P5V_REPS=3` ≈ 30 min）
+   → 回答 8K 双档是否存在、集中在哪个阶段、与哪个状态量同步；
+   **这是当前唯一优先级最高的实验**（8K 不闭环就不该恢复完整矩阵）；
+2. 8K 结论到手后，再决定 8K 是否进正式 factorial；若结论是"实现开销主导"，
+   必须先走协议 amendment + 重跑 B5/B6/B6-fp32，才能改实现；
+3. 全量 `python -m specdec.engine.g5_stability_probe`（12 条件 × 2 block，25–40 min；
+   先加 `--dry-run`）→ 量化 within-run 与 between-block；
+4. `python -m specdec.engine.g5_cost_breakdown`（5–15 min）→ 阶段归因，解释 12 AR 步/轮的构成；
+5. `python -m specdec.engine.g5_k_sweep`（20–40 min）→ k 曲线（若某 k 明显更好，**只提交修正建议**）。
 
-**A'. 报表（可在任意时刻离线跑，不需要 GPU）**
-- `python scripts/g5_report_from_run.py latest` → 打印 `[8]` 声明门控；出现 `NO CLAIM：<原因>` 即代表该条件**不得**进正式主表。
+**A'. 离线工具（不需要 GPU，只读）**
+- `python scripts/g5_report_from_run.py latest` → 报表 + `[8]` 声明门控（`NO CLAIM：<原因>`）；
+- `python scripts/g5_recanonicalize_run.py --run-id <stamp> [--dry-run]` → 用修正后的映射**重建** canonical
+  （只读分片、不重新测量、不覆盖旧文件）。
 
 **B. 拿到数据后分析 Agent 应产出**
 - 稳定性判定：哪些条件可入正式主表、哪些必须标 `CHECK`、哪些是 `ENV_INVALID`；
-  **规则是分层的**（`execution_status` vs `measurement_status`），`exit=0` **不等于**测量有效；
-  声明门控的 10 条规则见 `docs/g5_measurement_protocol.md` §7b，**不得为了"能出数"而放宽**；
+  **规则是分层的**（§7c.3：within_run / between_block / environment 三层 + 最坏值），
+  `exit=0` **不等于**测量有效；声明门控见 `docs/g5_measurement_protocol.md` §7b/§7c，**不得为了"能出数"而放宽**；
+- 8K 双档的阶段归因（**只按探针实测证据归因**，不得先验地写 WDDM paging）；
 - 成本方程：把 `SpecDec/AR < 1` 分解为 draft 提议 / 块验证 / 修复 / cache / control 的贡献比；
 - 8K 饱和的可执行处置建议（含"是否把 8K 从正式 factorial 降级为受限条件"的权衡）；
 - 若结论为"实现开销主导"⇒ 提出**最小改动**的实现优化提案（例如 KV 增长方式、chunk/并发），
   但**必须走协议 amendment + 重跑 B5/B6/B6-fp32** 才能生效。
 
 **C. 禁止**
+- **在 8K 波动未解释前启动完整 12-cell stability**；**在 canonical 记账未修正前启动正式 Pilot**（记账已修正 ⇒ 本条已解除）；
 - **在环境 Gate（`gpu_pstate_preflight`）未通过时开跑 cost breakdown / k sweep / Pilot**；
-- **在看到结果后调整 P-state 阈值**（`SM≥2000`、`mem≥7500`）或 20% 稳定性规则——任何改动必须**事先**登记为协议 amendment；
-- **删除慢 run**（低频数据是 P-state 结论的证据，必须保留）；
+- **在看到结果后调整 P-state 阈值**（`SM≥2000`、`mem≥7500`）、20% 稳定性规则或双档检出阈值（`P5V_BIMODAL_RATIO`）——任何改动必须**事先**登记；
+- **删除慢 run / 只保留 8K 快档**；
+- 把 dual-control 当正式 AR 分母；把 profiling 数字当正式吞吐；
 - 在 §9.1–9.2 数据到手前启动 ≥16 families × 12 conditions；
-- 为获得加速而改 prompt / 计时边界 / 删除慢 run / 换 dtype / 改 AR 驻留条件；
-- 修改 `spec_dec.py` / `spec_cache.py`（除新的、独立且可复现的失败证据）；
-- 把 exploratory 数据混入正式主表；把 profiling 数字当正式吞吐。
+- 修改 `spec_dec.py` / `spec_cache.py` / V-only FP8 设计 / 正式 BF16·模型·k=4（除新的、独立且可复现的失败证据）。
 
 ---
 
@@ -330,5 +371,21 @@ b2ec86e  docs: 19-page PDF explaining speculative decoding + md source + generat
    `peak_reserved_gib`（分配器池，含空闲块与虚拟预留，**≠物理占用**）/ `nvidia_smi_used_mib`（物理，辅助）。
 4. **`BF16_NEAR_TIE` 四条证据（全部满足才允许）**：结构化不变量通过；`off_by_one=False`；
    同位置明显比相邻位置更近；`|fp32 margin| ≤` 现场 bf16 形状噪声。不满足 ⇒ `NEEDS_INSPECTION`。
-5. **exploratory vs formal**：`g5_stability_probe` / `g5_cost_breakdown` / `g5_k_sweep` / 两次 Part 4 exploratory
-   run 均为 exploratory，**不入正式主表**；正式 = ≥16 families × 12 conditions × ≥5 reps。
+5. **exploratory vs formal**：`g5_stability_probe` / `g5_cost_breakdown` / `g5_k_sweep` /
+   `g5_8k_spec_variance_probe` / 两次 Part 4 exploratory run 均为 exploratory，**不入正式主表**；
+   正式 = ≥16 families × 12 conditions × ≥5 reps。
+6. **canonical（canonical JSONL）** = `output/g5/g5_<schema>_<hash>_<run_id>.jsonl`，
+   每 `(条件, block)` 一行，是**唯一的正式结果表**；`status` 是兼容别名，
+   判定一律看 `execution_status` / `measurement_status` / 三层状态字段。
+7. **三层测量状态**：`within_run_status`（同进程 reps）/ `between_block_status`（两随机 block）/
+   `environment_status`（P-state）；`measurement_status` = 三者最坏值。
+   **原因字段分层存放**，不得混用（§7c.3）。
+8. **跨进程等价性**：`ar_equal` 由**父进程**按 key `(block, ctx, KV, input_token_hash, max_new)`
+   比较 `AR target_only primary` ↔ `SpecDec primary` 得出；`ar_equal_available` = 是否有对照；
+   `ar_equal_certified` = 认证前提是否齐全。**缺对照写 null，绝不写 false**（§7c.2）。
+9. **speedup 点估计口径**：**全部 measured rep 合并中位数**再相除；
+   声明资格要求**每个配对 block 都合格**（§7c.6）。
+10. **`residency_penalty`** = `T_AR_target_only / T_AR_dual`；`<1` ⇒ 仅多驻留一个模型就拖慢了 AR。
+    8K 实测 ≈ **0.79**（dual 比 target-only 慢 ≈21%）。
+11. **重新记账 vs 重新测量**：`scripts/g5_recanonicalize_run.py` 只重算映射/分类，
+    **不使用任何新测量**；旧 canonical 一律保留。

@@ -59,10 +59,16 @@ def main() -> int:
           all(k in row for k in S.FIELDS), str([k for k in S.FIELDS if k not in row][:5]))
     check("schema_version 正确", row["schema_version"] == S.SCHEMA_VERSION)
     check("校验通过（真实映射行）", S.validate_row(row) == [], str(S.validate_row(row)[:3]))
+    # v1.2：availability 由**值**重算（值的纯函数），因此 finalize 后不可能出现
+    # "null 但 availability=true"；该矛盾仍必须被 validate_row 抓住（用于读盘/离线构造的行）。
     bad = S.finalize_row({"schema_version": S.SCHEMA_VERSION, "decode_seconds": None,
                           "availability": {"decode_seconds": True}})
+    check("finalize 由值重算 availability（null -> false，不保留调用方的 true）",
+          bad["availability"]["decode_seconds"] is False)
+    hand = dict(S.finalize_row({"schema_version": S.SCHEMA_VERSION, "decode_seconds": 1.0}))
+    hand["decode_seconds"] = None            # 手工制造矛盾（未经 finalize 重算）
     check("null 但 availability=true -> 报错",
-          any("decode_seconds" in e for e in S.validate_row(bad)))
+          any("decode_seconds" in e for e in S.validate_row(hand)))
     bad2 = S.finalize_row({"schema_version": S.SCHEMA_VERSION, "temperature_c": "71"})
     check("遥测字符串 -> 报错", any("temperature_c" in e for e in S.validate_row(bad2)))
     bad3 = S.finalize_row({"schema_version": S.SCHEMA_VERSION, "power_w": float("nan")})
@@ -393,6 +399,7 @@ def main() -> int:
     check("⑪ 高性能样本通过资格判定", D.pstate_verdict(hi)["qualified"] is True)
     idle_only = [dict(clock_sm_MHz="210", clock_mem_MHz="405", power_W="3", temp_C="45")] * 5
     from . import gpu_pstate_preflight as PF
+    from . import g4_part4_pilot_measure as MEAS      # 仅用于断言 hash 实现一致（不加载模型）
     v_idle = PF.verdict_from_sampler([], dict(clock_sm_MHz="315"))
     check("⑫ 空闲样本不得作为判定输入（无负载样本 -> available=false）",
           v_idle["available"] is False and v_idle["verdict_input"] == "load_samples_only"
@@ -479,6 +486,338 @@ def main() -> int:
             check(f"⑳ 非法配置必须报错（{name}）", "校验失败" in str(e))
     P.validate_requested(ctypes=[2048, 8192], kvs=["base_bf16"], modes=["AR", "SpecDec"])
     check("⑳ 合法配置不报错（缩小版复验的实际参数）", True)
+
+    print("\n== 14. v1.2 canonical 记账（summary 映射 / 跨进程等价性 / 措辞 / dual-control / 自洽校验）==")
+
+    # ---- 真实形状的 fixture：summary 只有 *_med，run 只有裸字段 ----
+    # 生成序列都取 64 个 token（= max_new），并让 accepted + mismatch_rounds == n_generated
+    # 这条**协议恒等式**在 fixture 里也成立，否则 validator 会（正确地）拒绝。
+    _IDS_AR_8K = [1000 + i for i in range(64)]
+    _IDS_SP_8K = list(_IDS_AR_8K)
+    _IDS_AR_2K = [2000 + i for i in range(64)]
+    _IDS_SP_2K = list(_IDS_AR_2K)
+    _IDS_SP_2K[4] = 2999                     # 首个差异在第 4 位（2K BF16 分歧）
+    _STATS = {8192: dict(accepted=56, proposed=76, mismatch=8, rounds=20, allacc=12),
+              2048: dict(accepted=46, proposed=99, mismatch=18, rounds=25, allacc=7)}
+
+    def _summ(ctx, mode, res, ids, **over):
+        st = _STATS[ctx]
+        s = dict(kind="summary", ctx=ctx, target_kv="base_bf16", mode=mode,
+                 ar_residency=(res if mode == "AR" else None), order="b0",
+                 input_token_hash=f"ih{ctx}", generated_token_hash=S.token_ids_hash(ids),
+                 generated_token_ids=list(ids), n_generated=len(ids), eos_id=151645,
+                 reps=5, k=4, warm=1, chunk=2048, max_new=len(ids), spread_flag="ok",
+                 t_prefill_s_med=31.96, t_decode_s_med=6.72, t_total_s_med=38.65,
+                 decode_tok_s_med=9.53, e2e_tok_s_med=1.66, peak_alloc_GiB_med=6.95,
+                 peak_resv_GiB_med=10.47, decode_tok_s_rel_spread_pct=1.9,
+                 t_decode_s_rel_spread_pct=2.0, logits_finite=True,
+                 accept_rate_med=st["accepted"] / st["proposed"], accepted_med=st["accepted"],
+                 proposed_med=st["proposed"], rounds_med=st["rounds"],
+                 draft_calls_med=st["proposed"], target_block_calls_med=st["rounds"],
+                 mismatch_rounds_med=st["mismatch"],
+                 all_accept_rounds_med=st["allacc"])
+        s.update(over)
+        return s
+
+    def _meta(ctx, mode, res, **over):
+        m = dict(run_id="t2", block_index=0, condition_index=0, seed=1, condition_order=[],
+                 timestamp_utc="2026-09-22T04:26:00Z", mode=mode,
+                 ar_residency=(res if mode == "AR" else None), target_kv="base_bf16",
+                 context_requested=ctx, context_actual=ctx, max_new_tokens=64,
+                 reps_expected=5, reps_measured=5, returncode=0, env_qualified=True,
+                 pstate_qualified=True, between_block_check=False,
+                 between_block_rel_diff_pct=1.0)
+        m.update(over)
+        return m
+
+    # T1/T2/T3 字段映射
+    sp8 = S.build_g5_row(_summ(8192, "SpecDec", None, _IDS_SP_8K), _meta(8192, "SpecDec", None))
+    check("㉑ summary 的 t_prefill_s_med 进入 canonical prefill_seconds",
+          sp8["prefill_seconds"] == 31.96 and sp8["prefill_source"] == "reported_median")
+    check("㉑ summary 的 e2e_tok_s_med 进入 canonical e2e_tok_per_s",
+          sp8["e2e_tok_per_s"] == 1.66)
+    check("㉒ SpecDec summary 统计全部映射（acceptance/accepted/proposed/rounds/draft/block/mismatch/allacc）",
+          sp8["accepted"] == 56 and sp8["proposed"] == 76 and sp8["rounds"] == 20
+          and sp8["draft_calls"] == 76 and sp8["target_block_calls"] == 20
+          and sp8["mismatch_rounds"] == 8 and sp8["all_accept_rounds"] == 12,
+          f"{sp8['accepted']}/{sp8['proposed']}/{sp8['rounds']}")
+    check("㉒ acceptance 用恒等式 accepted/proposed（不照抄 accept_rate_med）",
+          abs(sp8["acceptance"] - 56 / 76) < 1e-12)
+    check("㉒ AR 行不得携带 SpecDec 专属统计量",
+          all(S.build_g5_row(_summ(8192, "AR", "target_only", _IDS_AR_8K),
+                             _meta(8192, "AR", "target_only"))[f] is None
+              for f in ("acceptance", "accepted", "proposed", "rounds", "draft_calls",
+                        "mismatch_rounds", "all_accept_rounds")))
+    check("㉒ run 行（kind=run）走裸字段映射（t_prefill_s -> prefill_seconds）",
+          S.build_g5_row(dict(kind="run", ctx=2048, mode="AR", t_prefill_s=1.25,
+                              t_decode_s=2.0, t_total_s=3.25, n_gen=8,
+                              input_token_hash="ih"), _meta(2048, "AR", "target_only")
+                         )["prefill_seconds"] == 1.25)
+    check("㉒ 不得用 total-decode 偷算 prefill（缺 *_med 时必须留 null）",
+          S.build_g5_row(dict(kind="summary", ctx=2048, mode="AR",
+                              t_total_s_med=10.0, t_decode_s_med=4.0, n_generated=8,
+                              input_token_hash="ih", reps=5, spread_flag="ok"),
+                         _meta(2048, "AR", "target_only"))["prefill_seconds"] is None)
+    check("㉒ NaN 统计量不得写进 canonical（accept_rate_med=nan -> null）",
+          S.build_g5_row(_summ(2048, "SpecDec", None, _IDS_SP_2K, accept_rate_med=float("nan")),
+                         _meta(2048, "SpecDec", None))["acceptance_reported"] is None)
+
+    # T4/T5/T6 跨进程等价性
+    def _pair(ctx, ar_ids, sp_ids, ar_kw=None, sp_kw=None):
+        ar = S.build_g5_row(_summ(ctx, "AR", "target_only", ar_ids, **(ar_kw or {})),
+                            _meta(ctx, "AR", "target_only"))
+        sp = S.build_g5_row(_summ(ctx, "SpecDec", None, sp_ids, **(sp_kw or {})),
+                            _meta(ctx, "SpecDec", None))
+        rows = [ar, sp]
+        S.fill_cross_process_equality(rows)
+        return ar, sp
+
+    _, sp_eq = _pair(8192, _IDS_AR_8K, _IDS_SP_8K)
+    check("㉓ 8K 两侧 hash 相同 -> ar_equal=True 且已认证",
+          sp_eq["ar_equal"] is True and sp_eq["ar_equal_certified"] is True
+          and sp_eq["ar_equal_available"] is True
+          and sp_eq["equality_source"] == "parent_cross_process")
+    _, sp_ne = _pair(2048, _IDS_AR_2K, _IDS_SP_2K)
+    check("㉔ 2K 两侧不同 -> ar_equal=False 且给出 first_diff_index",
+          sp_ne["ar_equal"] is False and sp_ne["first_diff_index"] == 4,
+          f"first_diff={sp_ne['first_diff_index']}")
+    # 缺 input_token_hash：key 就对不上 -> 没有对照，绝不写 False
+    _, sp_nohash = _pair(8192, _IDS_AR_8K, _IDS_SP_8K, ar_kw=dict(input_token_hash=None))
+    check("㉕ 缺 input_token_hash -> available=False、certified=False、ar_equal=None（不是 False）",
+          sp_nohash["ar_equal"] is None and sp_nohash["ar_equal_available"] is False
+          and sp_nohash["ar_equal_certified"] is False
+          and "对照" in (sp_nohash["equality_reason"] or ""),
+          str(sp_nohash["equality_reason"]))
+    # 配对成功但 EOS 口径不同：key 一致却仍须拒绝认证（认证逻辑本身要真的生效）
+    _, sp_eos = _pair(8192, _IDS_AR_8K, _IDS_SP_8K, sp_kw=dict(eos_id=151646))
+    check("㉕ 配对成功但 eos_id 不同 -> 不认证、不给结果（eos_equal 生效）",
+          sp_eos["ar_equal"] is None and sp_eos["ar_equal_certified"] is False
+          and "eos_equal" in (sp_eos["equality_reason"] or ""),
+          str(sp_eos["equality_reason"]))
+    _, sp_maxnew = _pair(8192, _IDS_AR_8K, _IDS_SP_8K, sp_kw=dict(max_new=32))
+    ar_mn = S.build_g5_row(_summ(8192, "AR", "target_only", _IDS_AR_8K),
+                           _meta(8192, "AR", "target_only", max_new_tokens=64))
+    sp_mn = S.build_g5_row(_summ(8192, "SpecDec", None, _IDS_SP_8K),
+                           _meta(8192, "SpecDec", None, max_new_tokens=32))
+    S.fill_cross_process_equality([ar_mn, sp_mn])
+    check("㉕ max_new_tokens 不同 -> 不配对（key 含 max_new_tokens，绝不当成'不等'）",
+          sp_mn["ar_equal"] is None and sp_mn["ar_equal_available"] is False)
+    # 完全缺对照
+    lone = S.build_g5_row(_summ(8192, "SpecDec", None, _IDS_SP_8K), _meta(8192, "SpecDec", None))
+    S.fill_cross_process_equality([lone])
+    check("㉕ 完全没有 AR 对照 -> ar_equal=None（缺对照绝不解释为不等）",
+          lone["ar_equal"] is None and lone["ar_equal_available"] is False
+          and lone["equality_source"] is None)
+    ar_ref, _ = _pair(8192, _IDS_AR_8K, _IDS_SP_8K)
+    check("㉕ AR 参照行标为 reference_row（不与自己比较）",
+          ar_ref["equality_source"] == "reference_row" and ar_ref["ar_equal"] is None)
+
+    # T7 dual-control 声明纪律
+    dc = S.build_g5_row(_summ(8192, "AR", "dual_control", _IDS_AR_8K),
+                        _meta(8192, "AR", "dual_control"))
+    check("㉖ dual-control：角色/分母/声明字段全为 false",
+          dc["condition_role"] == "diagnostic_control"
+          and dc["formal_factorial_member"] is False
+          and dc["speedup_denominator_eligible"] is False
+          and dc["speedup_claim_allowed"] is False)
+    check("㉖ dual-control 即使一切合格也不得声明（校验器兜底）",
+          S.validate_row(dc) == []
+          and any("diagnostic_control" in e for e in
+                  S.validate_row(dict(dc, speedup_claim_allowed=True))))
+
+    # T8/T9/T10 措辞分层
+    def _bb_sp(rel, within_flag="ok", pstate=True):
+        r = S.build_g5_row(_summ(8192, "SpecDec", None, _IDS_SP_8K, spread_flag=within_flag),
+                           _meta(8192, "SpecDec", None, between_block_check=True,
+                                 between_block_rel_diff_pct=rel, pstate_qualified=pstate))
+        return r
+
+    sp_bb = _bb_sp(42.66)
+    ar_ok2 = S.build_g5_row(_summ(8192, "AR", "target_only", _IDS_AR_8K),
+                            _meta(8192, "AR", "target_only"))
+    cm = S.speedup_claim(ar_ok2, sp_bb)
+    check("㉗ within-run OK + between CHECK -> 原因只指向 between-block",
+          sp_bb["within_run_status"] == "OK" and sp_bb["between_block_status"] == "CHECK"
+          and sp_bb["within_run_check_reason"] is None
+          and sp_bb["between_block_check_reason"] == "between-block 相对差 42.7% > 20%"
+          and any("between-block CHECK（42.7% > 20%）" in x for x in cm["reasons"])
+          and not any("within-run" in x for x in cm["reasons"]), str(cm["reasons"]))
+    sp_wr = S.build_g5_row(_summ(8192, "SpecDec", None, _IDS_SP_8K,
+                                 spread_flag="CHECK:relative-spread>20%",
+                                 decode_tok_s_rel_spread_pct=222.4),
+                           _meta(8192, "SpecDec", None))
+    cm2 = S.speedup_claim(S.build_g5_row(_summ(8192, "AR", "target_only", _IDS_AR_8K),
+                                         _meta(8192, "AR", "target_only")), sp_wr)
+    check("㉘ within-run CHECK + between OK -> 原因只指向 within-run",
+          sp_wr["within_run_status"] == "CHECK" and sp_wr["between_block_status"] == "OK"
+          and any("within-run CHECK" in x for x in cm2["reasons"])
+          and not any("between-block" in x for x in cm2["reasons"]), str(cm2["reasons"]))
+    sp_env = S.build_g5_row(_summ(8192, "SpecDec", None, _IDS_SP_8K),
+                            _meta(8192, "SpecDec", None, pstate_qualified=False))
+    cm3 = S.speedup_claim(S.build_g5_row(_summ(8192, "AR", "target_only", _IDS_AR_8K),
+                                         _meta(8192, "AR", "target_only")), sp_env)
+    check("㉙ ENV_INVALID -> 原因含 ENV_INVALID 且 environment_status 为 ENV_INVALID",
+          sp_env["environment_status"] == "ENV_INVALID"
+          and sp_env["measurement_status"] == "ENV_INVALID"
+          and any("ENV_INVALID" in x for x in cm3["reasons"]), str(cm3["reasons"]))
+    check("㉙ within_run_check_reason 绝不拼接 between-block",
+          all("between-block" not in str(x) for x in
+              [sp_bb["within_run_check_reason"], sp_wr["within_run_check_reason"],
+               sp_env["within_run_check_reason"]]))
+
+    # T11 availability 一致性
+    check("㉚ 有值字段 availability=True、空字段 availability=False（值有就 true）",
+          all(sp8["availability"][f] is True for f in
+              ("prefill_seconds", "e2e_tok_per_s", "accepted", "proposed", "rounds",
+               "mismatch_rounds")) and
+          all(ar_ok2["availability"][f] is False for f in
+              ("accepted", "proposed", "rounds", "mismatch_rounds")))
+    check("㉚ 跨进程填写后 availability 立即同步（stale availability 回归）",
+          sp_eq["availability"]["equality_source"] is True
+          and sp_eq["availability"]["equality_reason"] is True
+          and lone["availability"]["equality_reason"] is True)
+
+    # T12/T13 旧版本只读兼容 + 不覆盖历史文件
+    legacy = S.build_g5_row(dict(ctx=8192, target_kv="base_bf16", mode="SpecDec", n_gen=64,
+                                 t_prefill_s=31.06, t_decode_s=10.69, t_total_s=41.75,
+                                 decode_tok_s=5.99, e2e_tok_s=1.53, accept_rate=56 / 76,
+                                 rounds=20, proposed=76, accepted=56, draft_calls=76,
+                                 target_block_calls=20, mismatch_rounds=8,
+                                 all_accept_rounds=12, gen_sha1="h1", input_token_hash="ih",
+                                 logits_finite=True), None)
+    check("㉛ v1.0/v1.1 无 kind 的旧行仍可映射为 1.2（缺失字段 null）",
+          legacy["schema_version"] == S.SCHEMA_VERSION and legacy["prefill_seconds"] == 31.06
+          and legacy["acceptance"] == 56 / 76)
+    with tempfile.TemporaryDirectory() as td:
+        p2 = Path(td) / "legacy.jsonl"
+        p2.write_text(json.dumps(dict(kind="summary", ctx=8192, mode="AR",
+                                      t_prefill_s_med=1.0, t_decode_s_med=2.0,
+                                      t_total_s_med=3.0, target_kv="base_bf16",
+                                      input_token_hash="ih", reps=5,
+                                      spread_flag="ok")) + "\n", encoding="utf-8")
+        h0 = sha(p2)
+        S.read_legacy_part4(p2)
+        check("㉛ read_legacy_part4 只读（sha256 不变）", sha(p2) == h0)
+        p3 = Path(td) / "canon.jsonl"
+        S.write_g5_run(p3, ar_ok2)
+        h1 = sha(p3)
+        try:
+            S.write_g5_run(p3, ar_ok2)
+            check("㉛ 历史 canonical 文件不得被覆盖", False)
+        except SystemExit:
+            check("㉛ 历史 canonical 文件不得被覆盖", True)
+        check("㉛ 拒绝覆盖后文件内容不变", sha(p3) == h1)
+        check("㉛ 只读旧文件后其 sha256 仍不变", sha(p2) == h0)
+
+    # T14/T15 canonical validator 抓错
+    bad_eq = dict(sp_eq, ar_equal=True)
+    check("㉜ validator 抓到 ar_equal 与证据矛盾（true 但两侧 hash 不同）",
+          any("hash" in e for e in
+              S.validate_canonical(dict(bad_eq, generated_token_hash="deadbeef"),
+                                   ref_row=ar_ref)))
+    check("㉜ validator 抓到 '相同 hash 却写 false'（本次真事故）",
+          any("相同" in e for e in
+              S.validate_canonical(dict(sp_ne, generated_token_hash="1f5e438ee5d38888",
+                                        ar_equal=False),
+                                   ref_row=dict(ar_ref, generated_token_hash="1f5e438ee5d38888"))))
+    miss_stats = S.finalize_row(dict(sp8, acceptance=None, accepted=None, proposed=None,
+                                     rounds=None))
+    check("㉝ validator 抓到缺失的 SpecDec summary 统计",
+          sum("缺" in e for e in S.validate_canonical(miss_stats)) >= 4,
+          str(S.validate_canonical(miss_stats)[:3]))
+    check("㉝ validator 抓到 acceptance 与 accepted/proposed 不一致",
+          any("acceptance" in e for e in
+              S.validate_canonical(S.finalize_row(dict(sp8, acceptance=0.99)))))
+    check("㉝ validator 抓到 accepted+mismatch != n_generated",
+          any("恒等式" in e for e in
+              S.validate_canonical(S.finalize_row(dict(sp8, mismatch_rounds=1)))))
+    check("㉝ validator 抓到 hash 与 ids 不一致",
+          any("generated_token_hash" in e for e in
+              S.validate_canonical(S.finalize_row(dict(sp8, generated_token_hash="zzz")))))
+    check("㉝ validator 抓到 dual-control 声明资格",
+          any("dual-control" in e for e in
+              S.validate_canonical(S.finalize_row(dict(dc, speedup_claim_allowed=True)))))
+    check("㉝ 合格行同一 validator 通过（不能只会报错）",
+          S.validate_canonical(sp_eq, ref_row=ar_ref) == [] and
+          S.validate_canonical(sp_bb, ref_row=ar_ref) == [],
+          str(S.validate_canonical(sp_bb, ref_row=ar_ref)[:3]))
+    check("㉞ token_ids_hash 与测量核心 gen_sha1 完全一致",
+          S.token_ids_hash(_IDS_SP_8K) == MEAS.gen_sha1(_IDS_SP_8K))
+
+    print("\n== 15. 8K variance probe 的分析逻辑（纯函数；不跑 GPU）==")
+    from . import g5_8k_spec_variance_probe as V
+
+    check("㉟ 单档：全部进程接近 -> 不误报双档",
+          V.bimodality([10.0, 10.2, 9.9, 10.1], 1.5)["detected"] is False)
+    bi = V.bimodality([10.0, 10.2, 5.0, 5.1], 1.5)
+    check("㉟ 双档：4 进程分成 2+2 且比值 1.96 -> 检出并给出切分",
+          bi["detected"] is True and bi["split"]["low"] == [5.0, 5.1]
+          and abs(bi["split"]["ratio"] - 1.96) < 0.01)
+    check("㉟ 进程数 <4 -> 明确不做双档判定（不硬凑结论）",
+          V.bimodality([10.0, 5.0], 1.5)["detected"] is False
+          and "不做双档判定" in (V.bimodality([10.0, 5.0], 1.5).get("note") or ""))
+    check("㉟ 3+1 分布不满足'两侧各≥2' -> 不检出（规则事先写死）",
+          V.bimodality([10.0, 5.0, 5.1, 5.2], 1.5)["detected"] is False)
+
+    def _child(role, idx, tok_s, prefill=32.0, rel=1.5, sm=2520, alloc=7000.0, retries=0):
+        d = 64.0 / tok_s
+        return dict(
+            role=role, index=idx, formal=dict(
+                reps=[dict(prefill_s=prefill, decode_s=d, total_s=prefill + d, n_gen=64,
+                           decode_tok_s=tok_s, e2e_tok_s=64 / (prefill + d)) for _ in range(5)],
+                medians=dict(prefill_s=prefill, decode_s=d, total_s=prefill + d,
+                             decode_tok_s=tok_s, e2e_tok_s=64 / (prefill + d)),
+                decode_rel_spread_pct=rel),
+            alloc_after_formal=dict(available=True, peak_allocated_mib=alloc,
+                                    peak_reserved_mib=alloc + 500,
+                                    inactive_split_peak_mib=12.0,
+                                    num_alloc_retries=retries, cuda_free_mib=100.0),
+            monitor_after=dict(system=dict(clock_sm_MHz=sm, clock_mem_MHz=8000,
+                                           power_W=68.0, temp_C=82.0, mem_used_MiB=7847)),
+            pstate=dict(available=True, qualified=True, reason="ok"))
+
+    recs = [_child("spec", 0, 9.5), _child("spec", 1, 5.4, sm=2520),
+            _child("spec", 2, 9.4), _child("spec", 3, 5.5, retries=3, alloc=7600.0),
+            _child("ar_target", 0, 29.4), _child("ar_target", 1, 29.5),
+            _child("ar_dual", 0, 23.1), _child("ar_dual", 1, 23.2)]
+    a = V.analyse(recs)
+    check("㊱ SpecDec 快慢两档被检出（5.4/5.5 vs 9.4/9.5）",
+          a["Q1_bimodality"]["decode_tok_per_s"]["detected"] is True
+          and abs(a["Q1_bimodality"]["max_over_min"] - 9.5 / 5.4) < 0.05)
+    check("㊱ 每进程 within-run 稳定性都记录（含 min/max）",
+          len(a["Q2_within_process"]) == 8
+          and a["Q2_within_process"]["spec[0]"]["decode_rel_spread_pct"] == 1.5)
+    check("㊱ 对照稳定性单列，且不含 SpecDec",
+          set(a["Q5_controls"]) == {"ar_target", "ar_dual"}
+          and a["Q5_controls"]["ar_dual"]["decode_tok_per_s"] == [23.1, 23.2])
+    check("㊱ prefill 稳定性按角色统计（8K 应稳定）",
+          a["Q4_prefill"]["spec"]["max_over_min"] == 1.0
+          and a["Q4_prefill"]["spec"]["medians"] == [32.0] * 4)
+    check("㊱ 相关量表只列观测，且带'未归因'说明",
+          len(a["Q6_correlates"]["per_process"]) == 4
+          and "不得把原因写成" in a["Q6_correlates"]["note"])
+    check("㊱ 无 profiling 数据时不做阶段对比（不硬凑）", "Q3_phase_contrast" not in a)
+    recs2 = [dict(r, profiling=dict(
+        phases={"draft_propose": {"total_ms": 1000.0, "calls": 20, "median_ms": 50.0},
+                "target_block_verify": {"total_ms": 2000.0, "calls": 20, "median_ms": 100.0},
+                "kv_cat": {"total_ms": 300.0, "calls": 40, "median_ms": 7.5}},
+        outer_decode_s=3.5, subset_phases=["kv_cat"], accounted_ms=3000.0,
+        residual_ms=500.0, residual_pct=14.3,
+        per_round_ms={"draft_propose": 50.0}, rounds=20, stats={},
+        note="x")) for r in recs if r["role"] == "spec"]
+    a2 = V.analyse(recs + recs2)
+    check("㊱ 阶段对比取最快 vs 最慢进程，并标出 subset 阶段（不可相加）",
+          a2["Q3_phase_contrast"]["fast"]["index"] == 0
+          and a2["Q3_phase_contrast"]["slow"]["index"] == 1
+          and "kv_cat" in a2["Q3_phase_contrast"]["subset_phases"],
+          f"{a2['Q3_phase_contrast']['fast']}/{a2['Q3_phase_contrast']['slow']}")
+    check("㊱ 阶段比值按 slow/fast 计算（>1 = 慢档更贵）",
+          abs(a2["Q3_phase_contrast"]["per_phase_ms"]["target_block_verify"]["ratio"] - 1.0)
+          < 1e-9)
+    check("㊲ profiling 与正式计时是两套独立字段（不得混写）",
+          "profiling" not in [k for k in ("formal",) if k in recs[0]]
+          and "formal" in recs[0] and "profiling" in recs2[0]
+          and V.SUBSET_PHASES == ("kv_cat",))
 
     print(f"\nG5 schema 自测：PASS {len(PASS)} / FAIL {len(FAIL)}")
     if FAIL:

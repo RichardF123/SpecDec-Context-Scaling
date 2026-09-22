@@ -166,6 +166,103 @@ pstate_reason`；**不在正式计时区间内轮询 `nvidia-smi`**。
 任意一项不满足 ⇒ `speedup_claim_allowed=false`，且**必须打印具体原因**
 （`NO CLAIM：AR between-block CHECK` 等），**不得**输出"可作确定声明"。
 
+---
+
+## 7c. Canonical 记账规则（v1.2，2026-09-22）—— 修正 4 类错记
+
+背景：1.1 版的 canonical 出现 4 类错记（summary `*_med` 全为 null；跨进程等价性写成
+**凭空否定**的 `ar_equal=False`；within-run / between-block 的措辞混用；dual-control 误标
+`claim_allowed=True`）。以下规则把记账口径**写死**，并由 `validate_canonical()` 在**写盘前**强制。
+
+### 7c.1 字段映射必须按 `kind` 走**显式映射表**
+- `kind=summary` → `SUMMARY_FIELD_MAP`（**只认 `*_med`**）：
+  `t_prefill_s_med→prefill_seconds`、`t_decode_s_med→decode_seconds`、`t_total_s_med→total_seconds`、
+  `decode_tok_s_med→decode_tok_per_s`、`e2e_tok_s_med→e2e_tok_per_s`、
+  `peak_alloc_GiB_med→peak_allocated_gib`、`peak_resv_GiB_med→peak_reserved_gib`、
+  `accepted_med→accepted`、`proposed_med→proposed`、`rounds_med→rounds`、
+  `draft_calls_med→draft_calls`、`target_block_calls_med→target_block_calls`、
+  `mismatch_rounds_med→mismatch_rounds`、`all_accept_rounds_med→all_accept_rounds`、
+  `accept_rate_med→acceptance_reported`；
+- `kind=run` → `RUN_FIELD_MAP`（裸字段，去掉 `_med`）；
+- **禁止**用"删掉 `_med`"这类泛化字符串替换（`accept_rate_med` 与 `acceptance` 语义不同）；
+- **禁止**用 `total_seconds - decode_seconds` 偷算 prefill（中位数之差 ≠ 差的中位数；
+  8K 实测两者相差 ~0.03 s）。`prefill_seconds` 的来源记在 `prefill_source`：
+  `reported_median` / `reported_per_rep`（**不产生 `derived`**）；
+- `acceptance` 是**恒等式** `accepted / proposed`（`proposed>0` 时），
+  子进程汇报的比率另存 `acceptance_reported`；非有限值（NaN）一律视为"没有值"；
+- AR 行里 SpecDec 专属统计量（`acceptance`/`accepted`/`proposed`/`rounds`/`draft_calls`/
+  `target_block_calls`/`mismatch_rounds`/`all_accept_rounds`/`accepted_length_histogram`）
+  **语义上不存在 ⇒ 一律 null**（不得把子进程汇报的 0 当成测量值）；
+- `availability` 是**值的纯函数**：值非 null ⇒ true，null ⇒ false；由 `finalize_row()` 每次重算，
+  因此"先 finalize 后填值"不会再留下 `值有 but availability=false` 的自相矛盾行。
+
+### 7c.2 跨进程等价性由**父进程**填写
+子进程按"一条件一进程"启动，AR 与 SpecDec **从不共存** ⇒ 进程内**没有**可比对象。
+父进程按 key `(block_index, context_actual, target_kv, input_token_hash, max_new_tokens)`
+配对，且**只**比较 `AR target_only primary` ↔ `SpecDec primary`（**dual-control 绝不作为正确性参照**）：
+
+| 情况 | `ar_equal` | `ar_equal_available` | `ar_equal_certified` |
+|---|---|---|---|
+| 前提齐全（ctx/KV/input_hash/max_new/EOS/n_generated/ids 或 hash） | ids 逐位比较结果 | true | true |
+| 有对照但前提缺失 | **null** | false | false |
+| 无对照（key 配不上） | **null** | false | false |
+| AR 参照行自身 | null | false | false（`equality_source=reference_row`） |
+
+**缺对照绝不写 `False`**（"没比过" ≠ "不相等"）。判定优先用 `generated_token_ids`
+逐位比较；只有缺 ids 时才降级为 hash 比较并在 `equality_reason` 里注明。
+`equality_source`：`parent_cross_process` / `reference_row`。
+
+### 7c.3 状态**分层**，措辞不得跨层
+| 字段 | 含义 |
+|---|---|
+| `within_run_status` | **同一进程内** reps 之间的稳定性（来源：子进程 `spread_flag`） |
+| `between_block_status` | 两个随机顺序 block 之间的一致性（来源：父进程 two-block 相对差） |
+| `environment_status` | P-state / 供电 / 环境资格 |
+| `measurement_status` | 三层的**最坏值**（ENV_INVALID > CHECK > OK） |
+
+- `within_run_check_reason` **只**保存 within-run 原因；
+- between-block 的原因**另存** `between_block_check_reason`；
+- **禁止**把 between-block 导致的 CHECK 写成"within-run CHECK"，也**禁止**拼接
+  `within_run_check_reason + " | between-block CHECK"`；
+- 正确措辞示例：`NO CLAIM：SpecDec between-block CHECK（42.7% > 20%）`。
+
+### 7c.4 dual-control 的声明纪律
+`condition_role=diagnostic_control` 的行必须同时满足
+`formal_factorial_member=false`、`speedup_denominator_eligible=false`、
+`speedup_claim_allowed=false` —— **即使** execution SUCCESS、within-run OK、between-block OK、
+P-state 合格也**永远**没有声明资格。`compute_speedup()` 既已拒绝其作分母，
+canonical 行自身也必须一致（`validate_row` / `validate_canonical` 双重拦截）。
+
+### 7c.5 写盘前的 canonical 自洽校验（`validate_canonical`）
+1. 已测得的行必须含 `prefill_seconds`/`decode_seconds`/`total_seconds`；
+2. SpecDec 已测得必须含 `acceptance`/`accepted`/`proposed`/`rounds`；
+3. `acceptance == accepted/proposed`（容差 1e-9）；且 `accepted + mismatch_rounds == n_generated`；
+4. `generated_token_hash` 必须等于按 `generated_token_ids` 重算的哈希；
+5. `ar_equal=true` ⇒ 两侧 `generated_token_hash` 相同；
+6. `ar_equal=false` ⇒ 两侧不同；
+7. `ar_equal_certified=true` ⇒ 认证前提字段齐全；
+8. dual-control 不得 `speedup_claim_allowed=true`；
+9. `measurement_status=CHECK` 必须有结构化原因；
+10. `within_run_status=OK` 时不得带 `within_run_check_reason`；between-block CHECK 时
+    `speedup_claim_blockers` 不得出现 "within-run" 字样；
+11. 字段有值时 `availability` 不得为 false；
+12. 字段为空时 `availability` 必须为 false。
+
+任一条不通过 ⇒ **拒绝写出**（`ValueError`），宁可写不出来，也不写一份自相矛盾的 JSONL。
+
+### 7c.6 聚合口径（写死，避免同一实验两个数）
+- **canonical 行**：每 `(cell, block)` 一行，逐 block 判定资格；
+- **speedup 点估计**：**全部 measured rep 合并取中位数**再相除
+  （`median(t_decode_s)` 两侧相除；e2e 同理），与离线报表 `scripts/g5_report_from_run.py`
+  的 `[8]` 段完全一致；
+- **声明资格**：`speedup_claim_over_blocks()` 要求**每个配对 block 都合格**，
+  原因合并去重后打印。
+
+### 7c.7 已发布 canonical 的修订方式
+**绝不原地改写**已写出的 canonical（那是审计证据）。修正映射后一律用
+`scripts/g5_recanonicalize_run.py --run-id <stamp>` 从**只读的 part4 分片**重建一份
+**新 schema 版本**的新文件；`notes` 里写明"由哪些分片重建、未重新测量"。
+
 ## 8. 正确性口径
 
 - **主 Gate**：FP32 `B6` 逐 token 精确相等（当前 PASS：20/20 组合，216/348）；
@@ -182,34 +279,52 @@ pstate_reason`；**不在正式计时区间内轮询 `nvidia-smi`**。
 - 正式计时：无任何插桩；
 - 成本分解（`g5_cost_breakdown`）用外部 CUDA Event 包装（**不改冻结文件**），其数字
   **不得写入正式主表**；`P5_PROFILE=0` 可跑同一条件但无包装，用于量化插桩自身开销；
-- `kv_cat` 是 forward 阶段的**子集**，不可与 forward 阶段相加。
+- `kv_cat` 是 forward 阶段的**子集**，不可与 forward 阶段相加；
+- `g5_8k_spec_variance_probe` **先**跑无插桩的正式 pass，**再单独**跑插桩 pass；
+  两套数字分别存在 `formal` / `profiling` 两个互不覆盖的字段里，且 `profiling` 里
+  明确带 `subset_phases`（当前仅 `kv_cat`）以保证闭合求和时不重复计入；
+- **计时区间内禁止**：轮询 `nvidia-smi`、`empty_cache`、文件 IO、`print` 之外的任何系统查询
+  （本探针的所有系统/显存查询都在计时区间**之外**）。
 
 ## 10. 本轮的 exploratory 工具（数字不入正式主表）
 
 | 工具 | 作用 | 状态 |
 |---|---|---|
-| `g5_stability_probe` | 12 条件 × 2 随机 block 的稳定性探针 | 已实现，**未运行** |
-| `g5_cost_breakdown` | AR/SpecDec 阶段成本分解 | 已实现，**未运行** |
-| `g5_k_sweep` | k ∈ {1,2,4,8} 诊断扫描 | 已实现，**未运行** |
+| `g5_stability_probe` | 12 条件 × 2 随机 block 的稳定性探针 | 已运行（第 1 次 ENV_INVALID；缩小版 2K/8K 见 ledger §4.14） |
+| `g5_cost_breakdown` | AR/SpecDec 阶段成本分解 | 已实现，**未运行**（等环境 Gate） |
+| `g5_k_sweep` | k ∈ {1,2,4,8} 诊断扫描 | 已实现，**未运行**（等环境 Gate） |
+| `g5_8k_spec_variance_probe` | 8K SpecDec **跨进程速度双档**专项定位（正式 pass 与插桩 pass 分离） | 已实现，**未运行** |
+
+> `g5_8k_spec_variance_probe` 的**预登记**双档检出规则：把各进程的 SpecDec decode 中位数排序，
+> 若存在切分点使**两侧各 ≥2 个进程**且 `min(高档)/max(低档) ≥ P5V_BIMODAL_RATIO`（默认 1.5），
+> 报告"检出双档"并给出切分，否则"单档"。该阈值是**可配置的诊断阈值，不是统计显著性判据**，
+> 也不作为任何 Gate；改阈值必须**事先**改并在此登记。
 
 ## 11. 进入正式 Pilot 的最低条件
 
-1. 所有运行可审计且不覆盖旧数据 —— ✅（schema + run_id + 拒绝覆盖，66 项 CPU 自测）
+1. 所有运行可审计且不覆盖旧数据 —— ✅（schema + run_id + 拒绝覆盖；`g5_schema_selftest_cpu` 151 项 / `g4_part4_selftest_cpu` 68 项全 PASS）
 2. AR/SpecDec 驻留与计时边界一致 —— ✅（§3：AR-primary = target-only；边界写死）
-3. 跨顺序差异已量化 —— ⬜ **需跑 stability probe**（工具已就绪）
+3. 跨顺序差异已量化 —— ⬜ **8K SpecDec 仍 42.7%（缩小版实测）** ⇒ 先跑 `g5_8k_spec_variance_probe`
 4. 8K 显存饱和被明确标注 —— ✅（§6 + 探针自动判定）
-5. 性能不稳定时有预先规定的处理 —— ✅（§7）
+5. 性能不稳定时有预先规定的处理 —— ✅（§7 / §7b / §7c）
 6. profiling 与正式 timing 完全分离 —— ✅（§9）
 7. 正确性状态未因追求速度而降低 —— ✅（§8；FP32 B6 PASS 保持）
+8. canonical 记账自洽（映射/等价性/分层/声明纪律）—— ✅（§7c；写盘前强制校验）
 
 ## 12. 命令清单
 
 ```powershell
-python -m specdec.engine.g5_schema_selftest_cpu     # CPU：schema/驱动自测（66 项）
+python -m specdec.engine.g5_schema_selftest_cpu     # CPU：schema/驱动/记账自测（151 项）
+python -m specdec.engine.g4_part4_selftest_cpu      # CPU：测量核心自测（68 项）
+python -m specdec.engine.gpu_pstate_preflight       # GPU：环境门禁（退出码 0 才可计时）
 python -m specdec.engine.g5_stability_probe         # GPU：12 primary（+ 可选 6 control）× 2 随机 block
 set P5_INCLUDE_DUAL_AR_CONTROL=1                    # 可选：加上 6 个 dual-resident 诊断控制
+python -m specdec.engine.g5_8k_spec_variance_probe --dry-run   # 先看计划（不跑 GPU 条件）
+python -m specdec.engine.g5_8k_spec_variance_probe  # GPU：8K SpecDec 双档专项定位（约 60–90 min）
 python -m specdec.engine.g5_cost_breakdown          # GPU：阶段归因（AR 用 target-only；dual 可选）
 python -m specdec.engine.g5_k_sweep                 # GPU：k 扫描（AR 分母 = target-only，每 ctx 只测一次）
+python scripts/g5_report_from_run.py latest         # 离线：报表 + [8] 声明门控（只读）
+python scripts/g5_recanonicalize_run.py --run-id <stamp>   # 离线：按新口径重建 canonical（只读分片）
 ```
 
 > AR-primary 单独测法（诊断/对照，非必须）：

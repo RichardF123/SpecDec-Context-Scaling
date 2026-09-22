@@ -175,6 +175,38 @@ def main() -> int:
     check("compare_across_conditions 按 (ctx,kv,order) 配对",
           len(pairs) == 2 and all(v["ar_equal_available"] for v in pairs.values()))
 
+    print("\n== 9b. 进程内等价性接缝（2026-09-22 canonical ar_equal=False 事故回归）==")
+    # 事故根因：驱动器"一条件一进程"只给单一 P4_MODE，SpecDec 进程里 ref_gen 为空，
+    # 旧代码仍拿 gen_sha1([]) 去比 -> ar_equal=False 且 certified=True（凭空否定）。
+    sp_runs = [dict(n_gen=64, generated_token_hash=M.gen_sha1([1] * 64),
+                    generated_token_ids=[1] * 64, input_token_hash="in1")]
+    empty = M.in_process_equality({}, 8192, "base_bf16", sp_runs, 3, max_new=64)
+    check("ref_gen 为空 -> ar_equal=None、available=False、certified=False（绝不 False）",
+          empty["ar_equal"] is None and empty["ar_equal_available"] is False
+          and empty["certified"] is False, str(empty["ar_equal"]))
+    check("ref_gen 为空 -> 给出'本进程无对照'的原因且 equality_source 为 None",
+          "本进程未运行同档 AR 对照" in (empty["certified_reason"] or "")
+          and empty["equality_source"] is None)
+    check("ref_gen 有其它 (ctx,kv) 的 AR 也不算对照",
+          M.in_process_equality({(2048, "base_bf16"): [1] * 64}, 8192, "base_bf16",
+                                sp_runs, 3, max_new=64)["ar_equal"] is None)
+    same = M.in_process_equality({(8192, "base_bf16"): [1] * 64}, 8192, "base_bf16",
+                                 sp_runs, 3, max_new=64)
+    check("ref_gen 有同档 AR 且序列相同 -> True 且 certified",
+          same["ar_equal"] is True and same["certified"] is True
+          and same["equality_source"] == "in_process")
+    diff_runs = [dict(sp_runs[0], generated_token_hash=M.gen_sha1([1] * 63 + [9]),
+                      generated_token_ids=[1] * 63 + [9])]
+    diff = M.in_process_equality({(8192, "base_bf16"): [1] * 64}, 8192, "base_bf16",
+                                 diff_runs, 3, max_new=64)
+    check("ref_gen 有同档 AR 但序列不同 -> False 且有 first_diff_index",
+          diff["ar_equal"] is False and diff["first_diff_index"] == 63)
+    check("原因拼接不再产生以 ' | ' 开头的半截字符串（旧版 certified_reason=' | 缺 ...'）",
+          not any(str(M.in_process_equality({(8192, "base_bf16"): [1] * 64}, 8192, "base_bf16",
+                                             [dict(sp_runs[0], generated_token_ids=None)], 3
+                                             ).get("certified_reason") or "").startswith(" | ")
+                  for _ in range(1)))
+
     print("\n== 10. 报表措辞：subset 不得打印 12 conditions；==AR 不得误报 False ==")
     summary = {}
     for kv in ("base_bf16", "v_fp8"):

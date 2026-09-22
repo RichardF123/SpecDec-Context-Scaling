@@ -649,7 +649,7 @@ INELIGIBLE FOR FORMAL SPEEDUP CLAIM**（它成功揭示了 P-state 切换，不�
 - **离线复核** `scripts/g5_report_from_run.py`：对历史 run 复算 within/between/P-state 与
   NO CLAIM 原因（只读）。
 
-**当前 Gate**
+**当前 Gate**（**已被 §4.14 的缩小版 run 取代**，此处保留作第一次运行的历史记录）
 ```
 target-only AR baseline:        PASS（口径已生效且有实机证据；性能数据本身受环境污染）
 within-run status propagation:  PASS（代码 + 测试）
@@ -718,6 +718,85 @@ formal Pilot:                   HOLD（等缩小版复验）
 **同时新增**：`scripts/run_g5_reduced.cmd`——把"预检 → 干跑 → 缩小版复验 → 离线报表"串成一条命令，
 用带引号的 `set "VAR=value"` 形式，避免 cmd 里 `set X=a & set Y=b` 把 `&` 前的空格并进变量值，
 从而**杜绝"条件名带空格 ⇒ 静默少跑条件"**（参见本节 4.11/自测 ⑲⑳）。
+
+### 4.14 G5 stability probe 缩小版（run `g5stab_20260922T040625Z`）—— **P-state 已修复；canonical 记账已修正**
+
+**登记产物（全部保留，不得覆盖/删除）**
+| 文件 | 内容 | 备注 |
+|---|---|---|
+| `output/g5/g5_g5-results-1.1_0e4ed83b6fb3_g5stab_20260922T040625Z.jsonl`（58009 B） | **1.1 版 canonical（含 4 类错记）** | **保留作审计证据**；sha256 `10045ba8331afed26efc91a469d5b6cb28c50941a9300c1cb281b7f1a1cc01e9` |
+| `output/g5/g5_g5-results-1.2_re44bd9ca4bb_g5stab_20260922T040625Z.jsonl`（61448 B） | **1.2 版 canonical（修正后重建）** | 由只读分片重建，**未重新测量** |
+| `output/part4/part4_*_g5stab_20260922T040625Z_*.jsonl`（12 文件） | 6 条件 × 2 block 的原始分片 | **受保护**，本次只读 |
+
+**配置**：ctx {2048, 8192} × KV base_bf16 × {AR target-only, SpecDec} + AR dual-residency 控制；
+2 随机 block、warm-up 1 + 5 measured reps、k=4（协议冻结）、max_new 64、chunk 2048。
+
+**① P-state 问题已解决（对比 §4.11）**
+| 项 | §4.11 第 1 次 | 本次 |
+|---|---|---|
+| SM 时钟 | 435–2535 MHz | **≈2490–2520 MHz** |
+| 显存时钟 | 6000 MHz（部分 block） | **8000 MHz** |
+| `pstate_ok` | 部分 false | **全 true** |
+| 温度 / 功耗 | 61–68 °C / 15.8–28 W | ≈82 °C / 68–70 W |
+
+**② 2K base_bf16：稳定且**允许**声明**
+| 量 | AR target-only | SpecDec |
+|---|---|---|
+| decode tok/s（blk0 / blk1） | 33.04 / 29.69 | 13.26 / 12.79 |
+| between-block | **10.1%**（OK） | **3.5%**（OK） |
+
+```
+decode speedup = 0.406×   e2e speedup = 0.434×   speedup_claim_allowed = true
+⇒ SpecDec decode 慢 2.46×、端到端慢 2.30×（合并全 rep 中位数口径）
+```
+**必须注明**：这是**缩小版** stability probe（2 长度 × 1 KV），**不是** 16-family 正式矩阵。
+
+**③ 8K base_bf16：AR 稳定，SpecDec 不稳定 ⇒ 不得声明倍数**
+| 量 | AR target-only | SpecDec |
+|---|---|---|
+| decode tok/s（blk0 / blk1） | 29.33 / 29.51 | 9.53 / 5.46 |
+| between-block | **0.6%**（OK） | **42.7%（CHECK）** |
+| prefill（blk0 / blk1） | 3.449 / 3.439 s | **31.958 / 32.000 s** |
+| within-run rel | ≈2% | **1.9% / 2.0%（OK）** |
+
+- 两 block 的 SM 2520 MHz / mem 8000 MHz / ≈82 °C / 68–70 W **完全相同**，
+  prefill 也几乎相同（31.96 vs 32.00 s），**只有 decode 从 6.72 s 变成 11.72 s**；
+- ⇒ **不是** 低功耗 P-state、**不是** 热降频、**不是** prefill 波动、**不是** token 决策随机性；
+- 合并口径 decode ×0.236、e2e ×0.136 —— **该比值没通过稳定性 Gate，不得写成"8K 正式 speedup"**；
+- 只能记录：*AR target-only 稳定；SpecDec 跨 block 差 42.7%；所有 clock-matched 观测均 <1；
+  方向上未观察到加速；正式倍数不得声明*。
+
+**④ target-only vs dual-resident 对照（支持"正式 AR 必须 target-only"）**
+| 分组 | AR target-only | AR dual-control | 说明 |
+|---|---|---|---|
+| 2K | 29.7–33.0 tok/s | 30.4–32.0 tok/s | 差异很小 |
+| 8K | **29.4** tok/s | **23.1** tok/s | 仅多驻留 draft 就让 8K AR decode 慢 **≈21%** |
+
+⇒ `residency_penalty`（= T_target/T_dual）8K ≈ 0.79；dual-control **仅作显存压力诊断**、
+**不作正式分母**（canonical 里 `claim_allowed=false`）。
+
+**⑤ canonical 记账修正（1.1 → 1.2，详见协议 §7c）**
+| 缺陷 | 1.1 的错误表现 | 1.2 修正 |
+|---|---|---|
+| summary `*_med` 未映射 | `prefill_seconds`/`e2e_tok_per_s`/`acceptance`/`accepted`/`proposed`/`rounds`/`draft_calls`/`target_block_calls`/`mismatch_rounds`/`all_accept_rounds` **全为 null** 且 `availability=false` | 按显式映射表取 `*_med`，重算后**全部有值**且 `availability=true` |
+| 子进程凭空判等价 | 驱动器"一条件一进程"使 `ref_gen` 为空，却拿 `gen_sha1([])` 去比 ⇒ `ar_equal=False` + `certified=True`（**8192 两侧 hash 明明都是 `610d0002bdfdcb37`**） | 子进程在**没有对照时不再判定**；父进程按 key 配对后填 `ar_equal`（8192 **True**；2048 False 且 `first_diff_index=34`，与已知 BF16 near-tie 一致） |
+| 措辞跨层 | `within_run_check_reason=' | between-block CHECK'`，而 within-run rel 只有 1.9% | 三层状态分离：`within_run_status=OK` / `between_block_status=CHECK` / `environment_status=OK`；原因写进 `between_block_check_reason`；声明原因输出 `NO CLAIM：SpecDec between-block CHECK（42.7% > 20%）` |
+| dual-control 误标资格 | 4 行 `speedup_claim_allowed=True` | 角色为 `diagnostic_control` 的行**永远** false（校验器兜底） |
+| availability 陈旧 | 父进程补值后 availability 仍为 false ⇒ 自相矛盾行 | `availability` 改为**值的纯函数**，每次 finalize 重算；跨进程填写后**原地刷新** |
+
+**⑥ 本轮 Gate**
+```
+P-state qualification:         PASS（两 block 预检均合格；全 cell pstate_ok=true）
+summary mapping:               PASS（10 个统计字段全部落表 + available=true；151 项 CPU 自测）
+cross-process equality:        PASS（8192 True / 2048 False，父进程填写且已认证）
+claim blocker wording:         PASS（within-run 与 between-block 分离）
+dual-control claim discipline: PASS（4/4 行 claim=false）
+canonical validator:           PASS（写盘前强制；合规行必须通过、错行必须被抓）
+8K SpecDec 波动原因:             **未定位** ⇒ 下一步 g5_8k_spec_variance_probe
+complete 12-cell stability:    HOLD（8K 未解释前不跑）
+cost breakdown:                HOLD（等环境与工具）
+formal Pilot:                  HOLD
+```
 
 ## 5. 复现设置（每次记录必须带上）
 - seed=42（测试）；性能脚本 seed=0，3 reps 取最优 + warmup；
