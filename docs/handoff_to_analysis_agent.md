@@ -293,8 +293,11 @@ Report & Presentation 15% / Creativity 10%。截止：提案 **10/7**、演示 W
 
 ## 11. Git 状态
 
-`main == origin/main`（`HEAD = f713332`）；最近提交（新→旧）：
+`main == origin/main`（`HEAD = 88a196f`）；最近提交（新→旧）：
 ```
+88a196f  G5 v1.2 canonical accounting: summary mapping, cross-process equality, layered status, claim discipline
+a93af68  Fix 3 pre-run hazards found while preparing the reduced re-run (no data was harmed)
+5141369  docs: handoff -- G5 v1.1 status, P-state preflight result (ledger 4.12), corrected blocker list and next-step order
 f713332  G5 v1.1: status layering + P-state preflight (and a real Sampler crash fix), claim gating
 1f34daa  fix: stability probe crashed unpacking build_dual_controls (3-tuples); add probe-level cell tests and a --dry-run preflight
 3235201  G5: freeze the measurement protocol, schema, stability probe, cost breakdown, k sweep
