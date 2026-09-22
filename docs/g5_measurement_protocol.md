@@ -300,6 +300,22 @@ canonical 行自身也必须一致（`validate_row` / `validate_canonical` 双�
 > 报告"检出双档"并给出切分，否则"单档"。该阈值是**可配置的诊断阈值，不是统计显著性判据**，
 > 也不作为任何 Gate；改阈值必须**事先**改并在此登记。
 
+### 10b. SpecDec 工具的硬性实现约束（2026-09-22 实测踩中，已修）
+`spec_dec.spec_decode_greedy` **内部会自己 prefill**，而引擎默认的 `spec_dec._prefill` 是
+**一次前向吃完整个 prompt**。8K 时那一层 fp32 softmax **一次性申请 ≈3.00 GiB** ⇒ 8 GB 卡上必然
+`torch.OutOfMemoryError`。因此任何在 8K 上驱动 SpecDec 的工具**必须**：
+
+1. **不要**在调用 `spec_decode_greedy` 之前自己再跑一次 `chunked_prefill`
+   （浪费显存，且让 prefill/decode 的划分变成假的 —— 引擎会**再** prefill 一次）；
+2. **必须**把 `spec_dec._prefill` 换成**分块 + 计时**版本（本仓库两处已如此：
+   `g4_part4_pilot_measure.spec_decode_timed`、`g5_8k_spec_variance_probe.timed_chunked_prefill`），
+   调用**一次** `spec_decode_greedy`，然后 `decode = total − prefill`；
+3. 插桩 pass 同样要包 `_prefill`（否则插桩 pass 自己会 OOM）；
+4. 用 `finally` 还原 `_prefill` / `_propose` / `_verify` / `_step` / `trim_cache` / `torch.cat`。
+
+对照检查：修复后 8K SpecDec prefill 实测 **29–32 s**、decode **6.7–11.7 s**，
+与缩小版 run 的 31.96 s / 6.72–11.72 s 一致；插桩闭合残差 **0.1%**。
+
 ## 11. 进入正式 Pilot 的最低条件
 
 1. 所有运行可审计且不覆盖旧数据 —— ✅（schema + run_id + 拒绝覆盖；`g5_schema_selftest_cpu` 151 项 / `g4_part4_selftest_cpu` 68 项全 PASS）

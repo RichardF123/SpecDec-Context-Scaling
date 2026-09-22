@@ -798,6 +798,50 @@ cost breakdown:                HOLD（等环境与工具）
 formal Pilot:                  HOLD
 ```
 
+### 4.15 8K SpecDec 工具级 OOM 缺陷与修复（2026-09-22，**在交付给使用者之前拦住**）
+
+**现象**：新写的 8K SpecDec 变体探针首次运行即崩 —— `spec` 角色的子进程**跑约 20 s 后退出且不产出任何文件**，
+另外两个 AR 角色的子进程正常完成。
+
+**根因（工具缺陷；不只是"显存不够"）**
+- `spec_dec.spec_decode_greedy` 内部调用 `spec_dec._prefill(model, ids)`；
+- 引擎默认的 `_prefill` 是 **一次前向吃完整个 prompt**（`model._run(embed_tokens(ids))`，**不分块**）；
+- 8K 时该层 attention 的 `torch.softmax(scores, dim=-1, dtype=torch.float32)` **一次性申请 ≈3.00 GiB**
+  （`scores` 约 `(1, 12, 8192, 8192)`），8 GB 卡上直接
+  `torch.OutOfMemoryError: Tried to allocate 3.00 GiB ... 9.31 GiB is allocated by PyTorch`。
+
+**为什么只有 spec 角色崩**：AR 角色走工具自己写的**分块** `chunked_prefill`；spec 角色的原实现
+**在调用 `spec_decode_greedy` 之前先跑了一次 `chunked_prefill`** ——
+① 那次 prefill **纯粹浪费**（引擎会**再** prefill 一次），② 它先把分配器池撑大，
+③ 随后引擎的**非分块** prefill 才撞上那笔 3 GiB 单次申请。
+
+**修复（与测量核心既有做法对齐）**
+- 新增 `timed_chunked_prefill(acc, chunk)`：把它换成 `spec_dec._prefill`（**分块 + 单独计时**），
+  再调用**一次** `spec_decode_greedy`，`decode = total − prefill`
+  —— 与 `g4_part4_pilot_measure.spec_decode_timed` **完全同一模式**（该模式在缩小版 run 中已稳定产出
+  prefill 31.96 s / decode 6.72–11.72 s）；
+- 插桩 pass 同样换成 `ph["prefill_target"].wrap(chunked_prefill)`（否则插桩 pass 也会 OOM）；
+- **同类缺陷一并修**：`g5_cost_breakdown.run_specdec_profiled` 原本也没包 `_prefill` ⇒ 它在 8K 首次运行
+  **同样会 OOM**；现已同样处理（该工具此前从未运行过，属**运行前**拦下）。
+
+**修复后实测验证（冒烟：1 个 spec 子进程、reps=1、warm=1、插桩 1 次；run_id `smoke2`）**
+```
+P-state qualified（SM 2295 / mem 8000 MHz）
+warm0: decode=13.77s prefill=23.88s        ← warm-up 效应明显
+rep0 : decode= 8.89s prefill=29.03s  dec_tok/s=7.20  n_gen=64
+插桩：outer=37.89s 残差=25ms(0.1%)          ← 阶段闭合良好
+exit=0
+```
+- prefill 29–31 s **与缩小版 run 的 31.96 s 一致** ⇒ 现在测到的确实是引擎真实的那次 prefill；
+- 插桩残差 0.1% ⇒ 阶段划分可用。
+
+**纪律说明（诚实登记）**
+- 修复前首跑**被我方测试脚本超时中断**，残留 3 个 AR 子进程文件：
+  `output/g5/variance/p5v_p5v_20260922T180840Z_{ar_target_0,ar_target_1,ar_dual_0}.json`；
+- **保留不删**，但**必须视为中断的残缺 run，不得用于任何结论**（缺 `spec` 角色、无 summary）；
+- `output/g5/variance/p5v_smoke2_spec_0.json` 是**单 rep 冒烟产物**，同样**不得当作实验数据**；
+- 两类文件各带自己的 run_id，探针**只读与自身 run_id 匹配的文件** ⇒ 后续正式运行不会被污染。
+
 ## 5. 复现设置（每次记录必须带上）
 - seed=42（测试）；性能脚本 seed=0，3 reps 取最优 + warmup；
 - prompt 固定（bench_basic.PROMPT，38 tok）；decode 数 64；

@@ -149,6 +149,31 @@ def chunked_prefill(model, ids, chunk=CHUNK):
     return lg, cache
 
 
+def timed_chunked_prefill(acc: dict, chunk: int = CHUNK):
+    """返回一个"**分块** + 计时"的 `spec_dec._prefill` 替身；`acc["t"]` 累积 prefill 秒数。
+
+    **这是本探针最容易写错的地方，务必理解**：
+      `spec_dec.spec_decode_greedy` 内部会调用 `spec_dec._prefill(model, ids)`，
+      而引擎默认的 `_prefill` 是 **一次前向吃完整个 prompt**。8K 时那一层的 fp32 softmax
+      会一次性申请 **≈3.00 GiB**，在 8 GB 卡上直接 `torch.OutOfMemoryError`
+      （2026-09-22 本工具首跑就是这么崩的）。
+      因此：
+        ① **不要**在调用 `spec_decode_greedy` 之前自己先跑一次 `chunked_prefill`——
+           既浪费显存，又让 prefill/decode 的划分变成假的（引擎会**再** prefill 一次）；
+        ② 正确做法与测量核心 `g4_part4_pilot_measure.spec_decode_timed` 完全一致：
+           把 `spec_dec._prefill` 换成这里的**分块**版本并单独计时，再调用一次
+           `spec_decode_greedy`，`decode = total − prefill`。
+    """
+    def timed(model, ids_):
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        lg, cache = chunked_prefill(model, ids_, chunk)
+        torch.cuda.synchronize()
+        acc["t"] += time.perf_counter() - t0
+        return lg, cache
+    return timed
+
+
 # --------------------------------------------------------------------------- 内存 / 系统状态
 def allocator_state() -> dict:
     """allocator 段/池状态（**关键是 `inactive_split` 与 allocation retries**）。"""
@@ -220,18 +245,30 @@ def formal_pass(tgt, drf, ids, eos, role: str) -> dict:
     reps = []
 
     def one() -> dict:
-        torch.cuda.synchronize()
-        t0 = time.perf_counter()
-        lg, cache = chunked_prefill(tgt, ids)
-        torch.cuda.synchronize()
-        t1 = time.perf_counter()
         if role == ROLE_SPEC:
-            out = spec_dec.spec_decode_greedy(tgt, drf, ids, MAXNEW, k=K, eos_id=eos,
-                                              target_kv=KV)
+            # SpecDec：**让引擎自己做 prefill**，只把 `_prefill` 换成分块+计时版本
+            # （见 timed_chunked_prefill 的说明；直接调 chunked_prefill 会 OOM 且划分失真）
+            acc = {"t": 0.0}
+            orig_prefill = spec_dec._prefill
+            spec_dec._prefill = timed_chunked_prefill(acc, CHUNK)
+            try:
+                torch.cuda.synchronize()
+                t0 = time.perf_counter()
+                out = spec_dec.spec_decode_greedy(tgt, drf, ids, MAXNEW, k=K, eos_id=eos,
+                                                  target_kv=KV)
+                torch.cuda.synchronize()
+                t2 = time.perf_counter()
+            finally:
+                spec_dec._prefill = orig_prefill
             gen, stats = out["gen"], out["stats"]
+            pre_s, dec_s = acc["t"], (t2 - t0) - acc["t"]
         else:
-            gen, cur = [], lg[:, -1:]
-            stats = None
+            torch.cuda.synchronize()
+            t0 = time.perf_counter()
+            lg, cache = chunked_prefill(tgt, ids)
+            torch.cuda.synchronize()
+            t1 = time.perf_counter()
+            gen, cur, stats = [], lg[:, -1:], None
             for i in range(MAXNEW):
                 tok = int(cur.reshape(-1, cur.shape[-1])[-1].argmax())
                 gen.append(tok)
@@ -240,11 +277,12 @@ def formal_pass(tgt, drf, ids, eos, role: str) -> dict:
                 if i == MAXNEW - 1:
                     break
                 cur, cache = spec_dec._step(tgt, tok, cache)
-        torch.cuda.synchronize()
-        t2 = time.perf_counter()
-        rec = dict(prefill_s=t1 - t0, decode_s=t2 - t1, total_s=t2 - t0,
-                   n_gen=len(gen), decode_tok_s=len(gen) / max(t2 - t1, 1e-9),
-                   e2e_tok_s=len(gen) / max(t2 - t0, 1e-9),
+            torch.cuda.synchronize()
+            t2 = time.perf_counter()
+            pre_s, dec_s = t1 - t0, t2 - t1
+        rec = dict(prefill_s=pre_s, decode_s=dec_s, total_s=pre_s + dec_s,
+                   n_gen=len(gen), decode_tok_s=len(gen) / max(dec_s, 1e-9),
+                   e2e_tok_s=len(gen) / max(pre_s + dec_s, 1e-9),
                    generated_token_hash=_gen_hash(gen))
         if stats:
             rec.update(dict(rounds=stats.get("rounds"), proposed=stats.get("proposed"),
@@ -285,16 +323,22 @@ def profiling_pass(tgt, drf, ids, eos, role: str, reps: int) -> dict:
                                         "target_replacement_step", "draft_replacement_step",
                                         "cache_trim_commit", "kv_cat", "prefill_target")}
             orig = dict(propose=spec_dec._propose, verify=spec_dec._verify, step=spec_dec._step,
-                        trim=spec_cache.trim_cache, cat=torch.cat)
+                        trim=spec_cache.trim_cache, cat=torch.cat,
+                        prefill=spec_dec._prefill)
 
             def step_profiled(model, token, cache):
                 name = ("target_replacement_step" if model is tgt
                         else "draft_replacement_step")
                 return ph[name].wrap(orig["step"])(model, token, cache)
 
+            def prefill_profiled(model, ids_):
+                # 同样必须**分块**：默认 `_prefill` 在 8K 会一次申请 ≈3.00 GiB 而 OOM
+                return ph["prefill_target"].wrap(chunked_prefill)(model, ids_, CHUNK)
+
             spec_dec._propose = ph["draft_propose"].wrap(orig["propose"])
             spec_dec._verify = ph["target_block_verify"].wrap(orig["verify"])
             spec_dec._step = step_profiled
+            spec_dec._prefill = prefill_profiled
             spec_cache.trim_cache = ph["cache_trim_commit"].wrap(orig["trim"])
             torch.cat = _kv_cat_wrapper(ph["kv_cat"], orig["cat"])
             try:
@@ -308,6 +352,7 @@ def profiling_pass(tgt, drf, ids, eos, role: str, reps: int) -> dict:
             finally:
                 spec_dec._propose, spec_dec._verify = orig["propose"], orig["verify"]
                 spec_dec._step, spec_cache.trim_cache = orig["step"], orig["trim"]
+                spec_dec._prefill = orig["prefill"]
                 torch.cat = orig["cat"]
         else:
             ph = {n: Phase(n) for n in ("target_single_step", "kv_cat", "prefill_target")}
@@ -316,7 +361,7 @@ def profiling_pass(tgt, drf, ids, eos, role: str, reps: int) -> dict:
             torch.cat = _kv_cat_wrapper(ph["kv_cat"], orig["cat"])
             try:
                 t0 = time.perf_counter()
-                lg, cache = chunked_prefill(tgt, ids)
+                lg, cache = ph["prefill_target"].wrap(chunked_prefill)(tgt, ids, CHUNK)
                 torch.cuda.synchronize()
                 t1 = time.perf_counter()
                 gen, cur = [], lg[:, -1:]
@@ -475,6 +520,24 @@ def _load_children(run_id: str) -> list[dict]:
     return out
 
 
+def estimate_minutes() -> float:
+    """**角色感知**的粗略时间估计。
+
+    8K 下 prefill 主导，且 AR（单模型）比 SpecDec（双模型）便宜得多，
+    所以不能用"所有角色一样贵"来估（会把总时长高估近一倍）。
+    实测参考（缩小版 run `gstab_20260922T040625Z`）：
+      SpecDec 8K：prefill 31.96 s + decode 6.7–11.7 s ⇒ 每 rep ≈ 42 s
+      AR 8K target-only：prefill 3.45 s + decode 2.2 s ⇒ 每 rep ≈ 5.7 s
+    """
+    per_rep = {ROLE_SPEC: 42.0, ROLE_AR_TARGET: 5.7, ROLE_AR_DUAL: 5.7}
+    total_s = 0.0
+    for role in ROLES:
+        per_pass = (WARM + REPS + PROF_REPS) * per_rep.get(role, 42.0)
+        total_s += PROCS * (PF.SECONDS + 25.0 + per_pass)     # 预检 + 加载 + 全部 pass
+    total_s += max(len(ROLES) * PROCS - 1, 0) * COOLDOWN
+    return total_s / 60.0
+
+
 def parent_main() -> int:
     run_id = S.default_run_id("p5v")
     OUTDIR.mkdir(parents=True, exist_ok=True)
@@ -483,8 +546,8 @@ def parent_main() -> int:
           f"warm={WARM} reps={REPS} 插桩 pass：{PROF_REPS} 次（**与正式计时分开**）")
     print(f"[p5v] 对照口径：ar_target=正式基线参照（本工具**不**据此做正式声明）；"
           f"ar_dual=诊断控制，永不作分母")
-    print(f"[p5v] 预计 {'%.0f' % (len(ROLES) * PROCS * (6 * (32 + 10) + 60) / 60)} 分钟量级；"
-          f"可用 P5V_PROCS/P5V_REPS 缩小\n", flush=True)
+    print(f"[p5v] 预计 ≈{estimate_minutes():.0f} 分钟（角色感知估算：SpecDec 每 rep ≈42s、"
+          f"AR 每 rep ≈6s；实际受加载与冷却影响）\n", flush=True)
 
     order = []
     for i in range(PROCS):
@@ -691,8 +754,8 @@ def main() -> int:
         print(f"[p5v] 每进程：P-state 预检({PF.SECONDS}s) + warm{WARM} + reps{REPS} "
               f"+ 插桩 {PROF_REPS} 次；ctx={CTX} kv={KV} k={K} max_new={MAXNEW}")
         print(f"[p5v] 输出目录 = {OUTDIR}（唯一命名，不覆盖）")
-        print(f"[p5v] 预计时间 ≈ {len(ROLES) * PROCS * (6 * (32 + 10) + 60) / 60:.0f} 分钟"
-              f"（8K 每 rep 约 40s；缩小请调 P5V_PROCS / P5V_REPS）")
+        print(f"[p5v] 预计时间 ≈ {estimate_minutes():.0f} 分钟"
+              f"（角色感知：SpecDec 每 rep≈42s、AR 每 rep≈6s）")
         return 0
     if os.environ.get("P5V_CHILD"):
         role = os.environ.get("P5V_ROLE", ROLE_SPEC)

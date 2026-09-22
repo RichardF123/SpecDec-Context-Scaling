@@ -138,17 +138,24 @@ def run_ar_profiled(tgt, ids, eos):
 def run_specdec_profiled(tgt, drf, ids, eos):
     ph = {n: Phase(n) for n in ("draft_propose", "target_block_verify",
                                 "target_replacement_step", "draft_replacement_step",
-                                "cache_trim_commit", "kv_cat")}
+                                "cache_trim_commit", "kv_cat", "prefill_target")}
     orig = dict(propose=spec_dec._propose, verify=spec_dec._verify, step=spec_dec._step,
-                trim=spec_cache.trim_cache, cat=torch.cat)
+                trim=spec_cache.trim_cache, cat=torch.cat, prefill=spec_dec._prefill)
 
     def step_profiled(model, token, cache):
         name = "target_replacement_step" if model is tgt else "draft_replacement_step"
         return ph[name].wrap(orig["step"])(model, token, cache)
 
+    def prefill_profiled(model, ids_):
+        # **必须分块**：引擎默认的 `_prefill` 会把整个 prompt 放进**一次**前向，
+        # 8K 时那一层的 fp32 softmax 一次申请 ≈3.00 GiB ⇒ 8 GB 卡上必然 OOM
+        # （2026-09-22 在 8K SpecDec 变体探针上实测到该崩溃；同类缺陷一处修两处）。
+        return ph["prefill_target"].wrap(chunked_prefill)(model, ids_, CHUNK)
+
     spec_dec._propose = ph["draft_propose"].wrap(orig["propose"])
     spec_dec._verify = ph["target_block_verify"].wrap(orig["verify"])
     spec_dec._step = step_profiled
+    spec_dec._prefill = prefill_profiled
     spec_cache.trim_cache = ph["cache_trim_commit"].wrap(orig["trim"])
     torch.cat = _kv_cat_wrapper(ph["kv_cat"], orig["cat"])
     try:
@@ -159,6 +166,7 @@ def run_specdec_profiled(tgt, drf, ids, eos):
     finally:
         spec_dec._propose, spec_dec._verify, spec_dec._step = orig["propose"], orig["verify"], orig["step"]
         spec_cache.trim_cache = orig["trim"]
+        spec_dec._prefill = orig["prefill"]
         torch.cat = orig["cat"]
     return out, outer, {n: p.stats() for n, p in ph.items()}
 
