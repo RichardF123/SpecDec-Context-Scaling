@@ -931,6 +931,54 @@ SpecDec 42.7%；prefill 在 16 个样本里 **3.34–3.45 s（±1.6%）**。
 - 命名提醒：子进程文件名为 `p5v_p5v_<stamp>_<role>_<i>.json`（run_id 自带 `p5v_` 前缀 ⇒ 出现重复前缀），
   **纯属命名冗余、不影响解析**，为保持与既有产物连续**不改名**。
 
+**根因已定位（2026-09-23，用户贴回完整 traceback）——8K SpecDec 撞物理显存墙**
+```
+torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 896.00 MiB.
+GPU 0 has a total capacity of 8.00 GiB of which 0 bytes is free.
+Of the allocated memory 6.07 GiB is allocated by PyTorch, and 1.08 GiB is reserved by PyTorch but unallocated.
+  spec_dec.py:61   drf_lg, drf_cache = _prefill(draft, prompt_ids)      ← **draft 的 prefill**
+    → 工具的分块替身 → model_self.py:169  torch.softmax(scores, fp32)   ← 需要 896 MiB
+```
+- 896 MiB = draft 最后一个 chunk 的 fp32 softmax：`14 heads × 2048(q) × 8192(kv) × 4 B = 940 MB` ✓ 数量级吻合；
+  同理 target 的最后一个 chunk 需要 `12 × 2048 × 8192 × 4 = 806 MB`；
+- 崩溃瞬间：PyTorch 池 **6.07 GiB allocated + 1.08 GiB reserved-unallocated = 7.15 GiB**，
+  物理显存 **0 bytes free** ⇒ 请求**连续** 896 MiB 失败；
+- **为什么 AR 角色不崩**：AR target-only 的 `peak_allocated` 只有 5.07 GiB、AR dual 5.99 GiB，
+  而 SpecDec 8K 是 **6.95 GiB**（§4.14 实测）⇒ SpecDec 比 AR 多需要约 **1.9 GiB**，
+  正好越过 8.00 GiB 物理上限。
+- ⇒ **8K 双模型 SpecDec 在本机是"踩在物理显存线上"的条件**：能否跑完取决于
+  ① 桌面/其它进程占用多少显存、② 分配器碎片（`inactive_split` 曾达 **1501 MiB**）。
+- **实测旁证**：agent 事后检查时，这台机器上同时跑着**一个游戏**（`Gamble With Your Friends.exe`）
+  与约 **20 个占 GPU 的应用**（Doubao / QQ / WeChat / Teams / CloudMusic / 多个 msedgewebview2 等），
+  `nvidia-smi` 显示 **1440 MiB / 60% 利用率**、**28 个 C+G 进程挂着 GPU**；
+  此时预检的"空闲快照"是 SM **2520 MHz / 53 W**（正常空闲应是 210 MHz / 5 W）
+  ⇒ **"空闲快照"本身就是外部占用的探针**。
+- 之前能跑通的三次（`045620Z` spec_0、agent 冒烟、缩小版 run 两 block）都发生在外部占用较低的时段。
+
+**由此得到一个强有力的待验假设（⚠️ 仍是假设，不是结论）**
+> 8K 下 SpecDec 的"快档/慢档"可能不是算法或 P-state 问题，而是**是否被挤出物理显存**：
+> 一旦外部占用/碎片把可用显存压到临界线以下，KV 增长与软max 的**连续**申请就会触发
+> WDDM 分页/重试（实测 `num_alloc_retries` 已出现过 1），于是 decode 与 prefill 同时变慢
+> （§4.16 里 prefill 13.2 s → 32 s、decode 6.72 s → 11.72 s 正好是同一现象的两面）。
+> **判据（必须先跑出数据）**：慢档进程的 `cuda_free_mib` / `smi_used_after_load` /
+> `inactive_split_peak_mib` / `num_alloc_retries` 是否系统性高于快档。
+> **在拿到该判据之前，不得把原因写成 WDDM paging。**
+
+**为此新增的数据字段**（否则上述结论只能靠事后回忆）
+- 每个子进程在**载入权重后立刻**记录 `smi_used_after_load`（物理占用）与
+  `alloc_after_load.cuda_free_mib`；
+- 新增 `gpu_consumers`：`nvidia-smi` 列出的 **GPU 上其它 C+G 进程数与非 python 进程名**；
+- 新增 `alloc_conf`：把 `PYTORCH_CUDA_ALLOC_CONF`（若设置）随数据落盘，
+  否则事后无法判断两批数据可比性。
+
+**下一次运行的处置（按顺序，均需人执行）**
+1. **关掉游戏与占 GPU 的应用**（当前 1440 MiB / 28 个进程）——**零协议影响**，先试这个；
+2. 若仍 OOM：采用 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`
+   （直接针对 1.08 GiB "reserved but unallocated" 的碎片；**属分配器行为变更**，
+   已随行记录 `alloc_conf`，采用时须在台账登记，且不得与未采用的批次混用）；
+3. 若仍 OOM：把 `P5V_CHUNK` 降到 1024 作为**单独标注的**诊断臂（最大瞬时申请减半），
+   **绝不与 chunk=2048 的行混用**。
+
 **第三次尝试（`p5v_20260923T155628Z`，2026-09-23 23:57 本地）—— 环境不合格，全部跳过**
 - 9 个子进程（spec 0–2、ar_target 0–2、ar_dual 0–2）各写出一条
   `skipped = "P-state 不合格 -> 未启动计时（数据不产生）"` 记录，**没有任何计时数据**；

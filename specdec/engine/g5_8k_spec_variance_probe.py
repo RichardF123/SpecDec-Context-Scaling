@@ -394,13 +394,15 @@ def profiling_pass(tgt, drf, ids, eos, role: str, reps: int) -> dict:
                         break
                     cur, cache = spec_dec._step(tgt, tok, cache)
                 torch.cuda.synchronize()
-                outer = time.perf_counter() - t1
+                # **必须从 t0（prefill 之前）算起**：phases 里含 `prefill_target`，
+                # 若 outer 只算 decode，闭合残差会变成负数（-3.4 s，2026-09-23 实测踩中）。
+                outer = time.perf_counter() - t0
                 stats = dict(n_gen=len(gen))
             finally:
                 spec_dec._step, torch.cat = orig["step"], orig["cat"]
         phases = {n: p.stats() for n, p in ph.items()}
-        rows.append(dict(phases=phases, outer_decode_s=outer, stats=stats))
-        print(f"    prof{i}: outer_decode={outer:.2f}s", flush=True)
+        rows.append(dict(phases=phases, outer_total_s=outer, stats=stats))
+        print(f"    prof{i}: outer_total={outer:.2f}s", flush=True)
 
     names = rows[0]["phases"].keys()
     agg = {}
@@ -410,12 +412,12 @@ def profiling_pass(tgt, drf, ids, eos, role: str, reps: int) -> dict:
             calls=int(statistics.median([x["phases"][n]["calls"] for x in rows])),
             median_ms=statistics.median([x["phases"][n]["median_ms"] for x in rows
                                          if x["phases"][n]["median_ms"] is not None] or [0]) or None)
-    outer = statistics.median([x["outer_decode_s"] for x in rows])
+    outer = statistics.median([x["outer_total_s"] for x in rows])
     additive = sum(v["total_ms"] for n, v in agg.items() if n not in SUBSET_PHASES)
     st = rows[0]["stats"] or {}
     rounds = st.get("rounds") or st.get("n_gen") or 0
     return dict(
-        phases=agg, outer_decode_s=outer, subset_phases=list(SUBSET_PHASES),
+        phases=agg, outer_total_s=outer, subset_phases=list(SUBSET_PHASES),
         accounted_ms=additive, residual_ms=outer * 1000.0 - additive,
         residual_pct=100.0 * (outer * 1000.0 - additive) / max(outer * 1000.0, 1e-9),
         per_round_ms={n: (v["total_ms"] / rounds if rounds else None) for n, v in agg.items()},
@@ -436,6 +438,9 @@ def child_main(role: str, index: int, run_id: str) -> int:
                      max_new=MAXNEW, chunk=CHUNK, reps=REPS, warm=WARM,
                      target_model=TARGET, draft_model=DRAFT, compute_dtype="bfloat16",
                      timestamp_utc=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                     # 分配器配置必须随数据落盘：一旦有人设置 PYTORCH_CUDA_ALLOC_CONF，
+                     # 它的存在必须能从数据里看出来，否则事后无法判断可比性。
+                     alloc_conf=os.environ.get("PYTORCH_CUDA_ALLOC_CONF"),
                      git=S.git_meta(ROOT))
 
     # ---- 环境资格（**在正式计时之前**，且只采负载期样本）----
@@ -468,8 +473,12 @@ def child_main(role: str, index: int, run_id: str) -> int:
     else:
         rec["resident_models"] = ["target"]
     rec["alloc_after_load"] = allocator_state()
+    rec["smi_used_after_load"] = D.system_snapshot()      # 载入权重后立刻看物理占用
+    rec["gpu_consumers"] = gpu_consumers()
     print(f"[p5v] 驻留={rec['resident_models']} "
-          f"alloc={torch.cuda.memory_allocated() / 2**30:.2f} GiB", flush=True)
+          f"alloc={torch.cuda.memory_allocated() / 2**30:.2f} GiB "
+          f"| smi 物理占用={rec['smi_used_after_load'].get('mem_used_MiB')} MiB "
+          f"| GPU 上其它 C+G 进程={rec['gpu_consumers'].get('count')}", flush=True)
 
     tgt.set_kv_format(spec_dec._fmt(KV))
     rec["formal"] = formal_pass(tgt, drf, ids, eos, role)
@@ -488,7 +497,7 @@ def child_main(role: str, index: int, run_id: str) -> int:
         try:
             rec["profiling"] = profiling_pass(tgt, drf, ids, eos, role, PROF_REPS)
             p = rec["profiling"]
-            print(f"[p5v] 插桩：outer={p['outer_decode_s']:.2f}s "
+            print(f"[p5v] 插桩：outer_total={p['outer_total_s']:.2f}s "
                   f"残差={p['residual_ms']:.0f}ms({p['residual_pct']:.1f}%)", flush=True)
         except Exception as e:                              # noqa: BLE001
             # 插桩失败**不得**毁掉正式结果：记录失败原因后照常收尾
@@ -576,21 +585,59 @@ def missing_required_roles(coverage: dict, required=(ROLE_SPEC, ROLE_AR_TARGET))
             if not (coverage.get(role) or {}).get("ok")]
 
 
+def gpu_consumers() -> dict:
+    """**GPU 上的其它消费者**（除本进程外的 C+G 进程），只在计时区之外调用。
+
+    为什么必须采集：2026-09-23 的 8 个 spec 子进程全部 OOM，事后才发现这台机器上
+    同时跑着一个游戏 + 约 20 个占 GPU 的应用（实测 1440 MiB / 28 个 C+G 进程）。
+    若不把"当时还有谁在用 GPU"写进数据，就只能靠事后回忆，无法判断可比性。
+    """
+    out = {"available": False, "count": None, "names": [], "note": ""}
+    try:
+        r = subprocess.run(["nvidia-smi", "--query-compute-apps=pid,process_name",
+                            "--format=csv,noheader"],
+                           capture_output=True, text=True, encoding="utf-8",
+                           errors="replace", timeout=15)
+        rows = [ln.strip() for ln in (r.stdout or "").splitlines() if ln.strip()]
+        names = []
+        for ln in rows:
+            parts = [p.strip() for p in ln.split(",")]
+            if len(parts) >= 2:
+                names.append(parts[1])
+        out.update(available=True, count=len(rows),
+                   names=sorted({n for n in names if "python" not in n.lower()}))
+    except Exception as e:                                  # noqa: BLE001
+        out["note"] = f"{type(e).__name__}: {e}"
+    return out
+
+
 def _crash_path(role: str, index: int, run_id: str) -> Path:
     return OUTDIR / f"p5v_{run_id}_{role}_{index}_crash.txt"
 
 
 def _write_crash(role: str, index: int, run_id: str, text: str) -> None:
-    """把子进程的崩溃栈落盘。
+    """把子进程的崩溃栈 + **崩溃时刻的显存状态**一起落盘。
 
-    为什么必须落盘：2026-09-23 那 4 个 spec 子进程崩溃后**什么都没留下**，
+    为什么必须落盘：2026-09-23 那 8 个 spec 子进程崩溃后**什么都没留下**，
     父进程只看到"退出码非 0"，崩溃原因只在终端的滚动输出里 ⇒ 事后无法定位。
-    有了这个文件，父进程与事后分析都能直接看到 `torch.OutOfMemoryError` 这类根因。
+    有了这个文件，`torch.OutOfMemoryError` 这类根因以及当时的 pool 状态都能被事后读到。
     """
     try:
         OUTDIR.mkdir(parents=True, exist_ok=True)
+        extra = ""
+        try:
+            import torch as _t
+            if _t.cuda.is_available():
+                free, total = _t.cuda.mem_get_info()
+                extra = ("\n--- allocator state at crash ---\n"
+                         f"alloc_conf={os.environ.get('PYTORCH_CUDA_ALLOC_CONF')!r}\n"
+                         + json.dumps(allocator_state(), ensure_ascii=False, indent=1)
+                         + f"\ncuda_free_mib={free / 2 ** 20:.1f} "
+                           f"cuda_total_mib={total / 2 ** 20:.1f}\n")
+        except Exception:                                   # noqa: BLE001
+            pass
         p = _crash_path(role, index, run_id)
-        p.write_text(f"role={role} index={index} run_id={run_id}\n\n{text}",
+        p.write_text(f"role={role} index={index} run_id={run_id}\n{extra}\n{text}",
                      encoding="utf-8")
         print(f"[p5v] 崩溃栈已落盘 -> {p}", flush=True)
     except Exception:                                       # noqa: BLE001
@@ -837,6 +884,8 @@ def print_report(a: dict) -> None:
     print(f"  规则：{q1['decode_tok_per_s']['rule']}")
     print(f"  SpecDec decode tok/s（排序）：{q1['decode_tok_per_s']['sorted']}")
     print(f"  检出={q1['decode_tok_per_s']['detected']}  最大/最小={q1['max_over_min']}")
+    if q1["decode_tok_per_s"].get("warning"):
+        print(f"  !! {q1['decode_tok_per_s']['warning']}")
     if q1["decode_tok_per_s"]["split"]:
         s = q1["decode_tok_per_s"]["split"]
         print(f"  最优切分：低档 {s['low']} / 高档 {s['high']}  比值={s['ratio']:.2f}")
@@ -873,7 +922,10 @@ def print_report(a: dict) -> None:
     print("\n== [V7] 与各状态量并列（**只列观测，未做归因**）==")
     print(f"  {'idx':>4}{'dec_tok/s':>11}{'sm_MHz':>8}{'mem_MHz':>9}{'pwr_W':>7}{'temp_C':>8}"
           f"{'smi_MiB':>9}{'peakAlloc':>10}{'peakResv':>10}{'inactSplit':>11}{'retries':>8}")
-    for r in a["Q6_correlates"]["per_process"]:
+    rows7 = a["Q6_correlates"]["per_process"]
+    if not rows7:
+        print("  （**无 SpecDec 样本** —— 该表只统计 SpecDec 角色；样本缺失时不得归因）")
+    for r in rows7:
         f2 = lambda v: "n/a" if v is None else f"{v:.1f}"          # noqa: E731
         print(f"  {r['index']:>4}{r['decode_tok_s']:>11.2f}{str(r['sm_clock_mhz']):>8}"
               f"{str(r['mem_clock_mhz']):>9}{f2(r['power_w']):>7}{f2(r['temp_c']):>8}"

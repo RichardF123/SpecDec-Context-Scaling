@@ -11,13 +11,20 @@ set "PYTHONIOENCODING=utf-8"
 REM ===========================================================================
 REM  8K SpecDec speed-cluster probe: preflight -> dry-run -> probe
 REM
-REM  Why this script exists: in cmd, `set P5V_PROCS=4 & set P5V_REPS=5` bakes the
-REM  space before `&` into the value and can silently mis-read the config.
-REM  Quoted `set "VAR=value"` avoids that.
-REM
 REM  Usage (from D:\RealDSH\specdec):   scripts\run_g5_variance.cmd
 REM  NOTE: this file is ASCII-only and CRLF on purpose. Do not convert to UTF-8.
 REM ===========================================================================
+
+REM ---- before running: close anything that holds VRAM (browser, players).
+REM      The 8K dual-model run needs ~900 MiB of contiguous free VRAM for the
+REM      draft prefill softmax; the desktop alone can hold 1.3 GiB.
+REM      Check with:  nvidia-smi --query-gpu=memory.used --format=csv
+
+REM ---- IF IT STILL OOMs, uncomment the next line (allocator de-fragmentation).
+REM      This is an ALLOCATOR behaviour change: it is recorded per child as
+REM      alloc_conf, and rows produced with it must not be mixed with rows
+REM      produced without it. Register it in docs/data_ledger.md when used.
+REM set "PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True"
 
 REM ---- frozen experiment configuration (do not change casually) ----
 set "P5V_CTX=8192"
@@ -40,8 +47,7 @@ if "%RC%"=="0" goto :pf_ok
 if "%RC%"=="3" goto :pf_not_qualified
 echo.
 echo !! Preflight could not obtain a qualified reading (exit %RC%).
-echo    This is an ENVIRONMENT/INTERPRETER problem, not necessarily a power setting.
-echo    Check that the venv python has torch+CUDA: run  %PY% -c "import torch"
+echo    ENVIRONMENT/INTERPRETER problem: check the venv python has torch+CUDA.
 goto :fail
 :pf_not_qualified
 echo.
@@ -61,17 +67,19 @@ if errorlevel 1 (
 
 echo.
 echo === [3/3] real run (3 roles x 4 procs = 12 independent processes; serial) ===
+echo     If the SpecDec role fails, the parent will REFUSE to report and will
+echo     write failures + crash files under output\g5\variance\.
 %PY% -m specdec.engine.g5_8k_spec_variance_probe
 if errorlevel 1 (
-  echo !! probe failed
+  echo.
+  echo !! probe exited non-zero. Read these files in output\g5\variance\ :
+  echo      *failures.json          return code of every child
+  echo      *_crash.txt             traceback + allocator state at crash
   goto :fail
 )
 
 echo.
 echo === Send back the [V1] .. [V7] output blocks ===
-
-echo.
-echo === Done. ===
 endlocal
 exit /b 0
 
