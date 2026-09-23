@@ -31,7 +31,14 @@ set "P5V_CTX=8192"
 set "P5V_KV=base_bf16"
 set "P5V_K=4"
 set "P5V_MAXNEW=64"
+REM ---- if the fit check still fails with the default chunk, uncomment this.
+REM      chunk 2048 -> 1024 halves the largest single CUDA request
+REM      (draft prefill softmax 768 MiB -> ~384 MiB), which is what the OOM
+REM      is about. Config change: if used, use it for the WHOLE run (including
+REM      the AR controls) and register it as the chunk=1024 arm -- its prefill
+REM      numbers must NOT be mixed with the chunk=2048 stability run.
 set "P5V_CHUNK=2048"
+REM set "P5V_CHUNK=1024"
 set "P5V_WARM=1"
 
 REM ---- procs/reps: SpecDec procs MUST be >=4, else bimodality is not tested ----

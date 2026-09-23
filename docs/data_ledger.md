@@ -979,6 +979,58 @@ Of the allocated memory 6.07 GiB is allocated by PyTorch, and 1.08 GiB is reserv
 3. 若仍 OOM：把 `P5V_CHUNK` 降到 1024 作为**单独标注的**诊断臂（最大瞬时申请减半），
    **绝不与 chunk=2048 的行混用**。
 
+**量化结论（2026-09-23 17:06/17:07/17:1x 三次直接诊断，决定性）**
+1. **拟合测试脚本 `scripts\run_g5_fit_check.cmd`**（1 个 SpecDec 进程、warm1+rep1、无插桩，约 2 min）
+   在**游戏已关闭、AC 供电、SM 2340 MHz** 的条件下**连续两次失败**：
+   - 两次都是 **退出码 3221225477 = `0xC0000005`（原生访问冲突）**，日志停在
+     `Loading weights: 100%|338/338` 之后、`[load] weights copied on CPU` 之前 ⇒
+     崩溃发生在**权重装载阶段**，且**不是 Python 异常**（`try/except` 抓不到，`crash.txt` 因此为空）；
+   - ⇒ 说明在 WDDM 超订下，**显存耗尽可以表现为原生崩溃而不是干净的 OOM**。
+2. **直接跑该子进程**（不经脚本）则走到更远：两个模型**装载成功**，随后在同一处崩于
+   `torch.OutOfMemoryError`。崩溃瞬间的**实测数字**（`crash.txt` 已落盘）：
+```
+alloc_conf='expandable_segments:True'      ← 配置**确实生效**（torch 读到了）
+peak_allocated_mib = 6115.7      peak_reserved_mib = 6736.0
+inactive_split_peak_mib = 945.06     num_alloc_retries = 2     num_ooms = 1
+cuda_free_mib = 771.0            cuda_total_mib = 8187.5
+请求：768 MiB   ← **在 771 MiB "空闲" 的情况下仍然失败**
+```
+3. **因此根因是"刚好越线 + 碎片"，不是"差很多"**：
+   - PyTorch 池峰值需要 **≈7.4 GiB**（6736 reserved + 768 新请求）；
+   - 而本机非 CUDA 占用约 **1.4 GiB**（27–28 个 C+G 进程 + 桌面 + 驱动），
+     `8187.5 − 6736 = 1451 MiB` 正好被它吃掉；
+   - 池内还有 **945 MiB `inactive_split`**（已释放但**无法复用**的碎片）⇒ 那笔 768 MiB **连续**申请
+     既拿不到新物理页、也用不上碎片；`num_alloc_retries` 已重试 2 次后判 OOM。
+   - **失败裕度只有 3 MiB**（771 请求 768）⇒ 任何几百 MiB 的外部占用变化都足以决定成败，
+     这也解释了为什么同一份代码在不同时段 "有时成功、有时失败"。
+4. **`expandable_segments:True` 单独不足以救**：设置生效后失败数字**逐字节相同**
+   （771 / 945.06 / 5.22 GiB / 768 MiB）⇒ 该开关没有改善本场景的碎片。
+   因此**不能**把它当作"已解决"，只能作为**叠加**手段之一。
+5. 对照参考：缩小版 run 里 8K SpecDec 的 `peak_reserved_gib = 10.47`（**> 物理 8 GiB**）
+   ⇒ 那两次成功是**靠 WDDM 分页挪到共享内存**才跑完的；这与"慢档"（decode 11.72 s、
+   prefill 32 s）方向一致 —— **但"慢档 = 分页"仍是假设，判据见上。**
+
+**由此确定的两个缓解手段（供人决策）**
+| 手段 | 效果 | 代价 / 性质 |
+|---|---|---|
+| A. 把外部占用压到最低（关浏览器/IM/音乐/网盘等，目标 `nvidia-smi` 空闲 ≤300 MiB） | 直接补上那 ~0.5–1.0 GiB 的缺口 | **零协议影响**，首选；但裕度只有 3 MiB，不保证 |
+| B. `P5V_CHUNK=1024`（最大瞬时申请 768→约 384 MiB） | 把 3 MiB 的裕度变成约 390 MiB，**大概率直接解决** | **属配置变更**：必须整轮（含 AR 对照）统一用 1024，并登记为"chunk=1024 臂"，**其 prefill 数字不得与 chunk=2048 的缩小版 run 混用** |
+
+**执行顺序（脚本已就绪）**：先 A → `scripts\run_g5_fit_check.cmd`（2 min）；
+若仍失败 → 在脚本里放开 `P5V_CHUNK=1024` 再跑 fit check；通过后再跑
+`scripts\run_g5_variance.cmd`（33 min）。
+
+**本轮诊断新增/修复的工具项**
+- `scripts\run_g5_fit_check.cmd`（新）：2 分钟"**到底装不装得下**"检查——1 个 SpecDec 进程、
+  warm1+rep1、无插桩；失败时明确指向 `*_crash.txt` 与 `*_failures.json`；
+- 崩溃文件现在同时包含**崩溃瞬间的分配器状态**与 `alloc_conf`；
+- 子进程记录新增 `smi_used_after_load`（载入权重后立刻看物理占用）与
+  `gpu_consumers`（GPU 上其它 C+G 进程数/名称）；
+- 修复 **AR 插桩 pass 的负数闭合残差**（`outer` 原先只算 decode、却与含 `prefill_target` 的
+  阶段和相减 ⇒ 残差 −3.4 s）；改为从 prefill 之前计时并改名 `outer_total_s`；
+- `[V2]` 的"样本不足"警告与 `[V7]` 的空表现在都会明确打印；
+- `missing_required_roles` 只在**被请求的**角色内判缺失，因此 `P5V_ROLES=spec` 的冒烟不会被自己的硬拦拒掉。
+
 **第三次尝试（`p5v_20260923T155628Z`，2026-09-23 23:57 本地）—— 环境不合格，全部跳过**
 - 9 个子进程（spec 0–2、ar_target 0–2、ar_dual 0–2）各写出一条
   `skipped = "P-state 不合格 -> 未启动计时（数据不产生）"` 记录，**没有任何计时数据**；

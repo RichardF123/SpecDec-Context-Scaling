@@ -580,9 +580,13 @@ def coverage_report(recs: list[dict], roles=None, procs=None) -> dict:
 
 
 def missing_required_roles(coverage: dict, required=(ROLE_SPEC, ROLE_AR_TARGET)) -> list:
-    """核心角色（SpecDec 本体 + AR 参照）一个样本都没有时，整轮不得产出结果。"""
+    """**在被请求的角色里**，核心角色一个样本都没有时，整轮不得产出结果。
+
+    注意"在被请求的角色里"：冒烟测试会只请求 `P5V_ROLES=spec`（1 个进程、1 rep），
+    此时不该因为"没有 ar_target"而被自己的硬拦拒掉。只有**请求了却没拿到**才算失败。
+    """
     return [role for role in required
-            if not (coverage.get(role) or {}).get("ok")]
+            if role in coverage and not (coverage.get(role) or {}).get("ok")]
 
 
 def gpu_consumers() -> dict:

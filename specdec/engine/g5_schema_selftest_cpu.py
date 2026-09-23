@@ -839,6 +839,11 @@ def main() -> int:
           V.missing_required_roles(V.coverage_report(
               [_child("spec", 0, 9.5)], roles=["spec", "ar_target", "ar_dual"], procs=4))
           == ["ar_target"])
+    check("㊴ 只请求 spec 的冒烟测试不被自己的硬拦拒掉（未请求的角色不算缺失）",
+          V.missing_required_roles(V.coverage_report(
+              [_child("spec", 0, 9.5)], roles=["spec"], procs=1)) == []
+          and V.missing_required_roles(V.coverage_report(
+              [], roles=["spec"], procs=1)) == ["spec"])
     a_missing = V.analyse(recs_missing)
     check("㊵ 样本不足时 Q1 必须显式警告，不得默默给'未检出双档'",
           a_missing["Q1_bimodality"]["spec_samples"] == 0
