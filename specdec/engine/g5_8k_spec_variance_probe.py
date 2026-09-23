@@ -576,6 +576,27 @@ def missing_required_roles(coverage: dict, required=(ROLE_SPEC, ROLE_AR_TARGET))
             if not (coverage.get(role) or {}).get("ok")]
 
 
+def _crash_path(role: str, index: int, run_id: str) -> Path:
+    return OUTDIR / f"p5v_{run_id}_{role}_{index}_crash.txt"
+
+
+def _write_crash(role: str, index: int, run_id: str, text: str) -> None:
+    """把子进程的崩溃栈落盘。
+
+    为什么必须落盘：2026-09-23 那 4 个 spec 子进程崩溃后**什么都没留下**，
+    父进程只看到"退出码非 0"，崩溃原因只在终端的滚动输出里 ⇒ 事后无法定位。
+    有了这个文件，父进程与事后分析都能直接看到 `torch.OutOfMemoryError` 这类根因。
+    """
+    try:
+        OUTDIR.mkdir(parents=True, exist_ok=True)
+        p = _crash_path(role, index, run_id)
+        p.write_text(f"role={role} index={index} run_id={run_id}\n\n{text}",
+                     encoding="utf-8")
+        print(f"[p5v] 崩溃栈已落盘 -> {p}", flush=True)
+    except Exception:                                       # noqa: BLE001
+        pass
+
+
 def _load_children(run_id: str) -> list[dict]:
     out = []
     for role in ROLES:
@@ -628,9 +649,14 @@ def parent_main() -> int:
         r = subprocess.run([sys.executable, "-m", "specdec.engine.g5_8k_spec_variance_probe"],
                            env=env, cwd=str(ROOT))
         if r.returncode not in (0, 3):
+            crash = _crash_path(role, i, run_id)
             print(f"[p5v] !! 子进程 role={role} index={i} 退出码 {r.returncode}"
                   f"（0=正常，3=环境不合格跳过；其它=崩溃）", flush=True)
-            failed.append(dict(role=role, index=i, returncode=r.returncode))
+            if crash.exists():
+                first = crash.read_text(encoding="utf-8").strip().splitlines()[-1]
+                print(f"[p5v]    崩溃末行：{first}", flush=True)
+            failed.append(dict(role=role, index=i, returncode=r.returncode,
+                               crash_file=(crash.name if crash.exists() else None)))
         if n < len(order) - 1 and COOLDOWN > 0:
             time.sleep(COOLDOWN)
 
@@ -871,7 +897,11 @@ def main() -> int:
         role = os.environ.get("P5V_ROLE", ROLE_SPEC)
         idx = int(os.environ.get("P5V_INDEX", "0"))
         rid = os.environ.get("P5V_RUN_ID", "adhoc")
-        return child_main(role, idx, rid)
+        try:
+            return child_main(role, idx, rid)
+        except BaseException:                               # noqa: BLE001
+            _write_crash(role, idx, rid, traceback.format_exc())
+            raise
     return parent_main()
 
 
