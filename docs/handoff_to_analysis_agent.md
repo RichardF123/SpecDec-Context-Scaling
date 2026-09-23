@@ -223,14 +223,26 @@ Report & Presentation 15% / Creativity 10%。截止：提案 **10/7**、演示 W
     **完全相同**；prefill **31.958 vs 32.000 s**（几乎相同）；SpecDec within-run **1.9% / 2.0%（OK）**；
     ⇒ **不是**低功耗 P-state、**不是**热降频、**不是** prefill 波动、**不是** token 随机性。
     只有 decode **6.72 s → 11.72 s**。**原因尚未定位**。
-27. **residency 效应（支持"正式 AR 必须 target-only"）**：2K 时 dual-control 与 target-only 接近
-    （30.4–32.0 vs 29.7–33.0 tok/s）；**8K 时 dual-control 仅 23.1 tok/s vs target-only 29.4** ⇒
-    仅多驻留 draft 就让 8K AR decode 慢 **≈21%**（`residency_penalty ≈ 0.79`）。
-    dual-control **只作显存压力诊断**、**永不作分母**。
+27. **residency 对照**：2K 时 dual-control 与 target-only 接近（30.4–32.0 vs 29.7–33.0 tok/s）。
+    ⚠️ **8K 的"仅多驻留 draft 就让 AR 慢 ≈21%"已在 §6.29 被推翻**（不重现）。
+    **与数字无关的口径结论仍然成立**：正式 AR 必须 target-only，dual-control **永不作分母**
+    （canonical `claim_allowed=false`）。
 28. **canonical 记账已修正（1.1 → 1.2）**：见 §2 表与协议 §7c。1.1 的 4 类错记中，
     最严重的是**跨进程等价性凭空判否**——8192 两侧 `generated_token_hash` 都是
     `610d0002bdfdcb37`，1.1 却写 `ar_equal=False, certified=True`；2.0/1.2 修正后为
     **8192 `ar_equal=True`**、**2048 `ar_equal=False`（`first_diff_index=34`，与已知 BF16 near-tie 一致）**。
+
+**8K 变体探针的尝试（2026-09-23，ledger §4.16）**
+29. **两次运行都缺了整个 SpecDec 角色**（`094741Z` / `100031Z`：spec **0/4**，AR 却 4/4 正常）；
+    旧版工具**照样打印报告 + 写 summary** ⇒ 假成功，已修：现在
+    `spec` 或 `ar_target` 为 0 样本时**拒绝出报告**（退出码 4）并写 `p5v_<rid>_failures.json`。
+    这两轮**没有回答任何关于 SpecDec 的问题**；其 `Q1/Q3` 无效。
+30. **8K AR 对照极稳（n=8/口径）**：`ar_target` 28.25–29.84（中位 **29.66**）、
+    `ar_dual` 28.65–29.98（中位 **29.81**），跨进程极差 ≤**5.6%**；prefill 16 个样本全在 **3.34–3.45 s**。
+    ⇒ 这是目前对"8K AR 稳定"最强的证据（比缩小版的 2 个 block 强得多）。
+31. **更正 §6.27**：8 个独立进程给出 `residency_penalty ≈ 0.995`（几乎无差），
+    **不是 0.79**；缩小版那次连 dual 的 prefill 都是 7.4 s（vs 本次 3.34 s）⇒
+    "21%"降级为**单会话观察**。同时说明：**8K 慢档不是 SpecDec 特有**（当时连 AR dual 都慢了）。
 
 ---
 
@@ -254,8 +266,15 @@ Report & Presentation 15% / Creativity 10%。截止：提案 **10/7**、演示 W
 5. 16 个 prompt family 的正式运行（manifest 是**草案**，4 项待定稿）。
 6. G5 的 ≥16 families × 12 conditions × ≥5 reps 正式矩阵。
 7. `input_token_hash` 认证：8K 隔离 run 早于该字段加入 ⇒ `certified=false`（新 run 自动带上）。
-8. **8K SpecDec 速度双档的原因**：唯一未闭环的性能问题；`g5_8k_spec_variance_probe` 已就绪但**未运行**。
-   在它给出阶段级证据前，**不得**把原因写成 WDDM paging / allocator / cache 增长中的任一项。
+8. **8K SpecDec 速度双档的原因：仍未闭环**。2026-09-23 的两次尝试（`094741Z` / `100031Z`）
+   **SpecDec 角色 0 个样本**（子进程崩溃、旧版工具不落盘），而这两轮的 AR 对照反而给出了两条新事实：
+   - **8K AR 在 8 个独立进程上极稳**（两种口径跨进程极差 ≤5.6%，prefill 3.34–3.45 s）；
+   - **"8K 仅多驻留 draft 就让 AR 慢 21%"不重现**（8 进程下 dual 中位 29.81 vs target 29.66 ⇒ penalty≈0.995）
+     ⇒ §6.27 已更正，该结论降级为"单会话观察"；
+   - 新增未解异常：**SpecDec 的 8K prefill 在不同会话间差 2.4×**（13.2 s vs 29.0 s vs 31.96 s），
+     而唯一成功样本的"target/draft 两次 prefill 各 6.55 s"无法用模型规模解释 ⇒
+     工具已改为**按模型拆分 prefill**（`prefill_target_s` / `prefill_draft_s`），待重跑判定。
+   在拿到阶段级证据前，**不得**把原因写成 WDDM paging / allocator / cache 增长中的任一项。
 9. V-FP8 在缩小版里**未测**（`P5_KV=base_bf16`），RQ3 目前仍无新证据。
 
 ---

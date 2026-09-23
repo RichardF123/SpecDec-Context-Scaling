@@ -819,6 +819,35 @@ def main() -> int:
           and "formal" in recs[0] and "profiling" in recs2[0]
           and V.SUBSET_PHASES == ("kv_cat",))
 
+    # ㊳–㊵ 覆盖度：**缺整个角色绝不允许看起来"跑完了"**
+    # 事故来源：2026-09-23 两次运行里 4 个 spec 子进程全部崩溃且不落盘，
+    # 父进程照样打印报告 + 写 summary，Q1 只写'进程数 <4 不做双档判定'。
+    recs_missing = [_child("ar_target", 0, 29.4), _child("ar_target", 1, 29.5),
+                    _child("ar_dual", 0, 23.1), _child("ar_dual", 1, 23.2)]
+    cov = V.coverage_report(recs_missing, roles=["spec", "ar_target", "ar_dual"], procs=4)
+    check("㊳ 覆盖度能看出'整个 spec 角色 0 个样本'",
+          cov["spec"]["measured"] == 0 and cov["spec"]["ok"] is False
+          and cov["ar_target"]["measured"] == 2 and cov["ar_dual"]["ok"] is True,
+          str(cov["spec"]))
+    check("㊴ 核心角色缺失 -> 必须点名（据此拒绝出报告）",
+          V.missing_required_roles(cov) == ["spec"])
+    check("㊴ 全部角色都有样本 -> 不点名",
+          V.missing_required_roles(V.coverage_report(
+              recs_missing + [_child("spec", 0, 9.5)],
+              roles=["spec", "ar_target", "ar_dual"], procs=4)) == [])
+    check("㊴ AR 参照角色缺失同样被拦（没有分母就没有结论）",
+          V.missing_required_roles(V.coverage_report(
+              [_child("spec", 0, 9.5)], roles=["spec", "ar_target", "ar_dual"], procs=4))
+          == ["ar_target"])
+    a_missing = V.analyse(recs_missing)
+    check("㊵ 样本不足时 Q1 必须显式警告，不得默默给'未检出双档'",
+          a_missing["Q1_bimodality"]["spec_samples"] == 0
+          and "不能" in (a_missing["Q1_bimodality"].get("warning") or ""),
+          str(a_missing["Q1_bimodality"].get("warning")))
+    check("㊵ prefill 按模型拆分字段存在（SpecDec 有 target 侧）",
+          "prefill_target_s" in a["Q4_prefill"]["spec"]
+          and "prefill_draft_s" in a["Q4_prefill"]["spec"])
+
     print(f"\nG5 schema 自测：PASS {len(PASS)} / FAIL {len(FAIL)}")
     if FAIL:
         print("失败项：" + ", ".join(FAIL))

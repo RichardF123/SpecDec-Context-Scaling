@@ -149,8 +149,13 @@ def chunked_prefill(model, ids, chunk=CHUNK):
     return lg, cache
 
 
-def timed_chunked_prefill(acc: dict, chunk: int = CHUNK):
-    """返回一个"**分块** + 计时"的 `spec_dec._prefill` 替身；`acc["t"]` 累积 prefill 秒数。
+def timed_chunked_prefill(acc: dict, chunk: int = CHUNK, tgt=None):
+    """返回一个"**分块** + 计时"的 `spec_dec._prefill` 替身，并**按模型分别累计**。
+
+    累计口径：`acc["t"]` 为总和，`acc["target"]` / `acc["draft"]` 按 `model is tgt` 分流。
+    为什么要分流：`spec_decode_greedy` 会**各调用一次** `_prefill`（target 一次、draft 一次），
+    只记总和时无法判断"慢的是哪个模型的前向"——2026-09-23 就出现过"两次调用各 6.5 s"
+    这种无法解释的分布，必须能从数据上直接分辨。
 
     **这是本探针最容易写错的地方，务必理解**：
       `spec_dec.spec_decode_greedy` 内部会调用 `spec_dec._prefill(model, ids)`，
@@ -169,7 +174,11 @@ def timed_chunked_prefill(acc: dict, chunk: int = CHUNK):
         t0 = time.perf_counter()
         lg, cache = chunked_prefill(model, ids_, chunk)
         torch.cuda.synchronize()
-        acc["t"] += time.perf_counter() - t0
+        dt = time.perf_counter() - t0
+        acc["t"] = acc.get("t", 0.0) + dt
+        if tgt is not None:
+            key = "target" if model is tgt else "draft"
+            acc[key] = acc.get(key, 0.0) + dt
         return lg, cache
     return timed
 
@@ -248,9 +257,9 @@ def formal_pass(tgt, drf, ids, eos, role: str) -> dict:
         if role == ROLE_SPEC:
             # SpecDec：**让引擎自己做 prefill**，只把 `_prefill` 换成分块+计时版本
             # （见 timed_chunked_prefill 的说明；直接调 chunked_prefill 会 OOM 且划分失真）
-            acc = {"t": 0.0}
+            acc = {"t": 0.0, "target": 0.0, "draft": 0.0}
             orig_prefill = spec_dec._prefill
-            spec_dec._prefill = timed_chunked_prefill(acc, CHUNK)
+            spec_dec._prefill = timed_chunked_prefill(acc, CHUNK, tgt)
             try:
                 torch.cuda.synchronize()
                 t0 = time.perf_counter()
@@ -262,6 +271,7 @@ def formal_pass(tgt, drf, ids, eos, role: str) -> dict:
                 spec_dec._prefill = orig_prefill
             gen, stats = out["gen"], out["stats"]
             pre_s, dec_s = acc["t"], (t2 - t0) - acc["t"]
+            pre_t, pre_d = acc["target"], acc["draft"]
         else:
             torch.cuda.synchronize()
             t0 = time.perf_counter()
@@ -280,9 +290,11 @@ def formal_pass(tgt, drf, ids, eos, role: str) -> dict:
             torch.cuda.synchronize()
             t2 = time.perf_counter()
             pre_s, dec_s = t1 - t0, t2 - t1
+            pre_t, pre_d = pre_s, None
         rec = dict(prefill_s=pre_s, decode_s=dec_s, total_s=pre_s + dec_s,
                    n_gen=len(gen), decode_tok_s=len(gen) / max(dec_s, 1e-9),
                    e2e_tok_s=len(gen) / max(pre_s + dec_s, 1e-9),
+                   prefill_target_s=pre_t, prefill_draft_s=pre_d,
                    generated_token_hash=_gen_hash(gen))
         if stats:
             rec.update(dict(rounds=stats.get("rounds"), proposed=stats.get("proposed"),
@@ -304,6 +316,11 @@ def formal_pass(tgt, drf, ids, eos, role: str) -> dict:
               f"n_gen={r['n_gen']} dec_tok/s={r['decode_tok_s']:.2f}", flush=True)
     med = {k: statistics.median([r[k] for r in reps]) for k in
            ("prefill_s", "decode_s", "total_s", "decode_tok_s", "e2e_tok_s")}
+    # prefill 按模型分开的中位数（SpecDec 才有 draft 侧；AR 为 None）
+    for key, src in (("prefill_target_s", "prefill_target_s"),
+                     ("prefill_draft_s", "prefill_draft_s")):
+        vals = [r.get(src) for r in reps if isinstance(r.get(src), (int, float))]
+        med[key] = statistics.median(vals) if vals else None
     rel = (100.0 * (max(r["decode_s"] for r in reps) - min(r["decode_s"] for r in reps))
            / max(med["decode_s"], 1e-9))
     return dict(reps=reps, medians=med, decode_rel_spread_pct=rel)
@@ -321,7 +338,8 @@ def profiling_pass(tgt, drf, ids, eos, role: str, reps: int) -> dict:
         if role == ROLE_SPEC:
             ph = {n: Phase(n) for n in ("draft_propose", "target_block_verify",
                                         "target_replacement_step", "draft_replacement_step",
-                                        "cache_trim_commit", "kv_cat", "prefill_target")}
+                                        "cache_trim_commit", "kv_cat",
+                                        "prefill_target", "prefill_draft")}
             orig = dict(propose=spec_dec._propose, verify=spec_dec._verify, step=spec_dec._step,
                         trim=spec_cache.trim_cache, cat=torch.cat,
                         prefill=spec_dec._prefill)
@@ -332,8 +350,10 @@ def profiling_pass(tgt, drf, ids, eos, role: str, reps: int) -> dict:
                 return ph[name].wrap(orig["step"])(model, token, cache)
 
             def prefill_profiled(model, ids_):
-                # 同样必须**分块**：默认 `_prefill` 在 8K 会一次申请 ≈3.00 GiB 而 OOM
-                return ph["prefill_target"].wrap(chunked_prefill)(model, ids_, CHUNK)
+                # **必须分块**（默认 `_prefill` 在 8K 会一次申请 ≈3.00 GiB 而 OOM）；
+                # 并按模型分流，才能判断"慢的是哪个模型的前向"
+                name = "prefill_target" if model is tgt else "prefill_draft"
+                return ph[name].wrap(chunked_prefill)(model, ids_, CHUNK)
 
             spec_dec._propose = ph["draft_propose"].wrap(orig["propose"])
             spec_dec._verify = ph["target_block_verify"].wrap(orig["verify"])
@@ -454,20 +474,34 @@ def child_main(role: str, index: int, run_id: str) -> int:
     tgt.set_kv_format(spec_dec._fmt(KV))
     rec["formal"] = formal_pass(tgt, drf, ids, eos, role)
     rec["alloc_after_formal"] = allocator_state()
+    # **先落盘一次**（stage=formal_done）：8K 双模型本来就在 8 GB 边缘，
+    # 若后面插桩 pass OOM，正式结果**不能**跟着一起丢（2026-09-23 的实测教训）。
+    rec["stage"] = "formal_done"
+    _write_child(rec, role, index, run_id, replace=False)
     print(f"[p5v] 正式：decode 中位 {rec['formal']['medians']['decode_s']:.2f}s "
           f"prefill 中位 {rec['formal']['medians']['prefill_s']:.2f}s "
+          f"（target {rec['formal']['medians'].get('prefill_target_s')}s / "
+          f"draft {rec['formal']['medians'].get('prefill_draft_s')}s）"
           f"rel={rec['formal']['decode_rel_spread_pct']:.1f}%", flush=True)
 
     if PROF_REPS > 0:
-        rec["profiling"] = profiling_pass(tgt, drf, ids, eos, role, PROF_REPS)
-        p = rec["profiling"]
-        print(f"[p5v] 插桩：outer={p['outer_decode_s']:.2f}s "
-              f"残差={p['residual_ms']:.0f}ms({p['residual_pct']:.1f}%)", flush=True)
+        try:
+            rec["profiling"] = profiling_pass(tgt, drf, ids, eos, role, PROF_REPS)
+            p = rec["profiling"]
+            print(f"[p5v] 插桩：outer={p['outer_decode_s']:.2f}s "
+                  f"残差={p['residual_ms']:.0f}ms({p['residual_pct']:.1f}%)", flush=True)
+        except Exception as e:                              # noqa: BLE001
+            # 插桩失败**不得**毁掉正式结果：记录失败原因后照常收尾
+            rec["profiling"] = None
+            rec["profiling_error"] = f"{type(e).__name__}: {e}"
+            print(f"[p5v] !! 插桩 pass 失败（正式结果已保留）：{rec['profiling_error']}",
+                  flush=True)
 
     after = dict(system=D.system_snapshot(), wddm=(wddm_state() if WDDM else None))
     rec["monitor_before"], rec["monitor_after"] = before, after
     rec["alloc_final"] = allocator_state()
-    _write_child(rec, role, index, run_id)
+    rec["stage"] = "complete"
+    _write_child(rec, role, index, run_id, replace=True)
     del tgt, drf
     return 0
 
@@ -476,13 +510,22 @@ def _child_path(role: str, index: int, run_id: str) -> Path:
     return OUTDIR / f"p5v_{run_id}_{role}_{index}.json"
 
 
-def _write_child(rec: dict, role: str, index: int, run_id: str) -> None:
+def _write_child(rec: dict, role: str, index: int, run_id: str, *,
+                 replace: bool = False) -> None:
+    """原子写出子进程结果。
+
+    `replace=True` 只用于**同一个进程**从 `stage=formal_done` 升级到 `stage=complete`
+    （先写临时文件再 `os.replace`，避免写到一半崩掉把已有的正式结果也毁掉）。
+    首次写入（`replace=False`）仍然**拒绝覆盖**已存在的文件。
+    """
     OUTDIR.mkdir(parents=True, exist_ok=True)
     p = _child_path(role, index, run_id)
-    if p.exists():
+    if p.exists() and not replace:
         raise SystemExit(f"[拒绝覆盖] {p} 已存在；换 run_id")
-    p.write_text(json.dumps(rec, ensure_ascii=False, indent=1), encoding="utf-8")
-    print(f"[p5v] 写出 {p}", flush=True)
+    tmp = p.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(rec, ensure_ascii=False, indent=1), encoding="utf-8")
+    os.replace(tmp, p)
+    print(f"[p5v] 写出 {p}（stage={rec.get('stage')}）", flush=True)
 
 
 # --------------------------------------------------------------------------- 父进程
@@ -508,6 +551,29 @@ def bimodality(values: list[float], ratio: float) -> dict:
     out["split"] = dict(low=v[:best[1]], high=v[best[1]:], ratio=best[0])
     out["detected"] = bool(best[0] >= ratio)
     return out
+
+
+def coverage_report(recs: list[dict], roles=None, procs=None) -> dict:
+    """**覆盖度**：每个角色实际拿到几个"有正式测量"的样本，期望几个。
+
+    存在的理由：2026-09-23 有两次运行**整个 SpecDec 角色一个样本都没有**，
+    父进程却照样打印了报告并写出 summary，看起来像"跑完了"。这属于"假成功"，
+    必须在数据层就能一眼看出来。
+    """
+    roles = list(ROLES if roles is None else roles)
+    procs = PROCS if procs is None else procs
+    have: dict = {}
+    for r in recs:
+        if r.get("formal"):
+            have[r.get("role")] = have.get(r.get("role"), 0) + 1
+    return {role: dict(expected=procs, measured=have.get(role, 0),
+                       ok=(have.get(role, 0) > 0)) for role in roles}
+
+
+def missing_required_roles(coverage: dict, required=(ROLE_SPEC, ROLE_AR_TARGET)) -> list:
+    """核心角色（SpecDec 本体 + AR 参照）一个样本都没有时，整轮不得产出结果。"""
+    return [role for role in required
+            if not (coverage.get(role) or {}).get("ok")]
 
 
 def _load_children(run_id: str) -> list[dict]:
@@ -553,6 +619,7 @@ def parent_main() -> int:
     for i in range(PROCS):
         for role in ROLES:
             order.append((role, i))
+    failed: list[dict] = []
     for n, (role, i) in enumerate(order):
         print(f"[p5v] ({n + 1}/{len(order)}) 启动独立进程 role={role} index={i}", flush=True)
         env = os.environ.copy()
@@ -561,11 +628,33 @@ def parent_main() -> int:
         r = subprocess.run([sys.executable, "-m", "specdec.engine.g5_8k_spec_variance_probe"],
                            env=env, cwd=str(ROOT))
         if r.returncode not in (0, 3):
-            print(f"[p5v] !! 子进程退出码 {r.returncode}（数据可能不完整）", flush=True)
+            print(f"[p5v] !! 子进程 role={role} index={i} 退出码 {r.returncode}"
+                  f"（0=正常，3=环境不合格跳过；其它=崩溃）", flush=True)
+            failed.append(dict(role=role, index=i, returncode=r.returncode))
         if n < len(order) - 1 and COOLDOWN > 0:
             time.sleep(COOLDOWN)
 
     recs = _load_children(run_id)
+    # ---- 覆盖度检查：**绝不允许"缺了整个角色"还当成跑完了** ----
+    coverage = coverage_report(recs)
+    print("\n[p5v] 覆盖度：" + "; ".join(
+        f"{role} {c['measured']}/{c['expected']}" for role, c in coverage.items()), flush=True)
+    _write_failures(run_id, dict(
+        run_id=run_id, config=dict(ctx=CTX, kv=KV, k=K, max_new=MAXNEW, chunk=CHUNK,
+                                   warm=WARM, reps=REPS, prof_reps=PROF_REPS,
+                                   procs=PROCS, roles=ROLES),
+        failed_children=failed, coverage=coverage,
+        note=("failed_children 只记录退出码；崩溃细节在**子进程自己的 stderr**。"
+              "coverage 中 ok=false 表示该角色**一个样本都没拿到**。")))
+    # 实验的核心角色必须至少有一个样本，否则整轮**不产生结果**
+    missing = missing_required_roles(coverage)
+    if missing:
+        print(f"\n[p5v] !! 关键角色没有任何可用样本：{missing}", flush=True)
+        print(f"[p5v] !! **拒绝输出结果报告与 summary**（避免'缺了整个本体却看起来跑完了'）。",
+              flush=True)
+        print(f"[p5v]    退出码记录在 {OUTDIR / f'p5v_{run_id}_failures.json'}", flush=True)
+        return 4
+
     print(f"\n[p5v] 收集到 {len(recs)} 个子进程结果")
     report = analyse(recs)
     print_report(report)
@@ -573,8 +662,17 @@ def parent_main() -> int:
     _write_summary(run_id, dict(run_id=run_id, config=dict(
         ctx=CTX, kv=KV, k=K, max_new=MAXNEW, chunk=CHUNK, warm=WARM, reps=REPS,
         prof_reps=PROF_REPS, procs=PROCS, roles=ROLES, bimodal_ratio=BIMODAL_RATIO),
+        coverage=coverage, failed_children=failed,
         children=sorted_recs, analysis=report))
     return 0
+
+
+def _write_failures(run_id: str, payload: dict) -> None:
+    p = OUTDIR / f"p5v_{run_id}_failures.json"
+    if p.exists():
+        raise SystemExit(f"[拒绝覆盖] {p} 已存在")
+    p.write_text(json.dumps(payload, ensure_ascii=False, indent=1), encoding="utf-8")
+    print(f"[p5v] 失败/覆盖度记录 -> {p}", flush=True)
 
 
 def _med(xs):
@@ -601,7 +699,11 @@ def analyse(recs: list[dict]) -> dict:
     out["Q1_bimodality"] = dict(
         decode_seconds=bimodality(spec_dec_s, BIMODAL_RATIO),
         decode_tok_per_s=bimodality(tok, BIMODAL_RATIO),
+        spec_samples=len(tok),
         max_over_min=(max(tok) / min(tok)) if len(tok) >= 2 and min(tok) else None)
+    if len(tok) < PROCS:
+        out["Q1_bimodality"]["warning"] = (
+            f"SpecDec 只有 {len(tok)}/{PROCS} 个可用样本 —— **不能**据此对双档下结论")
 
     # Q2 进程内稳定性
     out["Q2_within_process"] = {
@@ -630,14 +732,22 @@ def analyse(recs: list[dict]) -> dict:
             per_round_ms_slow=slow["profiling"]["per_round_ms"],
             subset_phases=fast["profiling"]["subset_phases"])
 
-    # Q4 prefill 稳定性
+    # Q4 prefill 稳定性（含按模型拆分）
     out["Q4_prefill"] = {}
     for role in ROLE_CHOICES:
         vals = [r["formal"]["medians"]["prefill_s"] for r in by_role.get(role, [])
                 if r.get("formal")]
         v = [x for x in vals if x]
+        tgt_vals = [r["formal"]["medians"].get("prefill_target_s")
+                    for r in by_role.get(role, []) if r.get("formal")]
+        drf_vals = [r["formal"]["medians"].get("prefill_draft_s")
+                    for r in by_role.get(role, []) if r.get("formal")]
+        tgt_vals = [x for x in tgt_vals if x]
+        drf_vals = [x for x in drf_vals if x]
         out["Q4_prefill"][role] = dict(
             medians=vals,
+            prefill_target_s=tgt_vals or None,
+            prefill_draft_s=drf_vals or None,
             max_over_min=((max(v) / min(v)) if len(v) >= 2 and min(v) else None))
 
     # Q5 对照稳定性

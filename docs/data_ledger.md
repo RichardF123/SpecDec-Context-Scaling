@@ -781,14 +781,17 @@ decode speedup = 0.406×   e2e speedup = 0.434×   speedup_claim_allowed = true
 - 只能记录：*AR target-only 稳定；SpecDec 跨 block 差 42.7%；所有 clock-matched 观测均 <1；
   方向上未观察到加速；正式倍数不得声明*。
 
-**④ target-only vs dual-resident 对照（支持"正式 AR 必须 target-only"）**
+**④ target-only vs dual-resident 对照** ⚠️ **本条已被 §4.16 部分推翻，请以 §4.16 为准**
 | 分组 | AR target-only | AR dual-control | 说明 |
 |---|---|---|---|
 | 2K | 29.7–33.0 tok/s | 30.4–32.0 tok/s | 差异很小 |
-| 8K | **29.4** tok/s | **23.1** tok/s | 仅多驻留 draft 就让 8K AR decode 慢 **≈21%** |
+| 8K（**本表**，单会话 2 block） | 29.4 tok/s | 23.1 tok/s | 曾据此认为"仅多驻留 draft 就让 8K AR 慢 ≈21%" |
 
-⇒ `residency_penalty`（= T_target/T_dual）8K ≈ 0.79；dual-control **仅作显存压力诊断**、
-**不作正式分母**（canonical 里 `claim_allowed=false`）。
+- **更正（2026-09-23）**：§4.16 用 **8 个独立进程**测 8K，`ar_dual` = 28.65–29.98 tok/s（中位 **29.81**）、
+  与 `ar_target`（中位 29.66）**不可区分**，prefill 也同为 3.34 s（本表当时是 7.40/7.74 s）
+  ⇒ **"21% residency 代价"不重现，降级为"单会话观察"**；
+- 仍然成立且与本节其它部分无关的结论：**正式 AR 必须用 target-only 口径**（口径选择不依赖这个数字），
+  且 dual-control **永远不作分母**（canonical `claim_allowed=false`）。
 
 **⑤ canonical 记账修正（1.1 → 1.2，详见协议 §7c）**
 | 缺陷 | 1.1 的错误表现 | 1.2 修正 |
@@ -856,6 +859,77 @@ exit=0
 - **保留不删**，但**必须视为中断的残缺 run，不得用于任何结论**（缺 `spec` 角色、无 summary）；
 - `output/g5/variance/p5v_smoke2_spec_0.json` 是**单 rep 冒烟产物**，同样**不得当作实验数据**；
 - 两类文件各带自己的 run_id，探针**只读与自身 run_id 匹配的文件** ⇒ 后续正式运行不会被污染。
+
+### 4.16 2026-09-23 两次 8K 变体运行：**SpecDec 角色全部缺失**（工具缺陷已修）+ **"21% residency penalty"结论被推翻**
+
+**运行与覆盖度**（配置均为 ctx=8192 / base_bf16 / k=4 / max_new=64 / chunk=2048 / warm=1 / reps=5 /
+roles=[spec, ar_target, ar_dual] / procs=4）
+
+| run_id | 子进程产物 | spec | ar_target | ar_dual | summary |
+|---|---|---|---|---|---|
+| `p5v_20260923T045620Z` | 2 | **1** | 1 | 0 | 无（中断） |
+| `p5v_20260923T094741Z` | 8 | **0** | 4 | 4 | 有 |
+| `p5v_20260923T100031Z` | 8 | **0** | 4 | 4 | 有 |
+
+⇒ **后两次"跑完了"的运行里，被测对象（SpecDec）一个样本都没有**：4 个 spec 子进程全部崩溃且**不落盘**
+（若是环境不合格会写 `skipped` 文件，实际连这个都没有 ⇒ 是真崩溃，不是预检跳过）。
+父进程当时**照样打印报告 + 写 summary**，`Q1` 只写"进程数 <4，不做双档判定" ⇒ 属于**假成功**，已修（见下）。
+
+**这两次运行里**有效**的数据：8K AR 对照（各 8 个独立进程，全部 P-state 合格 SM 2250–2370 MHz）**
+| role | decode tok/s（8 个进程） | 中位 | max/min | prefill（8 个进程） | within-run rel |
+|---|---|---|---|---|---|
+| `ar_target`（target-only） | 28.25 / 29.82 / 29.66 / 29.74 / 28.99 / 29.47 / 29.84 / 29.66 | **29.66** | **1.056** | 3.34–3.45 s | 1.6–8.1% |
+| `ar_dual`（双驻留控制） | 29.91 / 28.65 / 29.98 / 29.97 / 29.80 / 29.76 / 28.71 / 29.82 | **29.81** | **1.046** | 3.34–3.35 s | 1.2–6.5% |
+
+⇒ **8K 的 AR（两种驻留口径）在 8 个独立进程上极稳**：跨进程极差 **≤5.6%**，远优于缩小版 run 的
+SpecDec 42.7%；prefill 在 16 个样本里 **3.34–3.45 s（±1.6%）**。
+
+**⚠️ 结论更正：§4.14 第 ④ 条的"8K 仅多驻留 draft 就让 AR 慢 ≈21%"不成立（不重现）**
+| 来源 | 8K AR dual-control | prefill | target-only |
+|---|---|---|---|
+| §4.14 缩小版 run（1 个 session、2 个 block） | 22.89 / 23.23 tok/s | **7.40 / 7.74 s** | 29.33 / 29.51 tok/s |
+| 本次（8 个独立进程） | **28.65–29.98 tok/s（中位 29.81）** | **3.34–3.35 s** | 28.25–29.84（中位 29.66） |
+
+- 新版**8 个进程**一致给出 `residency_penalty = T_target/T_dual ≈ 0.995`（即**几乎无差**），
+  而不是 0.79；两次运行连 **prefill** 都差 2.2×（7.4 s vs 3.34 s）；
+- ⇒ 正确表述：**"8K residency 代价 ≈21%"降级为"单会话观察，未复现"**；
+  在 8 个独立进程的证据下，**8K 下 dual-control 与 target-only 在 decode 上不可区分**；
+- 同时说明：**8K 慢档不只出现在 SpecDec**——§4.14 那个 session 里连 AR dual-control 的 prefill 都慢了 2.2×，
+  即"慢档"是**会话级/进程级**的状态，不是 SpecDec 算法特有。**成因仍未定位。**
+
+**另一个新增未解异常：SpecDec 的 8K prefill 在不同会话间相差 2.4×**
+| 来源 | SpecDec 8K prefill | decode |
+|---|---|---|
+| 缩小版 run（§4.14，2 block） | 31.958 / 32.000 s | 6.72 / 11.72 s |
+| 本人冒烟（`smoke2`，1 进程 1 rep） | 29.03 s | 8.89 s |
+| 本次成功样本（`045620Z` spec_0，5 reps） | **13.11–13.24 s**（极稳） | 10.58–12.27 s |
+- 该样本的插桩 pass 给出 `prefill_target total=13107 ms calls=2 median=6553.6 ms`，
+  **两次调用各 6.55 s** ⇒ "target 一次 + draft 一次"却**几乎等时长**，无法用模型大小解释；
+- 正式 pass 与插桩 pass 的 prefill **互相一致**（13.2 vs 13.1 s）⇒ 不是计数错误，
+  因此**必须按模型拆分**才能判定（工具已改，见下）；
+- 参照：AR **dual-resident** 在 8K 的 prefill 只有 **3.34 s** ⇒ SpecDec 的 13.2 s 仍偏慢，
+  与"双模型同驻 + KV 增长下的带宽/分配器压力"方向一致，但**在拆分数据出来前不得定论**。
+- 决策层完全可复现（重要正面证据）：该样本 `rounds=20 / proposed=76 / accepted=56 / mismatch=8 /
+  all_accept=12`，与缩小版 run 的 8K SpecDec **逐项相同**；`acceptance=0.7368` 一致。
+
+**本轮修复的工具缺陷（都在交付前/交付中拦住）**
+1. **子进程结果只在最末尾落盘** ⇒ 若插桩 pass OOM，**正式结果一起丢**（这正是 4 个 spec 子进程"零产物"的原因）。
+   现在：正式 pass 结束先原子写出 `stage=formal_done`，插桩完成后原子升级为 `stage=complete`；
+   插桩 pass 包 `try/except`，失败只记 `profiling_error`，**不影响正式结果**。
+2. **父进程"缺整个角色"也照常出报告** ⇒ 现在 `coverage_report()` + `missing_required_roles()`：
+   `spec` 或 `ar_target` 为 0 个样本时**拒绝打印报告、拒绝写 summary**，退出码 4，
+   并把每个子进程的**退出码**写进 `p5v_<run_id>_failures.json`（崩溃细节仍在子进程 stderr）。
+   已用真实数据回放验证：`094741Z` / `100031Z` 会被判 `missing_required=['spec']` 而拒绝出结果。
+3. **prefill 未按模型拆分** ⇒ 新增 `prefill_target_s` / `prefill_draft_s`（正式 pass），
+   插桩 pass 的 phase 也拆成 `prefill_target` / `prefill_draft`。
+4. 样本不足时 `Q1` 必须显式写"**不能**据此对双档下结论"（不再只写"进程数<4"）。
+
+**数据定性**
+- `094741Z` / `100031Z`：**INCOMPLETE RUN**——其 16 个 AR 样本可作"8K AR 对照、n=8"的证据使用，
+  但**这两轮没有回答任何关于 SpecDec 的问题**；summary 中的 `Q1/Q3` 均无效。
+- `045620Z`：中断的 run，仅 1 个 spec 样本，**单样本不作为双档结论**，但可作为 prefill 异常的证据之一。
+- 命名提醒：子进程文件名为 `p5v_p5v_<stamp>_<role>_<i>.json`（run_id 自带 `p5v_` 前缀 ⇒ 出现重复前缀），
+  **纯属命名冗余、不影响解析**，为保持与既有产物连续**不改名**。
 
 ## 5. 复现设置（每次记录必须带上）
 - seed=42（测试）；性能脚本 seed=0，3 reps 取最优 + warmup；
