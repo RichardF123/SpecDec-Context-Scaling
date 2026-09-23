@@ -690,6 +690,21 @@ formal Pilot:                   HOLD（等缩小版复验）
 - 预检通过**只说明当下合格**；长实验中仍须依赖 stability probe 的 **block 级前置复检**（不合格则该 block 跳过），
   这已在 §4.11 的 run #1 中体现（当时的失败正是靠 cell 级审计发现的）。
 
+**预检失败记录（`pstate_preflight_pstate_20260923T154630Z.json`，2026-09-23）**
+```
+verdict = ENV_INVALID   退出码 3
+负载期 SM clock median 210 MHz（min 210 / max 2250）、mem clock median 405 MHz、power median 9.19 W
+platform_state: on_ac=False（battery_status_code=1）、power_scheme=Performance、sm_clock_now=210 MHz
+gate blocker: 当前在**电池供电**：dGPU 会被限频，计时无效。请插上电源后重跑
+```
+- **同一台机器、同一段 2048² matmul 负载**，当天早些时候（AC 供电）预检得到 SM median **2355–2400 MHz**、
+  功耗 87–91 W；本次只有 **210 MHz / 9.19 W** ⇒ 差异的唯一共变量是**供电状态**，不是负载强度、不是温度（61 °C）。
+- ⇒ **本次 8K 变体探针按纪律未启动**（不满足计时前置条件）。这也给 §4.11 run #1 的低频 block
+  （SM 435–1300 MHz / mem 6000 MHz）提供了**一个高度一致的候选解释：当时可能也处于电池供电或供电切换中**。
+  **这是待验证的候选解释，不是结论**——run #1 当时**没有**记录 `on_ac` 字段，无法回溯证实。
+- 教训：`on_ac` 必须随每批数据落盘（现已在 `platform_state()` 中采集），否则事后无法判断环境。
+
+
 ### 4.13 分片命名缺陷修复：防止第 2 次 run **追加**进第 1 次的分片（2026-09-22，**在开跑前拦住**）
 
 **发现（由"准备缩小版复验"触发，尚未造成任何数据损失）**
