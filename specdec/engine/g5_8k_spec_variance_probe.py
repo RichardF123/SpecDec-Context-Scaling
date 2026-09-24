@@ -84,10 +84,12 @@ ROLE_CHOICES = (ROLE_SPEC, ROLE_AR_TARGET, ROLE_AR_DUAL)
 SUBSET_PHASES = ("kv_cat",)
 
 # ---- commit 内存安全线（**安全护栏，不是科学门槛**）----
-# 依据（实测，非估计）：`load_ours(target)` 的 CPU 侧峰值 ≈ 13.3 GiB
-#   = HF 模型 3.1 GiB(bf16) + 自建模型 ~7.1 GiB(fp32) + to(bf16) 瞬时 3.1 GiB；
-# 实测失败现场：commit 可用 **9.5 GiB** ⇒ 原生崩溃 `0xC0000005`（不是干净的 MemoryError）。
-# 因此默认要求 **16 GiB 可用 commit**（13.3 需求 + 2.7 余量），可用 P5V_MIN_COMMIT_GIB 覆盖。
+# 依据（**推导 + 实测吻合**）：`load_ours(target)` 期间 CPU 侧同时存在两份权重
+#   HF 模型 bf16  : 1.54e9 × 2 B = 2.87 GiB   （与实测 `cuda free` 差值 2.88 GiB 吻合）
+#   自建模型 fp32 : 1.54e9 × 4 B = 5.74 GiB   （`nn.Linear`/`torch.randn` 默认 fp32）
+#   合计 ≈ 8.6 GiB，加 Python/torch 余量 ≈ **9.1–9.6 GiB**
+# 实测崩点：commit 可用 **9.5 GiB** ⇒ 正好压线，且失败是原生 `0xC0000005`（不是干净报错）。
+# 因此默认要求 **16 GiB 可用 commit**（9.5 需求 + 6.5 余量），可用 P5V_MIN_COMMIT_GIB 覆盖。
 MIN_COMMIT_GIB = float(os.environ.get("P5V_MIN_COMMIT_GIB", "16"))
 
 
@@ -475,7 +477,7 @@ def child_main(role: str, index: int, run_id: str) -> int:
           f"上限 {sm.get('commit_limit_mib', 0) / 1024:.1f} GiB"
           f"（已用 {sm.get('commit_used_mib', 0) / 1024:.1f} GiB）| "
           f"物理可用 {sm.get('phys_free_mib', 0) / 1024:.1f} GiB"
-          f"  ← 载入模型约需 13 GiB commit，**不足会原生崩溃 0xC0000005**", flush=True)
+          f"  ← 载入模型约需 9.1–9.6 GiB commit，**不足会原生崩溃 0xC0000005**", flush=True)
     # 子进程侧再过一次护栏（父进程可能已等待很久，期间系统状态会变）
     _ok, _why = commit_guard()
     if not _ok and not ALLOW_UNQUALIFIED:
@@ -654,7 +656,8 @@ def commit_guard() -> tuple[bool, str]:
     为什么需要这道护栏：2026-09-24 13:50 这台机器发生了**系统级硬挂**（黑屏无法操作），
     事件日志为 `Kernel-Power 41` + `EventLog 6008 上次关机 13:50:14 是非预期的`，
     且**没有 BugCheck/内存转储**。此前同一工作负载已多次出现
-    `0xC0000005` 原生崩溃，而崩溃点正是**CPU 侧构造模型**（约 13.3 GiB commit 需求），
+    `0xC0000005` 原生崩溃，而崩溃点正是**CPU 侧构造模型**（HF bf16 2.87 + 自建 fp32 5.74
+    ≈ 9.1–9.6 GiB commit 需求），
     失败现场 commit 仅剩 9.5 GiB。
     ⇒ 在 commit 不足时**在启动任何子进程之前**退出，避免把整机拖进不可恢复的状态。
     """
