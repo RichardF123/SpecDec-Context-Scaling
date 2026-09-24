@@ -1075,6 +1075,64 @@ cuda_free_mib = 771.0            cuda_total_mib = 8187.5
   **会被父进程拒绝出报告并退出码 4**。
 - **定性：无测量数据，不得用于任何结论。**
 
+### 4.17 attention 后端替换（FlashAttention / SDPA）的可行性论证（2026-09-24，**尚未上 GPU**）
+
+**动机**：§4.16 的 OOM 就是手写 attention 里那一笔
+`torch.softmax(scores, dim=-1, dtype=torch.float32)`（draft 896 MiB / target 806 MiB）。
+FlashAttention / mem-efficient 后端**不物化** score 矩阵（分块 + 在线 softmax），
+因此它**直接消除这笔申请**；而 PagedAttention 只改 KV 的**摆放方式**
+（8K KV 逻辑仅 224 MiB，占 `peak_allocated` 的 3.1%），治不了这笔瞬时申请。
+
+**现行实现（逐行确认，`model_self.py:156-170`）**
+```python
+k_rep = kv_repeat(k_all, heads // kv_heads)              # GQA 手工展开
+scores = torch.matmul(q, k_rep.transpose(-2,-1)) / sqrt(head_dim)   # bf16
+scores = scores.masked_fill(偏移因果掩码, -inf)          # cache 为 None 时 diagonal=1，否则 diagonal=T-s+1
+attn   = torch.softmax(scores, dim=-1, dtype=torch.float32).to(q.dtype)   # ← 806–896 MiB
+out    = torch.matmul(attn, v_rep)
+```
+
+**⚠️ 两个已实测的语义陷阱（必须在 amendment 里写死）**
+1. **`is_causal=True` 不是我们的掩码**。PyTorch 的 `is_causal` 等价于
+   `triu(ones(L,S), diagonal=1)`（**左上**对齐），而分块 prefill 的 query 是全长 KV 的
+   **最后 s 个** token，需要 `diagonal=T-s+1`（**右下**对齐）。CPU fp64 实测：
+   `s=8,T=8` → max|Δ| **2.145e-07**（等价）；`s=5,T=32` → **2.157**；`s=1,T=32` → **2.156**
+   ⇒ **只有 `s == T` 时才能用 `is_causal`**。
+2. **SDPA 的 bool mask 语义与 `masked_fill` 相反**：SDPA 中 **True = 参与**，
+   所以要传 `keep = ~triu(..., diagonal=T-s+1)`。
+
+**正确形式已被 CPU 证明等价**（同一组形状，fp64）：
+```
+keep-mask 形式  s=8  T=8   max|Δ| = 2.145e-07   ✅
+keep-mask 形式  s=5  T=32  max|Δ| = 1.122e-07   ✅
+keep-mask 形式  s=1  T=32  max|Δ| = 5.906e-08   ✅
+```
+
+**环境可行性（已核对，无需新依赖）**：`torch 2.6.0+cu124`、RTX 4060 = **sm_89**（Ada）；
+`F.scaled_dot_product_attention` 支持 **`enable_gqa=True`**（GQA 2 个 KV 头无需手工展开）；
+`FLASH_ATTENTION / EFFICIENT_ATTENTION / CUDNN_ATTENTION / MATH` 后端全部可用；
+`torch.nn.attention.sdpa_kernel` 可用于**强制**指定后端，避免静默回退。
+
+**工具**：`specdec/engine/g5_attn_backend_probe.py`（**不加载模型、不改引擎**）
+- 先做 **CPU 语义自检**（上 GPU 之前先证明形式正确，否则直接退出码 3）；
+- 再在真实形状上量**单笔瞬时显存**与**耗时**：
+  `s=2048/T=8192/h=12,d=128`（target chunk）、`h=14,d=64`（draft chunk，OOM 崩点）、
+  `s=5`（块验证）、`s=1`（decode）；`s=8192` 全长前向为 opt-in（手写路径约 3 GiB）；
+- 每一格都与手写路径比 `max|Δ|` 并显式标注**是否等价**——不等价的"加速"一律作废；
+- 安全性：只造 q/k/v，峰值约 1–2 GiB，**不建 8K KV、不载双模型**，
+  远离触发 WDDM 超订 / commit 压力的那条路径；
+- 产物 `output/g5/attn/attn_backend_<stamp>.json`（唯一命名）。
+- **状态：已实现并通过 CPU 自检；GPU 微基准待由人在交互式终端执行。**
+
+**若微基准显示收益足够，amendment 的范围与代价（供决策）**
+- **只改 `SelfAttention.forward` 的 score→output 一段**；`spec_cache` 的 cache 契约、
+  `trim_cache`、rollback、`_propose`/`_verify` 出口不变量、索引映射**全部不动**
+  ⇒ 风险显著低于 PagedAttention（后者要动 cache 布局，正是本项目最脆弱的地方）；
+- 但 `model_self.py` 是**冻结**文件 ⇒ 必须走协议 amendment + 你签字；
+- 数值路径会变（kernel 内 fp32 累加 + 输出回 bf16 的舍入不同）⇒ 必须重跑
+  **G1 / B4 / B5 / B6-fp32 / B6-bf16 / 35 哨兵 / BF16 tie 重基线**；
+- 所有既有性能数字（含 2K 的 0.406×）将变成 **"pre-SDPA 时代"**，不得与之后的数据混表。
+
 ## 5. 复现设置（每次记录必须带上）
 - seed=42（测试）；性能脚本 seed=0，3 reps 取最优 + warmup；
 - prompt 固定（bench_basic.PROMPT，38 tok）；decode 数 64；
