@@ -853,6 +853,29 @@ def main() -> int:
           "prefill_target_s" in a["Q4_prefill"]["spec"]
           and "prefill_draft_s" in a["Q4_prefill"]["spec"])
 
+    # ㊶/㊷ commit 护栏（2026-09-24 整机黑屏硬挂事故的防护）
+    # 事故链：载入模型需 ≈13.3 GiB commit；失败现场只剩 9.5 GiB -> 原生 0xC0000005；
+    #        同一工作负载另有一次整机黑屏硬挂（Kernel-Power 41，无 BugCheck 转储）。
+    sm = V.system_memory()
+    check("㊶ system_memory 读到 commit 上限与可用量（commit 才是那堵墙，不是物理内存）",
+          sm.get("available") is True and sm["commit_limit_mib"] > 0
+          and 0 < sm["commit_free_mib"] <= sm["commit_limit_mib"],
+          str({k: sm.get(k) for k in ("commit_limit_mib", "commit_free_mib",
+                                      "phys_free_mib")}))
+    ok, why = V.commit_guard()
+    check("㊶ commit 余量充足时放行，并给出具体数字",
+          ok is True and "GiB" in why and f"{V.MIN_COMMIT_GIB:.0f}" in why, why)
+    _old_min = V.MIN_COMMIT_GIB
+    try:
+        V.MIN_COMMIT_GIB = 10 ** 6
+        ok2, why2 = V.commit_guard()
+        check("㊷ 余量低于安全线 -> **拒绝启动**（黑屏事故的护栏）",
+              ok2 is False and "安全线" in why2, why2)
+    finally:
+        V.MIN_COMMIT_GIB = _old_min
+    check("㊷ 安全线必须高于实测载入需求（13.3 GiB），否则护栏没有意义",
+          V.MIN_COMMIT_GIB > 13.3)
+
     print(f"\nG5 schema 自测：PASS {len(PASS)} / FAIL {len(FAIL)}")
     if FAIL:
         print("失败项：" + ", ".join(FAIL))

@@ -40,7 +40,7 @@ REM      is about. Config change: if used, use it for the WHOLE run (including
 REM      the AR controls) and register it as the chunk=1024 arm -- its prefill
 REM      numbers must NOT be mixed with the chunk=2048 stability run.
 set "P5V_CHUNK=2048"
-REM set "P5V_CHUNK=1024"
+set "P5V_CHUNK=1024"
 set "P5V_WARM=1"
 
 REM ---- smoke configuration: ONE SpecDec process, 1 measured rep, no profiling ----

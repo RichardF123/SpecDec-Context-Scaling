@@ -83,6 +83,13 @@ ROLE_CHOICES = (ROLE_SPEC, ROLE_AR_TARGET, ROLE_AR_DUAL)
 # kv_cat 是 forward 的子集：列出来是为了**永不**把它计入闭合求和
 SUBSET_PHASES = ("kv_cat",)
 
+# ---- commit 内存安全线（**安全护栏，不是科学门槛**）----
+# 依据（实测，非估计）：`load_ours(target)` 的 CPU 侧峰值 ≈ 13.3 GiB
+#   = HF 模型 3.1 GiB(bf16) + 自建模型 ~7.1 GiB(fp32) + to(bf16) 瞬时 3.1 GiB；
+# 实测失败现场：commit 可用 **9.5 GiB** ⇒ 原生崩溃 `0xC0000005`（不是干净的 MemoryError）。
+# 因此默认要求 **16 GiB 可用 commit**（13.3 需求 + 2.7 余量），可用 P5V_MIN_COMMIT_GIB 覆盖。
+MIN_COMMIT_GIB = float(os.environ.get("P5V_MIN_COMMIT_GIB", "16"))
+
 
 # --------------------------------------------------------------------------- 阶段计时
 class Phase:
@@ -462,6 +469,20 @@ def child_main(role: str, index: int, run_id: str) -> int:
     rec["input_tokens"] = int(ids.shape[1])
 
     before = dict(system=D.system_snapshot(), wddm=(wddm_state() if WDDM else None))
+    rec["system_memory_before_load"] = system_memory()
+    sm = rec["system_memory_before_load"]
+    print(f"[p5v] 系统内存：commit 可用 {sm.get('commit_free_mib', 0) / 1024:.1f} GiB / "
+          f"上限 {sm.get('commit_limit_mib', 0) / 1024:.1f} GiB"
+          f"（已用 {sm.get('commit_used_mib', 0) / 1024:.1f} GiB）| "
+          f"物理可用 {sm.get('phys_free_mib', 0) / 1024:.1f} GiB"
+          f"  ← 载入模型约需 13 GiB commit，**不足会原生崩溃 0xC0000005**", flush=True)
+    # 子进程侧再过一次护栏（父进程可能已等待很久，期间系统状态会变）
+    _ok, _why = commit_guard()
+    if not _ok and not ALLOW_UNQUALIFIED:
+        rec["skipped"] = f"commit 余量不足 -> 未启动加载：{_why}"
+        _write_child(rec, role, index, run_id, replace=False)
+        print(f"[p5v] !! 子进程拒绝加载：{_why}", flush=True)
+        return 3
     tgt, _ = load_ours(TARGET)
     drf = None
     if role == ROLE_SPEC:
@@ -589,6 +610,66 @@ def missing_required_roles(coverage: dict, required=(ROLE_SPEC, ROLE_AR_TARGET))
             if role in coverage and not (coverage.get(role) or {}).get("ok")]
 
 
+def system_memory() -> dict:
+    """物理内存与 **commit**（提交）内存，只用 Win32 `GlobalMemoryStatusEx`，不依赖 psutil。
+
+    为什么必须采集：2026-09-23/24 的 `0xC0000005` 原生崩溃发生在
+    `load_ours` → `build_from_config` → **CPU 侧**构造模型（约 7 GB fp32）时，
+    当时**物理内存还有 11.9 GB**、但 **commit 只剩 9.5 GB**（limit 39.1 GB / charge 29.6 GB）
+    ⇒ 真正被撞的是 **commit 上限**，不是物理内存、也不是显存。
+    Windows 上 `ullTotalPageFile/ullAvailPageFile` 的语义就是 commit 上限/可用量。
+    """
+    out = {"available": False}
+    try:
+        import ctypes
+
+        class MEMORYSTATUSEX(ctypes.Structure):
+            _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
+                        ("ullTotalPhys", ctypes.c_ulonglong),
+                        ("ullAvailPhys", ctypes.c_ulonglong),
+                        ("ullTotalPageFile", ctypes.c_ulonglong),
+                        ("ullAvailPageFile", ctypes.c_ulonglong),
+                        ("ullTotalVirtual", ctypes.c_ulonglong),
+                        ("ullAvailVirtual", ctypes.c_ulonglong),
+                        ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+
+        m = MEMORYSTATUSEX()
+        m.dwLength = ctypes.sizeof(MEMORYSTATUSEX)
+        if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(m)):
+            out.update(available=True,
+                       phys_total_mib=m.ullTotalPhys / 2 ** 20,
+                       phys_free_mib=m.ullAvailPhys / 2 ** 20,
+                       commit_limit_mib=m.ullTotalPageFile / 2 ** 20,
+                       commit_free_mib=m.ullAvailPageFile / 2 ** 20,
+                       commit_used_mib=(m.ullTotalPageFile - m.ullAvailPageFile) / 2 ** 20,
+                       memory_load_pct=float(m.dwMemoryLoad))
+    except Exception as e:                                  # noqa: BLE001
+        out["error"] = f"{type(e).__name__}: {e}"
+    return out
+
+
+def commit_guard() -> tuple[bool, str]:
+    """**开跑前**检查系统 commit 余量，不足则拒绝启动。
+
+    为什么需要这道护栏：2026-09-24 13:50 这台机器发生了**系统级硬挂**（黑屏无法操作），
+    事件日志为 `Kernel-Power 41` + `EventLog 6008 上次关机 13:50:14 是非预期的`，
+    且**没有 BugCheck/内存转储**。此前同一工作负载已多次出现
+    `0xC0000005` 原生崩溃，而崩溃点正是**CPU 侧构造模型**（约 13.3 GiB commit 需求），
+    失败现场 commit 仅剩 9.5 GiB。
+    ⇒ 在 commit 不足时**在启动任何子进程之前**退出，避免把整机拖进不可恢复的状态。
+    """
+    sm = system_memory()
+    if not sm.get("available"):
+        return True, f"无法读取系统内存信息（{sm.get('error')}）-> 不阻断，但请自行确认余量"
+    free_gib = sm["commit_free_mib"] / 1024.0
+    if free_gib < MIN_COMMIT_GIB:
+        return False, (f"commit 可用 {free_gib:.1f} GiB < 安全线 {MIN_COMMIT_GIB:.0f} GiB"
+                       f"（上限 {sm['commit_limit_mib'] / 1024:.1f} GiB，"
+                       f"已用 {sm['commit_used_mib'] / 1024:.1f} GiB）")
+    return True, (f"commit 可用 {free_gib:.1f} GiB ≥ 安全线 {MIN_COMMIT_GIB:.0f} GiB"
+                  f"（上限 {sm['commit_limit_mib'] / 1024:.1f} GiB）")
+
+
 def gpu_consumers() -> dict:
     """**GPU 上的其它消费者**（除本进程外的 C+G 进程），只在计时区之外调用。
 
@@ -684,6 +765,14 @@ def parent_main() -> int:
           f"warm={WARM} reps={REPS} 插桩 pass：{PROF_REPS} 次（**与正式计时分开**）")
     print(f"[p5v] 对照口径：ar_target=正式基线参照（本工具**不**据此做正式声明）；"
           f"ar_dual=诊断控制，永不作分母")
+    ok, why = commit_guard()
+    print(f"[p5v] commit 护栏：{why}", flush=True)
+    if not ok:
+        print("[p5v] !! **拒绝启动**：先把系统 commit 余量腾出来再跑"
+              "（关掉游戏/Steam/浏览器/IM，或把 pagefile 上限调大）。\n"
+              "       上一次在这种状态下运行，这台机器直接黑屏硬挂（Kernel-Power 41，无转储）。",
+              flush=True)
+        return 5
     print(f"[p5v] 预计 ≈{estimate_minutes():.0f} 分钟（角色感知估算：SpecDec 每 rep ≈42s、"
           f"AR 每 rep ≈6s；实际受加载与冷却影响）\n", flush=True)
 
