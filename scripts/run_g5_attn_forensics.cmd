@@ -41,6 +41,7 @@ echo    default safety line is 16 GiB; see the guard docstring for the derivatio
 :no_override
 
 if /I "%WHAT%"=="nll" goto :nll
+if /I "%WHAT%"=="smoke" goto :smoke
 
 set "RTF_KV=%WHAT%"
 echo.
@@ -62,6 +63,26 @@ if "%RC%"=="0" goto :ok
 if "%RC%"=="2" goto :crashed
 if "%RC%"=="3" goto :refused
 echo !! nll quality check failed with exit %RC%
+goto :fail
+
+:smoke
+REM ---- show effective config: set the same defaults the tool uses, so the echo is truthful ----
+if "%SMOKE_CTX%"==""     set "SMOKE_CTX=8192"
+if "%SMOKE_CHUNK%"==""   set "SMOKE_CHUNK=2048"
+if "%SMOKE_K%"==""       set "SMOKE_K=4"
+if "%SMOKE_MAXNEW%"==""  set "SMOKE_MAXNEW=16"
+if "%SMOKE_ARM%"==""     set "SMOKE_ARM=cudnn_prefill"
+if "%SMOKE_KV%"==""      set "SMOKE_KV=base_bf16"
+echo.
+echo === 8K single smoke: ctx=%SMOKE_CTX% chunk=%SMOKE_CHUNK% k=%SMOKE_K% maxnew=%SMOKE_MAXNEW% ===
+echo     arm=%SMOKE_ARM% kv=%SMOKE_KV%
+echo     single run only; NOT a throughput measurement and NOT a stability check
+%PY% -m specdec.engine.g5_8k_smoke_cudnn
+set "RC=%errorlevel%"
+if "%RC%"=="0" goto :ok
+if "%RC%"=="2" goto :crashed
+if "%RC%"=="3" goto :refused
+echo !! smoke failed with exit %RC%
 goto :fail
 
 :refused
