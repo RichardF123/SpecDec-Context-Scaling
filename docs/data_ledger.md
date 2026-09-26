@@ -1186,6 +1186,50 @@ draft 21.094 s   vs   target 7.340 s     ← draft 只有 0.5B（target 的 1/3�
 **下一步**：chunk 已确认无需改动 ⇒ 直接跑完整变体探针
 （`scripts\run_g5_variance.cmd`，3 角色 × 4 进程 ≈33 min）→ 4 个 SpecDec 样本判双档 + 阶段归因。
 
+### 4.19 同配置复跑（9 分钟内两次）揭示了"双档"的**判别性证据**（2026-09-26）
+
+**两次运行：完全相同的配置**（ctx 8192 / base_bf16 / SpecDec / k=4 / max_new 64 / **chunk 2048** /
+warm1 + rep1 / 同一份代码 / 同一台机器 / 外部 C+G 进程数都是 22）
+
+| 量 | run `...T073128Z`（15:31） | run `...T074020Z`（15:40） | 变化 |
+|---|---|---|---|
+| decode | 10.04 s（6.37 tok/s） | 11.18 s（5.72 tok/s） | **+11.4%** |
+| prefill 合计 | 28.43 s | 32.39 s | **+13.9%** |
+| ├ **draft 侧** | 21.09 s | **24.98 s** | **+18.4%** |
+| └ **target 侧** | 7.34 s | **7.41 s** | **+1.0%** |
+| `peak_allocated` | 7120.6 MiB | 7120.6 MiB | **0.0%** |
+| `peak_reserved` | 10736 MiB | 10736 MiB | **0.0%** |
+| `inactive_split` | 1371 MiB | 1371 MiB | **0.0%** |
+| `num_alloc_retries` | 0 | 0 | — |
+| SM 时钟中位 | 2385 MHz | **2430 MHz（更高）** | ↑ |
+| commit 可用 | 20.5 GiB | 19.6 GiB | −0.9 |
+
+**三个排除（本轮最有价值的部分）**
+1. **不是分配器/池大小造成的**：三项显存指标**逐字节相同**（0.0%）⇒ 慢的那次并没有"池更大"。
+2. **不是时钟造成的**：慢的那次 SM 时钟**反而更高**（2385 → 2430 MHz）。
+3. **不是整机/全局变慢**：若是全局争用，target 与 draft 应同步变慢；
+   实际是 **target +1.0%、draft +18.4%** —— 变化**高度偏向 draft 侧**。
+
+**机制（与既有证据一致，但仍属未隔离的机制）**
+- `spec_decode_greedy` 的顺序是 **先 target prefill、后 draft prefill**；
+  等 draft 开始 prefill 时，target 的权重 + KV 已占满显存（实测 `cuda_free = 0`）。
+- ⇒ **后跑的一方（draft）承担显存压力**；它每次要申请的瞬时最大
+  （chunk=2048 时 **896 MiB**，比 target 的 768 MiB 还大）⇒ 在满显存下付换页代价。
+- 这解释了 **target 侧稳定（7.34–7.41 s）而 draft 侧波动（21.1–25.0 s）**。
+- 也解释了 §4.18 的 residency 效应：draft 只是"常驻"（AR dual-control）就能让
+  **target 的 prefill 从 3.34 s 变 7.40 s（2.2×）** —— 压力来自"多占的 0.95 GiB"。
+
+**方法学后果（必须写进结论）**
+- **同配置的 run-to-run 噪声地板 ≈ 11–18%**（本组实测）⇒
+  ① 任何"配置 A vs B"的单次对比，**差异 <20% 不能归因**；
+  ② 8K SpecDec 的"双档"正是这个量级；
+  ③ 判断分配器旋钮是否有效，每种配置至少 **2–3 次**，否则无法与噪声区分。
+
+**附**：B/C 组因**误用系统 python**（shell 未激活 venv ⇒
+`ModuleNotFoundError: No module named 'torch'`）未运行。已提供一键脚本
+`scripts\run_g5_alloc_ab.cmd`：**显式使用 `.venv\Scripts\python.exe`**，依次跑
+`A 基线 / B expandable_segments:True / C max_split_size_mb:256`。
+
 ## 5. 复现设置（每次记录必须带上）
 - seed=42（测试）；性能脚本 seed=0，3 reps 取最优 + warmup；
 - prompt 固定（bench_basic.PROMPT，38 tok）；decode 数 64；
