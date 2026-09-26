@@ -1337,8 +1337,18 @@ C : warm0 decode= 3.75s prefill=66.59s  →  rep0 decode= 3.38s prefill=56.62s  
    但**不保证**成功 —— 因为 `peak_resv` 超物理 2.5 GiB 的主因是**分配器池 + WDDM 分页**，
    而不是那笔瞬时。投产前应先做 §4.17 的算子级微基准。
 
-## 5. 复现设置（每次记录必须带上）
-- seed=42（测试）；性能脚本 seed=0，3 reps 取最优 + warmup；
+### 4.21 结果汇报文档（2026-09-26）—— 给分析 Agent 的入口
+
+新增 **`docs/results_brief_for_analysis_2026-09-26.md`**（**结果汇报 / 入口文档**）：
+一页读完现状、**可声明的事实**（附台账锚点）、**已排除的假设及证据**（P-state / 热降频 / prefill /
+token 随机性 / CPU commit / 分配器碎片 / 时钟 / 外部占用漂移）、**红线**、**决策点（D1 CUDNN amendment / D2 8K 降级）**、
+数据与代码索引、Gate 总表。`docs/handoff_to_analysis_agent.md` 顶部已加指针。
+
+同时在该简报中固定一条口径说明（避免同一实验出现两个数）：
+**speedup 点估计 = 全部 measured rep 合并中位数**（协议 §7c.6）⇒ 2K = decode **0.406×** / e2e **0.434×**；
+若改用"逐 block 中位数再平均"则为 **0.416× / 0.444×**（差 ~2.3%，**引用时必须注明口径**）。
+
+## 5. 复现设置（每次记录必须带上）- seed=42（测试）；性能脚本 seed=0，3 reps 取最优 + warmup；
 - prompt 固定（bench_basic.PROMPT，38 tok）；decode 数 64；
 - dtype/设备随行标注（fp32/CPU、fp16/CUDA）；attn eager；no_grad；
 - 待补：torch/transformers 精确版本、nvidia-smi 输出存档。
