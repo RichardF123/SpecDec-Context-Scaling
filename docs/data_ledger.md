@@ -1133,6 +1133,59 @@ keep-mask 形式  s=1  T=32  max|Δ| = 5.906e-08   ✅
   **G1 / B4 / B5 / B6-fp32 / B6-bf16 / 35 哨兵 / BF16 tie 重基线**；
 - 所有既有性能数字（含 2K 的 0.406×）将变成 **"pre-SDPA 时代"**，不得与之后的数据混表。
 
+### 4.18 chunk 分档扫描结果（2026-09-26）—— **8K SpecDec 跑通，且 chunk=2048 就够**；并首次按模型拆出 prefill
+
+**环境前提（本轮同时修好）**
+- commit：`c:\pagefile.sys` 固定 **8192 MB**（D 盘那条无效，已移除）⇒ 上限 **33.6 → 39.6 GB**，
+  可用 commit 最坏 **9.3 → 20.5–22.7 GB**（载入需求 ≈9.1–9.6 GiB）；
+- 显存外部占用 **476 MiB**（22 个 C+G 进程），P-state 合格（SM 2385 / mem 8000 MHz）。
+
+**结果：`chunk=2048` → `FITS`（exit=0，113 s）⇒ 不需要改 chunk，与既有数据同口径**
+| 量 | 实测 |
+|---|---|
+| prefill 中位 | **28.434 s** |
+| ├ target 侧 | **7.340 s** |
+| └ **draft 侧** | **21.094 s** ← 异常，见下 |
+| decode 中位 | 10.044 s（**6.372 tok/s**；1 rep ⇒ `rel=0.0%` 不可用于稳定性判断） |
+| e2e | 1.663 tok/s |
+| `peak_allocated` | **7120.6 MiB**（6.95 GiB） |
+| `peak_reserved` | **10736 MiB（10.48 GiB > 8 GiB 物理！）** ⇒ 靠 WDDM 换页硬撑 |
+| `inactive_split` | 1371 MiB |
+| `num_alloc_retries` | **0** |
+| `cuda_free_mib` | **0.0**（物理已满） |
+| `smi` 载入后 | 4705 MiB |
+
+⚠️ **仍属"踩线"**：物理显存吃满（`cuda_free=0`），reserved 超物理 2.48 GiB。
+本次能过是因为**外部占用低（476 MiB）**且 commit 充足；换到外部占用 ~1.5 GiB 的时段
+（§4.16 记录的失败现场）就会 OOM ⇒ **8K SpecDec 的可运行性依赖外部占用，不是稳定可用的条件。**
+
+**🔑 新发现（RQ2 的关键线索）：prefill 按模型拆开后，慢的是 draft 侧**
+```
+draft 21.094 s   vs   target 7.340 s     ← draft 只有 0.5B（target 的 1/3），却慢 2.9×
+```
+**交叉验证（两次独立测量吻合）**：
+| 测量 | 8K target 侧 prefill |
+|---|---|
+| 本节 SpecDec 进程内（draft 常驻**且参与计算**） | **7.340 s** |
+| §4.14 缩小版 run 的 **AR dual-control**（draft 仅常驻、**不**参与计算） | **7.40 / 7.74 s** |
+| §4.14 缩小版 run 的 **AR target-only**（draft 完全不加载） | **3.45 / 3.44 s** |
+| §4.16 8 进程独立测量的 AR target-only | **3.34–3.45 s** |
+
+⇒ **"draft 常驻"本身就让 target 的 8K prefill 慢 2.16–2.30×**，且**与 draft 是否参与计算无关**
+（dual-control 7.40 s 与 SpecDec 内的 7.34 s 几乎相同）。
+**这修正了 §4.16 的更正**：那里用 8 个进程测得"8K residency 对 **decode** 无影响（penalty 0.995）"——
+那只对 **decode** 成立；对 **prefill** 而言 residency 代价**真实且可复现（2.2×）**。
+机制候选（**未隔离，不得当结论**）：prefill 的瞬时激活大（768–896 MiB/chunk）+ KV `cat` 复制，
+一旦 draft 的 0.95 GiB 权重常驻，可用显存就被压到触发 WDDM 换页的水平；decode 的瞬时很小（s=1），故不受影响。
+**待验证**：慢档进程的 `cuda_free` / `inactive_split` / `peak_reserved` 是否系统性更差。
+
+**工具**：`specdec/engine/g5_chunk_fit_sweep.py`（新增，含 commit 护栏复查与
+`FITS` / `REFUSED_COMMIT` / `OOM` / `NATIVE_CRASH` 分类）+ 一键脚本 `scripts\run_g5_chunk_sweep.cmd`；
+产物 `output/g5/variance/p5v_chunksweep_20260926T073128Z_*`。
+
+**下一步**：chunk 已确认无需改动 ⇒ 直接跑完整变体探针
+（`scripts\run_g5_variance.cmd`，3 角色 × 4 进程 ≈33 min）→ 4 个 SpecDec 样本判双档 + 阶段归因。
+
 ## 5. 复现设置（每次记录必须带上）
 - seed=42（测试）；性能脚本 seed=0，3 reps 取最优 + warmup；
 - prompt 固定（bench_basic.PROMPT，38 tok）；decode 数 64；
