@@ -1138,6 +1138,56 @@ keep-mask 形式  s=1  T=32  max|Δ| = 5.906e-08   ✅
   **G1 / B4 / B5 / B6-fp32 / B6-bf16 / 35 哨兵 / BF16 tie 重基线**；
 - 所有既有性能数字（含 2K 的 0.406×）将变成 **"pre-SDPA 时代"**，不得与之后的数据混表。
 
+**4.17.x GPU 算子级微基准结果（2026-09-26，`attn_backend_20260926T091642Z.json`）—— 结论：值得做**
+
+| 形状 | 变体 | 峰值瞬态 | 耗时 | vs 手写 max\|Δ\| | 等价 |
+|---|---|---|---|---|---|
+| **prefill chunk target**<br>12 头 / 2048q / 8192kv / d128 | manual | **1998.1 MiB** | 34.01 ms | — | — |
+| | sdpa **默认（= MATH）** | 1932.1 MiB | 47.67 ms | 1.465e-03 | ✅ |
+| | sdpa **FLASH** | **无可用 kernel** | — | — | ❌ |
+| | sdpa **EFFICIENT** | **无可用 kernel** | — | — | ❌ |
+| | **sdpa CUDNN** | **74.1 MiB** | **4.56 ms** | 1.465e-03 | ✅ |
+| **prefill chunk draft**<br>14 头 / 2048q / 8192kv / d64 | manual | **2288.4 MiB** | 38.54 ms | — | — |
+| | sdpa 默认 | 2150.9 MiB | 51.57 ms | 1.465e-03 | ✅ |
+| | **sdpa CUDNN** | **59.4 MiB** | **4.12 ms** | 1.465e-03 | ✅ |
+| **block verify**（5q） | manual | 52.9 MiB | 0.63 ms | — | — |
+| | **sdpa CUDNN** | **0.2 MiB** | **0.39 ms** | 8.545e-04 | ✅ |
+| **decode**（1q） | manual | 48.9 MiB | 0.50 ms | — | — |
+| | sdpa CUDNN | **ERROR：cudnn 不支持 seq_len = 1** | — | — | ❌ |
+
+**三个平台事实（torch 2.6.0+cu124 / Windows，均由 PyTorch 自己的警告给出）**
+1. `This torch build was not compiled with flash attention` ⇒ **FLASH 后端不可用**；
+2. `Memory Efficient attention has been runtime disabled` ⇒ **mem-efficient 后端被禁用**；
+3. `both fused kernels require query, key and value to have the same num_heads`
+   ⇒ **GQA（12q/2kv）不被 fused kernel 支持**；只有 **CUDNN** 能吃 `enable_gqa=True`。
+4. 另：`cudnn SDPA does not support sequence length 1` ⇒ **decode（s=1）必须保留手写路径**。
+
+**为什么手写路径要 2 GiB（一次要 4 个整尺寸张量）**
+```
+scores = q@kᵀ            (1,12,2048,8192) bf16 = 403 MiB
+scores.masked_fill(...)  再一份                = 403 MiB
+softmax(..., fp32)       fp32 升采样           = 806 MiB
+.to(bf16)                再回写一份            = 403 MiB
+───────────────────────────────────────── 峰值 ≈ 2015 MiB（实测 1998 MiB ✓）
+```
+CUDNN 融合核只用 **74 MiB** 工作区 ⇒ **省约 1.92 GiB/次调用**（draft 侧省 2.23 GiB）。
+
+**对"踩线"的预期（这是关键）**
+- 目标瞬时 768–896 MiB 只是**其中一份**；实际可省 **~1.9–2.2 GiB**（我上一轮按 0.9 GiB 估，**低估了**）；
+- `peak_allocated` 7121 MiB → 预期 **~5.2 GiB**；`peak_reserved` 10736 → 有望**降到 8188 MiB 物理线以内**
+  ⇒ **有机会真正"不踩线"**（不再走 WDDM 分页 ⇒ 时间也可能变得可复现）；
+- prefill 时间：target 侧 attention 合计 ≈ 34 ms × 28 层 × 4 chunk ≈ 3.8 s → CUDNN ≈ 0.5 s
+  （即 target prefill 7.34 s 里约 **3.3 s 是手写 attention**，可省）；
+  draft 侧 ≈ 3.7 s → 0.4 s，但 draft prefill 实测 21–28 s，**其余部分仍待解释**。
+
+**风险与代价（不变）**
+- 只改 `SelfAttention.forward` 的 score→output 一段；**cache 契约 / trim / rollback / 索引映射全不动**；
+- 需要**混合实现**：`s ≥ 2` 走 CUDNN-SDPA，`s == 1`（decode）保留手写（因 cudnn 不支持）；
+- 数值：max|Δ| **1.465e-03**（bf16 输出）+ `attn_mask` 的 bool keep-mask（**不是** `is_causal`，见上）；
+- 必须重跑 **B6-fp32 / B6-bf16 / 35 哨兵 / BF16 tie 重基线**；
+  **G1（CPU fp32 对齐 transformers）不受影响**（CUDNN 只在 CUDA 路径启用）；
+- 所有既有性能数字成为 **"pre-CUDNN 时代"**，不得混表。
+
 ### 4.18 chunk 分档扫描结果（2026-09-26）—— **8K SpecDec 跑通，且 chunk=2048 就够**；并首次按模型拆出 prefill
 
 **环境前提（本轮同时修好）**
