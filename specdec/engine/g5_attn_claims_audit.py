@@ -48,6 +48,30 @@ def close(a, b, tol=1e-12) -> bool:
         return False
 
 
+def close_rel(a, b, rtol=5e-4) -> bool:
+    """报告里的数值只印 4 位有效数字 ⇒ 按 4 位有效数字比对（显示精度，不是放宽结论）。"""
+    try:
+        a, b = float(a), float(b)
+        return abs(a - b) <= rtol * max(abs(a), abs(b), 1e-30)
+    except (TypeError, ValueError):
+        return False
+
+
+# 报告 §5.3 表里印出的数值（4 位有效数字）—— 审计拿它去核对 JSON
+REPORT_OP_ABS_REL = {
+    ("target", "block2048_T2048_first"): (2.344e-2, 7.937e-3),
+    ("target", "block2048_T8192_hist"): (1.465e-3, 1.240e-2),
+    ("target", "block512_T8192_hist"): (9.766e-4, 1.031e-2),
+    ("target", "block4_T8192_hist"): (8.545e-4, 1.277e-2),
+    ("target", "block2_T2_first"): (1.562e-2, 4.255e-3),
+    ("draft", "block2048_T2048_first"): (1.562e-2, 5.747e-3),
+    ("draft", "block2048_T8192_hist"): (1.465e-3, 1.172e-2),
+    ("draft", "block512_T8192_hist"): (8.545e-4, 8.373e-3),
+    ("draft", "block4_T8192_hist"): (4.883e-4, 6.579e-3),
+    ("draft", "block2_T2_first"): (1.562e-2, 5.155e-3),
+}
+
+
 def main() -> int:
     ops, model = load(OPS), load(MODEL)
     rb, rv, rpre = load(RTF_BASE), load(RTF_VFP8), load(RTF_PRE)
@@ -77,6 +101,21 @@ def main() -> int:
               kp.get("matched") is True
               and "cudnn" in " ".join(kp.get("fused_kernel_names") or []).lower(),
               str(kp.get("fused_kernel_names")))
+        # ---- §5.3 数值表：报告里印的每个数都要能在 JSON 里对上 ----
+        bad_num = []
+        for (cfg, rname), (a_rep, r_rep) in REPORT_OP_ABS_REL.items():
+            row = rows.get((cfg, rname))
+            if row is None or not (close_rel(row["abs_err"], a_rep)
+                                   and close_rel(row["rel_err"], r_rep)):
+                bad_num.append((cfg, rname, row["abs_err"] if row else None,
+                                row["rel_err"] if row else None))
+        check("§5.3 数值表 10 行 abs/rel 全部与 JSON 一致（4 位有效数字）",
+              not bad_num, str(bad_num[:3]))
+        check("§5.3 判定：12 行里恰好 8 行 FAIL（预登记判据，未放宽）",
+              sum(1 for r in ops["op_level"] if r["verdict"] == "FAIL") == 8
+              and all(r["verdict"] == "PASS" for r in ops["op_level"]
+                      if r["path"] == "eager"),
+              f"FAIL={sum(1 for r in ops['op_level'] if r['verdict'] == 'FAIL')}")
     else:
         check("算子级结果存在", False, str(OPS))
 
@@ -244,6 +283,18 @@ def main() -> int:
               f"after_load pt_peak_res={tl.get('after_load', {}).get('pt_peak_reserved_mib')} "
               f"smi_used={tl.get('after_load', {}).get('smi_mem_used_MiB')}")
         check("排练**不是** 8K 结论（ctx 记录为 512）", smoke["config"]["ctx"] == 512)
+
+    print("\n== §4 CPU 自测（报告主张 43 PASS / 0 FAIL）==")
+    import subprocess
+    try:
+        pr = subprocess.run([sys.executable, "-m", "specdec.engine.attn_phase_selftest_cpu"],
+                            cwd=str(ROOT), capture_output=True, text=True, encoding="utf-8",
+                            errors="replace", timeout=900)
+        tail = (pr.stdout or "").strip().splitlines()[-1] if pr.stdout else ""
+        check("CPU 自测当前可复现为 PASS 43 / FAIL 0",
+              pr.returncode == 0 and "PASS 43 / FAIL 0" in tail, tail)
+    except Exception as e:                                     # noqa: BLE001
+        check("CPU 自测可运行", False, f"{type(e).__name__}: {e}")
 
     bad = [n for n, ok, _ in RESULTS if not ok]
     print(f"\n审计：{len(RESULTS) - len(bad)} / {len(RESULTS)} 条与原始结果一致")
