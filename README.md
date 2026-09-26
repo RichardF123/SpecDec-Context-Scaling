@@ -6,7 +6,41 @@
 > `docs/design_freeze_fp8_kv.md`（FP8 KV 设计冻结 v1.3）、`docs/design_freeze_g4_specdec.md`（G4 协议 v0.3）、
 > `docs/plan_g4_next_steps.md`（G4 阶段状态）。
 
-## 项目状态（2026-09-15 快照）
+## 当前状态（2026-09-27 更新）
+
+**已完成引擎、V-only FP8 KV 和投机解码实现；当前重点是 8K 测量稳定性与 prefill-only cuDNN 验证，尚未完成正式 12 条件实验矩阵。** 以下新结果来自截至 2026-09-26 的已归档实验，不代表后续测试已经通过。
+
+| 阶段 | 当前结果 | 结论边界 |
+|---|---|---|
+| G1 / G3 | target 正确性通过；V-only FP8 设计冻结 | 正式计算口径为 BF16；V-only 不等于 K/V 全 FP8 |
+| G4 | B6 FP32：20/20 组合逐 token 一致；BF16：19/20，CHECK | FP32 实现证据不替代 BF16 exact-id 门；216/348 是 accepted/proposed，不是正确率 |
+| G5 测量系统 | canonical v1.2、阶段计时、独立进程探针、P-state 预检及失败记录已实现；已有 151 项 CPU 自测记录 | 测量工具完成不代表正式实验完成 |
+| 8K eager 双模型 | 历史可行性测试跑通过；后续出现 OOM/崩溃和计时不稳定 | “能跑一次”不等于可进行稳定的正式性能测量 |
+| prefill-only cuDNN | 可选分支已接入，默认仍为 eager；CPU 43/43，GPU 路径复核符合预期 | 只融合显式 prefill；decode/propose/verify/repair 保持 eager |
+| cuDNN 对齐验证 | 算子级 8/12 行未过门；模型级 5 配置 × 2 次重复均未过门，ctx512/base 生成发生分歧 | 未通过预登记 eager 对齐判据；不直接等同于融合实现错误，也不改写为 PASS |
+
+### 关键实测数据
+
+| 数据 | 结果 | 测量范围 |
+|---|---|---|
+| V-only FP8 质量 | 独立 40 窗：ΔNLL +0.000397，relative ΔPPL +0.040% | 已冻结 eager 路径；不外推到新后端 |
+| target 8K 逻辑 KV | 224.00 → 169.75 MiB，约 1.32× 压缩 | 仅 target KV，不是双模型总显存 |
+| 2K base_bf16 探索性结果 | decode speedup 0.406×；e2e 0.434×，未加速 | 缩小版 stability probe；合并 measured reps 取中位数后相除，不是 ≥16-family 正式矩阵 |
+| 8K eager SpecDec 波动 | 同配置三次 decode：10.04 / 11.18 / 16.22 s，极差约 61%（相对最小值） | 不支持正式速度倍数声明 |
+| target attention 临时显存 | s=2048、T=2048：496 → 18 MiB；s=2048、T=8192：1984 → 54 MiB | eager → cuDNN，单算子测试，不是整模型峰值 |
+| draft attention 临时显存 | s=2048、T=8192：2284 → 51.5 MiB | 同上；profiler 确认 cuDNN attention 路径 |
+
+`s` 是当前 query 块长度，`T` 是含历史缓存的总 KV 长度；`s=2048,T=8192` 不是 prefill 第一块。`allocated` 是 PyTorch 跟踪的张量分配，`reserved` 是分配器保留池，两者都不能直接等同于整卡物理占用；单凭 reserved 超过 8 GiB 不能证明发生分页。
+
+**数值归因仍需补证**：合成 Q/K/V 对照支持 BF16 中间舍入是重要原因，但尚不能断言真实模型全部差异只来自 score 舍入，或 cuDNN 内部“全程 FP32”。保留原 FAIL，区分数值差异、生成差异与质量损失。
+
+**下一步顺序**：真实模型同一份 Q/K/V 的精度定位 → 固定短窗口独立 NLL/PPL 对照 → 在证据支持后进行独立进程完整 8K 双模型 smoke → 重复稳定性与新后端 correctness 验证。新旧后端数据分开记录，正式 AR/SpecDec 使用一致的后端策略；当前不启动正式矩阵，不声明 8K 已解决或 SpecDec 已加速。
+
+来源：[数据台账](docs/data_ledger.md)（§3.5.3、§4.14、§4.20、§4.22）、[G5 测量协议](docs/g5_measurement_protocol.md)、[cuDNN 阶段报告](docs/cudnn_prefill_stage_report.md)。阶段报告中的唯一根因表述仍需上述真实张量实验补证，不能据此认定已完成验证。
+
+## 已完成阶段与历史验收
+
+以下为对应时间和配置下的历史记录，不代表当前 8K 正式测量或新后端已经通过。
 
 - ✅ **引擎正确性基线**：L1 从零前向对齐 0.000（fp32 CPU，vs transformers）；L2 KV-cache + 贪心生成对齐 PASS；
 - ✅ **G1 — target 1.5B correctness**（fp32 CPU）：full-forward `3.1e-05`、cached-vs-full `2.0e-05`、argmax same、生成序列一致 → **PASS**；
@@ -21,14 +55,14 @@
   - **B6-fp32 = 实现正确性证据 → PASS**：10 case × 2 KV 档 = **20/20 组合逐 token id 全等**（CPU/float32，参照 = 同引擎 cached AR；总 216/348；finite、确定性、非空过、case 与档位跑满）。判据在运行前入库；"dtype 不是被测对象"已明确；
   - **B6-bf16 = 性能档行为 → CHECK 19/20**：唯一分歧 `natural-2@7` 经实测归因为 **bf16 数值不可判定位置**（候选对精确并列 22.8750；signal 0.1491 ≤ noise 0.1491），fp32 真值 = spec 侧 token。**严格口径：不设例外、不放宽 exact-id 门**，该记录原样保留并作为已知数值限制披露；
 - ✅ **EOS 路径 bug 修复**：`_propose` 的 EOS 检查位置导致 draft cache 少 1，全接受分支 `trim_cache` 越界（生成以 EOS 正常收尾时必踩）→ 已修 + 纯逻辑回归测试（含旧实现对照复现 ValueError）；
-- 🔄 **下一步**：≥16 prompt families（2K⊂4K⊂8K）→ G5 instrumentation → **Part 4 测量（含 AR 基线同档）** → 定 final 规模 → pilot/final → 图与归因（break-even）；
+- **后续正式实验**：先完成上方数值与稳定性验证，再推进 ≥16 prompt families（2K⊂4K⊂8K）的 pilot/final 与 break-even 分析；G5 instrumentation 和 Part 4 探索测量已有实现与结果，不再列为未启动；
 - 测量纪律：只记录实测（数据见 `docs/data_ledger.md`）；跨脚本显存数字不作比较；进度与决策变更走 amendment/日志而非改写已冻结方案。
 
 ## 项目简介
 
 **在做什么**：从零手写 Qwen2 架构推理引擎（RMSNorm / RoPE / GQA attention /
-SwiGLU / KV-cache 解码 / 贪心生成），再沿 **KV-cache → int8/int4 量化 → fp8 KV
-量化 → 投机解码** 逐级优化，用可复现测量表回答研究问题：
+SwiGLU / KV-cache 解码 / 贪心生成），目前沿 **KV-cache → V-only FP8 KV
+压缩 → 投机解码** 进行实现与验证，用可复现测量表回答研究问题：
 > 投机解码在 8GB 小卡上随上下文变长到哪里失效？KV 量化能否延长它的获利区间？
 
 **意义**：课程要求"原创 + hands-on LLM system"——我们交付自写引擎 + 质量×成本
@@ -36,10 +70,10 @@ SwiGLU / KV-cache 解码 / 贪心生成），再沿 **KV-cache → int8/int4 量
 可作为小模型部署的决策表；亲手实现 transformer 与推理引擎也正是 AI Infra
 方向的核心技能。
 
-**技术栈**：Python + PyTorch 2.6（cu124）；自写引擎 `engine/model_self.py`（OURS）；
-HuggingFace 仅用于权重加载与 tokenizer（LIB）；对齐/缓存/生成测试 vs transformers
-eager；规划 int8/int4（L4）、fp8 KV（L4b）、固定链投机解码（L5）、受控 CUDA kernel 轨、
-Spec-Bench 风格测量协议 + `results.jsonl`。
+**技术栈**：Python + PyTorch 2.6（cu124）；自写引擎 `specdec/engine/model_self.py`（OURS）；
+HuggingFace 用于权重加载、tokenizer 与参考实现（LIB）；自写缓存、V-only FP8 量化及 greedy 投机循环。
+新增的可选 prefill 融合路径通过 PyTorch 调用 cuDNN attention（LIB），不是团队自研 CUDA/FlashAttention 算子。
+int8/int4 权重量化与自研 CUDA 不属于当前推进范围；测量遵循 G5 协议并落盘保存真实数据。
 
 **为什么这么做**：调 API/库只能看整机表现，研究问题（缓存、量化、投机解码的收益）
 需要引擎内部控制权（缓存布局、解码循环、计时插桩）——这是自建引擎的必要性而非炫技；
@@ -128,6 +162,6 @@ specdec/
   bench/          Phase 7：基准测试
 ```
 
-诚实性规则：`results.jsonl` 只追加真实测量数据，绝不写假行。引擎代码由团队
-自己编写；只有权重加载 / tokenizer / 测试工具借用第三方库（OURS vs LIB 边界
-见 `docs/plan_v6.md`）。
+诚实性规则：`results.jsonl` 只追加真实测量数据，绝不写假行。引擎、缓存与投机循环由团队
+编写，底层张量运算依赖 PyTorch；权重加载、tokenizer、参考实现及可选 cuDNN 融合 attention
+使用第三方库。历史 eager 与新后端的实验口径必须分别记录，不混表、不把诊断数据当正式结论。
