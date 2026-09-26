@@ -108,6 +108,49 @@ _ATTENTION_PHASE = "other"       # 调用方显式设置；默认**不是** pref
 _ATTENTION_STATS: dict | None = None
 _MAX_FALLBACK_LOGGED = 32
 
+# ---------------------------------------------------------------------------
+# **仅用于诊断**的 eager 精度干预开关（两个可独立移除的舍入点，默认全部关闭）
+#   R1 = QK 分数被舍入成 bf16（matmul 输入 bf16 ⇒ 输出 bf16）
+#   R2 = softmax 概率被 `.to(dtype)` 转回 bf16
+# 第三个舍入点 R3（AV 输出被舍入成 bf16）**在整模型层面无法单独移除**：
+# 下游的 `o_proj` 是 bf16 权重，fp32 的 attention 输出喂不进去
+# （实测：`RuntimeError: expected mat1 and mat2 to have the same dtype, but got: float != BFloat16`）。
+# 因此整模型层面 `R3 缺失` 与 `R3 存在但立刻被 o_proj 的输入转换再舍入一次` 不可区分；
+# R3 只能靠 `g5_attn_real_tensor_forensics.py` 的**逐层张量**变体阶梯单独测量。
+# **默认 (False, False) 时，eager 分支执行的算子与顺序与历史完全一致**（逐位不变）；
+# 打开后只用于"在真实模型上逐项分离差异来源"，**不得**用于正式测量。
+DIAG_QK_FP32 = False
+DIAG_PROB_FP32 = False
+
+
+def diag_precision() -> dict:
+    return dict(qk_fp32=DIAG_QK_FP32, prob_fp32=DIAG_PROB_FP32)
+
+
+def set_diag_precision(qk32=None, prob32=None) -> dict:
+    """设置诊断用精度干预开关；返回设置后的状态。**不改变默认行为。**"""
+    global DIAG_QK_FP32, DIAG_PROB_FP32
+    if qk32 is not None:
+        DIAG_QK_FP32 = bool(qk32)
+    if prob32 is not None:
+        DIAG_PROB_FP32 = bool(prob32)
+    return diag_precision()
+
+
+# 整模型层面可运行的预设（名字与逐层工具的变体一致；`out32` 只在逐层工具里有意义）
+DIAG_PRESETS = {
+    "eager": (False, False),      # R1 在、R2 在
+    "qk32": (True, False),        # 只移除 R1
+    "prob32": (False, True),      # 只移除 R2
+    "fp32": (True, True),         # R1、R2 都移除（R3 仍受 o_proj 约束）
+}
+
+
+def set_diag_preset(name: str) -> dict:
+    if name not in DIAG_PRESETS:
+        raise ValueError(f"未知诊断精度预设 {name!r}（可选 {tuple(DIAG_PRESETS)}）")
+    return set_diag_precision(*DIAG_PRESETS[name])
+
 
 def _fresh_stats() -> dict:
     return {"strategy": ATTENTION_STRATEGY, "requested_backend": FUSED_BACKEND_NAME,
@@ -364,7 +407,11 @@ class SelfAttention(nn.Module):
         else:
             k_rep = kv_repeat(k_all, self.heads // self.kv_heads)
             v_rep = kv_repeat(v_all, self.heads // self.kv_heads)
-            scores = torch.matmul(q, k_rep.transpose(-2, -1)) / (self.head_dim ** 0.5)
+            # ---- R1：QK 分数精度。默认（DIAG_QK_FP32=False）与历史**逐位一致** ----
+            if DIAG_QK_FP32:
+                scores = torch.matmul(q.float(), k_rep.float().transpose(-2, -1)) / (self.head_dim ** 0.5)
+            else:
+                scores = torch.matmul(q, k_rep.transpose(-2, -1)) / (self.head_dim ** 0.5)
             p = T - s
             if cache is None:
                 mask = torch.triu(torch.ones(s, T, device=x.device, dtype=torch.bool), diagonal=1)
@@ -374,8 +421,14 @@ class SelfAttention(nn.Module):
             else:
                 mask = torch.triu(torch.ones(s, T, device=x.device, dtype=torch.bool), diagonal=p + 1)
                 scores = scores.masked_fill(mask, float('-inf'))
-            attn = torch.softmax(scores, dim=-1, dtype=torch.float32).to(q.dtype)
-            out = torch.matmul(attn, v_rep)
+            attn = torch.softmax(scores, dim=-1, dtype=torch.float32)
+            # ---- R2：概率是否回转 bf16（R3 见策略块说明：整模型层面无法单独移除）----
+            if DIAG_PROB_FP32:
+                out = torch.matmul(attn, v_rep.float())
+            else:
+                attn = attn.to(q.dtype)                              # 默认路径：与历史一致
+                out = torch.matmul(attn, v_rep)
+            out = out.to(q.dtype)      # o_proj 是 bf16 ⇒ 这一步在默认路径是**无操作**（无拷贝）
         out = out.transpose(1, 2).contiguous().view(b, s, self.heads * self.head_dim)
         if cache is None:
             if fmt in ('fp8', 'v_fp8'):

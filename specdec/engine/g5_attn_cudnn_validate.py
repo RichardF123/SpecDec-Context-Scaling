@@ -64,7 +64,9 @@ OP_CONFIGS = (("target", 12, 2, 128), ("draft", 14, 2, 64))
 OP_ROWS = (
     # 名称                     s     T     has_cache
     ("block2048_T2048_first", 2048, 2048, False),   # 首块（cache is None）
-    ("block2048_T8192_hist",  2048, 8192, True),    # 8K 分块 prefill 的**第一块**：D1 决策的关键行
+    # 术语更正：本行是**带历史 KV 的块**（chunk=2048 时 8192 上下文的**最后一块**，历史 6144），
+    # 不是"第一块"；第一块是 cache is None 的 block2048_T2048_first。s×T 最大 ⇒ eager 开销最大。
+    ("block2048_T8192_hist",  2048, 8192, True),
     ("block512_T8192_hist",    512, 8192, True),
     ("block4_T8192_hist",        4, 8192, True),    # 短块但仍 ≥ MIN_S ⇒ 应融合
     ("block2_T2_first",          2,    2, False),   # 允许融合的最小情形

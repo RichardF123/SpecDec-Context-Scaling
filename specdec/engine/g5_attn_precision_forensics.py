@@ -4,7 +4,8 @@
 而算子级用 `randn` 测却只有 2–3 ULP。本工具回答"到底是哪一侧、哪个环节"。
 
 它检验并区分 4 个假说
-  H1 **分数矩阵的 bf16 舍入**（eager 在 softmax 前把分数舍入成 bf16；cuDNN 内部 fp32）
+  H1 **分数矩阵的 bf16 舍入**（eager 在 softmax 前把分数舍入成 bf16；
+     **不宣称** cuDNN 内部精度 —— 本工具只测"融合侧误差对输入幅度不敏感"，不解释其内部实现）
   H2 掩码语义不一致（融合侧忽略 offset-causal 掩码）
   H3 GQA 广播错误（`enable_gqa=True` 与手工 `kv_repeat` 结果不同）
   H4 缩放被重复施加（`scale` 之外 kernel 又乘了一次 1/√d）
