@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
+import contextlib
 class RMSNORM(nn.Module):
     def __init__(self, hidden: int, eps: float = 1e-6):
         super().__init__()
@@ -86,6 +87,205 @@ def dequantize_kv_fp8(q: torch.Tensor, scale: torch.Tensor, dtype: torch.dtype =
     hat = qg * scale.unsqueeze(-1)
     return hat.reshape_as(q).to(dtype)
 
+# ---------------------------------------------------------------- attention 后端策略（实验性分支）
+# 目的：**单独**验证"融合 attention 能否降低 prefill 的临时显存压力"。
+# 纪律（对应本次任务的硬要求）：
+#   ① 默认 `eager`，行为与历史完全一致；不把新后端宣布为正式冻结方案；
+#   ② **只允许 prefill 阶段**走融合路径 —— AR 单步 / draft 起草 / target 块验证 / 替换修复
+#      一律保持原路径；
+#   ③ 阶段由调用方**显式标注**。**不得**用 `q_len > 1` 判断 prefill：
+#      `spec_dec._verify` 的候选验证也是多 token（s = kp ∈ [1..k]）；
+#   ④ 不支持或短块 → **预先定义**的回退策略，并把**原因**记录进统计（不静默回退）；
+#   ⑤ **不吞异常**：融合路径的 OOM / "无可用 kernel" / 实现错误一律向上抛，
+#      绝不用笼统 `except Exception` 掩盖。
+ATTENTION_STRATEGIES = ("eager", "cudnn_prefill")
+PREFILL_FUSED_MIN_S = 2          # cuDNN SDPA 不支持 seq_len == 1（见台账 §4.17.x）
+SHORT_BLOCK_POLICY = "eager_fallback"   # 唯一预定义策略：短块回退 eager 并记录原因
+FUSED_BACKEND_NAME = "CUDNN_ATTENTION"
+
+ATTENTION_STRATEGY = "eager"
+_ATTENTION_PHASE = "other"       # 调用方显式设置；默认**不是** prefill
+_ATTENTION_STATS: dict | None = None
+_MAX_FALLBACK_LOGGED = 32
+
+
+def _fresh_stats() -> dict:
+    return {"strategy": ATTENTION_STRATEGY, "requested_backend": FUSED_BACKEND_NAME,
+            "calls": {"eager": 0, "fused": 0},
+            "by_phase": {}, "fused_by_phase": {}, "eager_by_phase": {},
+            # 每阶段见过的最大 query 长度 —— 用来**正面证明**
+            # "候选验证的 s>1 也仍然是 eager"（而不是只靠"没有 fused"反证）
+            "s_max_by_phase": {}, "fused_s_max_by_phase": {},
+            "fallbacks": [], "fallback_count": 0, "eager_reason_kinds": {},
+            "phases_seen": [], "errors": []}
+
+
+def set_attention_strategy(name: str) -> str:
+    """显式切换策略。返回切换后的策略名。"""
+    global ATTENTION_STRATEGY
+    if name not in ATTENTION_STRATEGIES:
+        raise ValueError(f"未知 attention 策略 {name!r}（可选 {ATTENTION_STRATEGIES}）")
+    ATTENTION_STRATEGY = name
+    if _ATTENTION_STATS is not None:
+        _ATTENTION_STATS["strategy"] = name
+    return ATTENTION_STRATEGY
+
+
+def attention_strategy() -> str:
+    return ATTENTION_STRATEGY
+
+
+@contextlib.contextmanager
+def attention_phase(name: str):
+    """显式标注当前执行阶段。**唯一**决定"是否允许融合"的输入（除策略本身）。
+
+    合法阶段：`prefill` / `decode` / `propose` / `verify` / `repair` / `other`。
+    只有 `prefill` 允许融合；其余一律 eager —— 这正是"候选验证不被误用新路径"的机制保证。
+    """
+    global _ATTENTION_PHASE
+    prev = _ATTENTION_PHASE
+    _ATTENTION_PHASE = name
+    st = _stats()
+    if name not in st["phases_seen"]:
+        st["phases_seen"].append(name)
+    try:
+        yield
+    finally:
+        _ATTENTION_PHASE = prev
+
+
+def current_attention_phase() -> str:
+    return _ATTENTION_PHASE
+
+
+def _stats() -> dict:
+    global _ATTENTION_STATS
+    if _ATTENTION_STATS is None:
+        _ATTENTION_STATS = _fresh_stats()
+    return _ATTENTION_STATS
+
+
+def reset_attention_stats() -> None:
+    global _ATTENTION_STATS
+    _ATTENTION_STATS = _fresh_stats()
+
+
+def attention_stats() -> dict:
+    """返回统计（深拷贝），用于证明阶段分流与回退原因。"""
+    import copy
+    st = copy.deepcopy(_stats())
+    st["strategy"] = ATTENTION_STRATEGY
+    return st
+
+
+def decide_attention_path(phase: str, s: int, strategy: str | None = None) -> tuple[str, str | None]:
+    """**纯函数**决定走哪条路径。返回 `(path, reason)`，`path ∈ {"eager","fused"}`。
+
+    可 CPU 测试；这是"阶段分流"的唯一裁决点。
+    """
+    strat = ATTENTION_STRATEGY if strategy is None else strategy
+    if strat != "cudnn_prefill":
+        return "eager", f"strategy={strat}"
+    if phase != "prefill":
+        return "eager", f"phase={phase!r} != 'prefill'（仅 prefill 允许融合）"
+    if s < PREFILL_FUSED_MIN_S:
+        return "eager", f"s={s} < PREFILL_FUSED_MIN_S={PREFILL_FUSED_MIN_S}（cuDNN 不支持 seq_len=1）"
+    return "fused", None
+
+
+def _kv_keep_mask(s: int, T: int, device) -> torch.Tensor:
+    """偏移因果掩码的**保留**形式（SDPA 语义：True = 参与）。
+
+    语义必须与 eager 路径完全一致：**第 i 个 query 只能访问 key_position ≤ (T − s) + i**。
+    本式对三种情形统一成立：cache 为 None（T==s ⇒ j ≤ i）、s==1（j ≤ T−1，全允许）、
+    以及非方阵的分块情况（**此时 `is_causal=True` 不等价**，见台账 §4.17）。
+    """
+    drop = torch.triu(torch.ones(s, T, device=device, dtype=torch.bool), diagonal=(T - s) + 1)
+    return ~drop
+
+
+def _sdpa(q, k, v, **kw):
+    """`F.scaled_dot_product_attention` 的**一级间接**。
+
+    存在的理由：让测试可以**安全地** spy/替换（直接改 `F.scaled_dot_product_attention`
+    会污染全局 `torch.nn.functional`，那是不可接受的副作用）。
+    """
+    return F.scaled_dot_product_attention(q, k, v, **kw)
+
+
+def _fused_prefill_attention(q, k, v, head_dim: int):
+    """强制 CUDNN_ATTENTION 后端的融合 prefill attention。
+
+    - GQA 用 `enable_gqa=True` 原生处理（**不做** `kv_repeat` 展开，这是省显存的一半来源）；
+    - 掩码用 **bool keep-mask**（不是 `is_causal`，非方阵时二者不等价）；
+    - **不捕获任何异常**：无可用 kernel / OOM 直接抛给调用方。
+    """
+    import torch.nn.attention as A
+    s, T = q.shape[2], k.shape[2]
+    keep = _kv_keep_mask(s, T, q.device)
+    with A.sdpa_kernel([A.SDPBackend.CUDNN_ATTENTION]):
+        out = _sdpa(q, k, v, attn_mask=keep, dropout_p=0.0, scale=head_dim ** -0.5,
+                    enable_gqa=(q.shape[1] != k.shape[1]))
+    return out
+
+
+def _record_attention_call(path: str, phase: str, s: int, T: int, reason: str | None,
+                           heads: int, kv_heads: int, head_dim: int) -> None:
+    st = _stats()
+    st["calls"][path] += 1
+    st["by_phase"][phase] = st["by_phase"].get(phase, 0) + 1
+    key = "fused_by_phase" if path == "fused" else "eager_by_phase"
+    st[key][phase] = st[key].get(phase, 0) + 1
+    smax = st["s_max_by_phase"]
+    if s > smax.get(phase, 0):
+        smax[phase] = s
+    if path == "fused":
+        fsmax = st["fused_s_max_by_phase"]
+        if s > fsmax.get(phase, 0):
+            fsmax[phase] = s
+    if path == "eager" and ATTENTION_STRATEGY == "cudnn_prefill":
+        # **口径**：`fallback_count` = 策略=cudnn_prefill 时的**全部非融合调用**，
+        # 它包含两大类，必须靠 `eager_reason_kinds` 分开读，否则会误读：
+        #   short_block_seq_len_lt_min —— **短块策略真的触发了**（prefill 里 s < 2）；
+        #   phase_not_prefill         —— 非 prefill 阶段**本就应该** eager（正常路径，不是回退）。
+        st["fallback_count"] += 1
+        kind = "other"
+        if reason and "PREFILL_FUSED_MIN_S" in reason:
+            kind = "short_block_seq_len_lt_min"
+        elif reason and reason.startswith("phase="):
+            kind = "phase_not_prefill"
+        st["eager_reason_kinds"][kind] = st["eager_reason_kinds"].get(kind, 0) + 1
+        if len(st["fallbacks"]) < _MAX_FALLBACK_LOGGED:
+            st["fallbacks"].append(dict(phase=phase, s=s, T=T, reason=reason, kind=kind,
+                                        heads=heads, kv_heads=kv_heads, head_dim=head_dim,
+                                        policy=SHORT_BLOCK_POLICY))
+
+
+def assert_strategy_used() -> dict:
+    """**防止"忘了标注阶段"导致静默不融合**：策略已切到 cudnn_prefill 但一次都没融合 ⇒ 抛错。"""
+    st = attention_stats()
+    if ATTENTION_STRATEGY == "cudnn_prefill" and st["calls"]["fused"] == 0:
+        raise RuntimeError(
+            "策略=cudnn_prefill 但 fused 调用数为 0 —— 说明没有任何调用点标注了 "
+            "attention_phase('prefill')，**这属于静默不生效**，必须显式排查。"
+            f"（已见阶段：{st['phases_seen']}；回退数：{st['fallback_count']}）")
+    return st
+
+
+def chunked_prefill(model, ids, chunk: int = 1024, *, need_logits_last: bool = True):
+    """分块 prefill 的**规范实现**：把 attention 阶段显式标为 `'prefill'`。
+
+    与各处 harness 原有的循环语义一致：逐块 `model._run`，**仅最后一块**取 logits。
+    阶段标注是本函数存在的主要理由 —— 否则 `cudnn_prefill` 策略会静默不生效。
+    """
+    with attention_phase("prefill"):
+        cache, lg, n = None, None, ids.shape[1]
+        for st in range(0, n, chunk):
+            lg, cache = model._run(model.embed_tokens(ids[:, st:st + chunk]), cache,
+                                   need_logits=(need_logits_last and st + chunk >= n))
+    return lg, cache
+
+
 class SelfAttention(nn.Module):
     def __init__(self, hidden: int, heads: int, kv_heads: int, head_dim:int, attn_bias: bool = False):
         super().__init__()
@@ -153,21 +353,29 @@ class SelfAttention(nn.Module):
             else:
                 v_all = torch.cat([cache["v"], v_cur16], dim=2)
                 cache["v"] = v_all
-        k_rep = kv_repeat(k_all, self.heads // self.kv_heads)
-        v_rep = kv_repeat(v_all, self.heads // self.kv_heads)
-        scores = torch.matmul(q, k_rep.transpose(-2, -1)) / (self.head_dim ** 0.5)
         T = k_all.shape[2] if cache is not None else s
-        p = T - s
-        if cache is None:
-            mask = torch.triu(torch.ones(s, s, device=x.device, dtype=torch.bool), diagonal=1)
-            scores = scores.masked_fill(mask, float('-inf'))
-        elif s == 1:
-            pass
+        # ---- 阶段分流（唯一裁决点；见文件头策略块）----
+        path, reason = decide_attention_path(_ATTENTION_PHASE, s)
+        _record_attention_call(path, _ATTENTION_PHASE, s, T, reason,
+                               self.heads, self.kv_heads, self.head_dim)
+        if path == "fused":
+            # 融合 prefill：不做 kv_repeat 展开；掩码为 bool keep-mask
+            out = _fused_prefill_attention(q, k_all, v_all, self.head_dim)
         else:
-            mask = torch.triu(torch.ones(s, T, device=x.device, dtype=torch.bool), diagonal=p + 1)
-            scores = scores.masked_fill(mask, float('-inf'))
-        attn = torch.softmax(scores, dim=-1, dtype=torch.float32).to(q.dtype)
-        out = torch.matmul(attn, v_rep)
+            k_rep = kv_repeat(k_all, self.heads // self.kv_heads)
+            v_rep = kv_repeat(v_all, self.heads // self.kv_heads)
+            scores = torch.matmul(q, k_rep.transpose(-2, -1)) / (self.head_dim ** 0.5)
+            p = T - s
+            if cache is None:
+                mask = torch.triu(torch.ones(s, T, device=x.device, dtype=torch.bool), diagonal=1)
+                scores = scores.masked_fill(mask, float('-inf'))
+            elif s == 1:
+                pass
+            else:
+                mask = torch.triu(torch.ones(s, T, device=x.device, dtype=torch.bool), diagonal=p + 1)
+                scores = scores.masked_fill(mask, float('-inf'))
+            attn = torch.softmax(scores, dim=-1, dtype=torch.float32).to(q.dtype)
+            out = torch.matmul(attn, v_rep)
         out = out.transpose(1, 2).contiguous().view(b, s, self.heads * self.head_dim)
         if cache is None:
             if fmt in ('fp8', 'v_fp8'):

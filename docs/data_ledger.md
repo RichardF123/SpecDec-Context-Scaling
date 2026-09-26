@@ -1348,6 +1348,86 @@ token 随机性 / CPU commit / 分配器碎片 / 时钟 / 外部占用漂移）�
 **speedup 点估计 = 全部 measured rep 合并中位数**（协议 §7c.6）⇒ 2K = decode **0.406×** / e2e **0.434×**；
 若改用"逐 block 中位数再平均"则为 **0.416× / 0.444×**（差 ~2.3%，**引用时必须注明口径**）。
 
+### 4.22 prefill-only cuDNN 分支：实现 + 算子级显存成立，但**正确性判据未通过**，差异已定位到 eager 基线的 bf16 分数舍入（2026-09-26）
+
+首次也是唯一一次修改冻结文件 `model_self.py`（+211/−13，纯增量：原 eager 代码块逐字保留，只在其前加一个裁决点）。
+新增显式策略 `eager` / `cudnn_prefill`（**默认 `eager`，历史行为不变**），融合**只**允许在**调用方显式标注的
+`prefill` 阶段**发生。`spec_dec.py` / `spec_cache.py` **一行未改**（契约不变）。
+
+**为什么必须显式标注阶段（两条都实测过）**
+- 不能用 `q_len > 1`：`spec_dec._verify` 的候选验证也是多 token（`s = kp ∈ [1..k]`）⇒ 会把**验证**误判成 prefill；
+- 不能用 `cache is None`：它只标识**第一块**，`chunked_prefill` 的第 2..n 块仍是 prefill；
+- **真实踩坑**：`spec_dec._prefill` 是**直接**调 `model._run` 的（`spec_dec.py:17`），不经过
+  `chunked_prefill` ⇒ 不标注就跑在 `other` 阶段 ⇒ **静默不融合**（CPU 自测首跑 `fused=0`）。
+  正确做法是由 harness 在这一层标注；`assert_strategy_used()` 是这件事的报警器。
+
+**1. CPU 自测全绿（43/43）** — `specdec/engine/attn_phase_selftest_cpu.py`
+（掩码等价逐元素 8/8、分流裁决 8/8、真实调用序列 10/10、kp=1/2/3/4 逐阶段确定性 8/8、
+SDPA kwargs 5/5、防静默失效+短块+默认行为 4/4；日志 `output/g5/attn/attn_phase_selftest_cpu_20260926T174715Z.log`）。
+`fused_by_phase={'prefill':4}`（target+draft 各 2 层）；`s=1` 末块回退且有原因；默认 `eager` 时融合函数**从未被调用**（`fused=0 eager=24`）。
+附注：tiny 随机模型对这次**两轮全接受**（`mismatch_rounds=0`）⇒ 真实序列里 `repair` 未被触发，
+该行是**条件断言**；`repair` 的确定性覆盖由 3b 直接调 `_step` 提供。
+
+**2. 算子级显存（预登记判据通过）** — `g5_attn_cudnn_validate.py`，`ACV_STAGE=ops`，
+结果 `output/g5/attn/attn_cudnn_validate_20260926T175207Z.json`：
+
+| 行（s,T） | target eager→fused 瞬时 | draft eager→fused |
+| --- | --- | --- |
+| **`(2048, 8192)`（8K 分块第一块）** | **1984.0 → 54.0 MiB（36.7×）** | **2284.0 → 51.5 MiB（44.3×）** |
+| `(2048, 2048)` | 496.0 → 18.0 MiB | 571.0 → 16.4 MiB |
+| `(512, 8192)` | 532.0 → 13.5 MiB | 592.0 → 12.9 MiB |
+| `(1, 8192)` | **按策略走 eager**（cuDNN 不支持 s=1） | 同 |
+
+路径判据 12/12 符合预登记期望；profiler 抓到 kernel `aten::_scaled_dot_product_cudnn_attention`
+⇒ **确实走了 cuDNN 融合算子，不是 math 回退**。
+
+**3. 算子级数值：预登记判据（`abs≤1e-2` 且 `rel≤1e-2`）12 行里 8 行 FAIL，不放宽。**
+但 fp32 诊断（**非判据**）显示：10 个融合行 `|eager−fused|` 为 **1.09–3.27 个 bf16 ULP**，
+且 **10/10 行融合侧比 eager 侧更接近 fp32**。两个判据在**不同输出尺度上朝相反方向**失效
+（大 T 失 `rel`、小 T 失 `abs`）⇒ 一条"绝对 1e-2 且相对 1e-2"的判据在 bf16 注意力上
+不可能同时满足所有尺度。
+
+**4. 模型级 A/B：10/10 行 FAIL（短上下文 128/512/1025，`max_new=16`，`k=4`，2 reps）**
+结果 `output/g5/attn/attn_cudnn_validate_20260926T175638Z.json`。要点：
+- 自对照 **eager vs eager 在 5/5 组里 `abs=0.0`（逐位相同）** ⇒ 引擎确定性，**差异全部来自融合路径**；
+- logits 差 `abs` 3.6–17.3、`rel` 5%–60%，argmax 一致率 0.9297–1.0000（翻转 5–26 个位置）；
+- **`ctx=512 / base_bf16` 生成序列真的变了**：首个分歧在 **index 3**（eager `1602` vs 融合 `883`）；
+- **阶段分流在模型级精确成立**：`fused=52/52`（28+24 层 × 1 块）；`ctx=1025` 的 `[1024,1]` 两块
+  ⇒ `fused=52/52` 且短块回退 `52/52`；`eager_reason_kinds={'short_block_seq_len_lt_min':52,
+  'phase_not_prefill':776}` ⇒ 短块回退与非 prefill 的正常 eager **被干净分开**；`assert_strategy_used()` 全 `ok`；
+- `rep=0` 与 `rep=1` 每个数字逐字节相同（0 方差）。
+- 两模型驻留后 `peak_allocated=3906.6 MiB` / `peak_reserved=4134.0 MiB`（**短上下文，非 8K**）。
+
+**5. 差异来源已定位（专项取证 `g5_attn_precision_forensics.py`，日志 `forensics_20260926T180128Z.log`）**
+
+| 假说 | 结果 |
+| --- | --- |
+| **H1 eager 在 softmax 前把分数舍入成 bf16**（`model_self.py:357` 的 matmul 输入输出都是 bf16） | **成立**：eager 误差随分数幅度线性增长 1.34e-2 → 6.18e-1，fused 恒定 ~1e-2，且 `\|eager−fused\|/\|eager−fp32\|` = 1.16/0.95/1.01/1.01 |
+| H2 融合侧忽略掩码 | 不成立（`\|fused−eager带掩码\|=3.1e-2` vs `\|fused−eager无掩码\|=1.24e+1`） |
+| H3 GQA 广播错误 | 不成立（`enable_gqa` 与手工实体 `kv_repeat` 差值 **0.000e+00**） |
+| H4 缩放被重复施加 | 不成立（最贴正确 scale 1/√d） |
+
+⇒ **`|eager − fused| ≈ |eager − fp32|`：差异的全部来源是 eager 路径自己的 bf16 分数舍入。**
+平坦注意力（`randn`、大 T）下误差互相抵消 ⇒ 只有 2–3 ULP；尖峰注意力（真实模型数据）下不抵消
+⇒ 放大到 12–60%。**顺带暴露一个此前没人量过的事实：项目自建的 eager 注意力基线在 softmax 之前
+把分数舍入到 bf16，在尖峰注意力下对阵 fp32 的相对误差可达 ~50%。这是既有基线的性质，
+本次没有改动它（超出本任务范围，且基线冻结）。**
+
+**6. 口径澄清（本条修正一个此前未写明的事实）**：冻结设计里的 `v_fp8` **只压 target 的 V cache**，
+draft **必须**保持 `base_bf16` —— draft 的 `head_dim=64` 而 `GROUP_V=128`
+（`model_self.py:70,467`）⇒ 在 draft 上设 `v_fp8` 会直接
+`AssertionError: head_dim 64 % GROUP_V != 0`。全项目既有口径一致
+（`g5_stability_probe.py:289` 显式写死 `draft_kv="base_bf16"`，其余工具用默认值）。
+
+**7. 红线（不得由本条推出）**：**没有**任何端到端 8K 收益结论、**没有**任何速度结论
+（算子级瞬时显存≠端到端；本阶段工具里的耗时字段含插桩，禁止进 speedup 表）。
+本次环境有 **24 个其它 C+G 进程**，且 commit 余量在 16 GiB 安全线上下浮动（16.2→15.8→16.1 GiB）。
+**不得**说"8K 已解决"、"正式方案已切换"、"SpecDec 已加速"。
+
+**8. 但"可以替换了吗"的答案是「不」**：预登记判据 FAIL 且生成序列发生变化
+⇒ **注意力后端不是行为中性的**，换后端 = 换模型行为；任何跨后端 A/B 都自带这个混淆项，必须显式声明。
+阶段报告：`docs/cudnn_prefill_stage_report.md`。
+
 ## 5. 复现设置（每次记录必须带上）- seed=42（测试）；性能脚本 seed=0，3 reps 取最优 + warmup；
 - prompt 固定（bench_basic.PROMPT，38 tok）；decode 数 64；
 - dtype/设备随行标注（fp32/CPU、fp16/CUDA）；attn eager；no_grad；
