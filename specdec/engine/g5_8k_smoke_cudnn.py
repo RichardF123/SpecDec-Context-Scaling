@@ -160,6 +160,8 @@ def main() -> int:
                      timing_policy="计时字段含插桩，仅供诊断，禁止进入 speedup 表")
     print(f"[smoke] run_id={run_id} arm={ARM} ctx={CTX} chunk={CHUNK} k={K} "
           f"max_new={MAXNEW} kv={KV}")
+    # 机器可读的 run_id：上层据此**按确定名字**定位产物，不去猜目录里"最新 JSON"
+    print(f"RUN_ID={run_id}", flush=True)
     if SELFTEST:
         return _selftest(SELFTEST, rec, run_id)
     if DRY_RUN:

@@ -64,7 +64,7 @@ function Sample-Env {
   return $line
 }
 
-"step`tlabel`tmode`tkv`texit_code`tjson`tlog`tcommit_free`tgpu_free`tstatus" | Set-Content -Path $master -Encoding UTF8
+"step`tlabel`tmode`tkv`texit_code`trun_id`tjson`tlog`tcommit_free`tgpu_free`tstatus`tpair_correctness`tcommon_prefix`tfirst_divergence" | Set-Content -Path $master -Encoding UTF8
 
 foreach ($s in $plan) {
   Write-Host ""
@@ -83,13 +83,44 @@ foreach ($s in $plan) {
   # 独立进程；**不传第 2 个参数** ⇒ 保持默认 16 GiB 护栏
   cmd /c "cd /d $root && set `"SMOKE_MODE=$($s.mode)`" && set `"SMOKE_KV=$($s.kv)`" && set `"SMOKE_MAXNEW=$maxnew`" && scripts\run_g5_attn_forensics.cmd smoke > `"$log`" 2>&1"
   $rc = $LASTEXITCODE
-  # 找出该步写出的 JSON（按时间取最新的一个）
-  $json = Get-ChildItem (Join-Path $outdir 'smoke8k_*.json') | Sort-Object LastWriteTime |
-          Select-Object -Last 1
-  $status = if ($rc -eq 0) { 'PASS' } elseif ($rc -eq 3) { 'ENV_REFUSED' } else { "FAIL_rc$rc" }
-  "$($s.n)`t$($s.label)`t$($s.mode)`t$($s.kv)`t$rc`t$($json.FullName)`t$log`t$commitFree`t$gpuFree`t$status" |
+  # **按明确 run_id 关联产物**（不再猜"目录里最新的 JSON"）
+  $rid = ([regex]::Match((Get-Content $log -Raw -Encoding UTF8), 'RUN_ID=([0-9TZ]+)')).Groups[1].Value
+  $jsonPath = if ($rid) { Join-Path $outdir "smoke8k_cudnn_prefill_$rid.json" } else { '' }
+  $hasJson = ($jsonPath -and (Test-Path $jsonPath))
+  $status = if (-not $hasJson) { 'NO_RESULT' }
+            elseif ($rc -eq 0) { 'PASS' }
+            elseif ($rc -eq 3) { 'ENV_REFUSED' }
+            else { "FAIL_rc$rc" }
+  $s.runId = $rid; $s.jsonPath = $jsonPath
+  "$($s.n)`t$($s.label)`t$($s.mode)`t$($s.kv)`t$rc`t$rid`t$jsonPath`t$log`t$commitFree`t$gpuFree`t$status`t`t`t" |
     Add-Content -Path $master -Encoding UTF8
-  Write-Host "[step $($s.n)] exit=$rc status=$status json=$($json.Name)"
+  Write-Host "[step $($s.n)] exit=$rc status=$status run_id=$rid json=$(if($hasJson){Split-Path $jsonPath -Leaf}else{'(missing)'})"
+
+  # ---- 同一 KV 档的 AR/SpecDec 配对：本步一并结束后**立即**比较生成序列 ----
+  if ($s.mode -eq 'spec' -and $hasJson) {
+    $prev = $plan | Where-Object { $_.mode -eq 'ar' -and $_.kv -eq $s.kv -and $_.n -lt $s.n } |
+            Select-Object -Last 1
+    if ($prev -and $prev.jsonPath -and (Test-Path $prev.jsonPath)) {
+      $cmp = & $py -c "import json,sys;a=json.load(open(sys.argv[1],encoding='utf-8'))['run']['gen'];b=json.load(open(sys.argv[2],encoding='utf-8'))['run']['gen'];n=min(len(a),len(b));p=0
+for i in range(n):
+    if a[i]==b[i]: p+=1
+    else: break
+same=(a==b)
+print('%s	%d	%s	%d	%d'%('SAME' if same else 'DIFF',p,'-' if same else '%d|%d'%((a[p] if p<len(a) else -1),(b[p] if p<len(b) else -1)),len(a),len(b)))" $prev.jsonPath $jsonPath
+      $parts = ($cmp -split "`t")
+      $verdict = if ($parts[0] -eq 'SAME') { 'PASS' } else { 'CHECK' }
+      Write-Host "[pair $($prev.label) vs $($s.label)] pair_correctness=$verdict common_prefix=$($parts[1]) first_divergence=$($parts[2]) lens=$($parts[3])/$($parts[4])"
+      "$($s.n)`tPAIR:$($prev.label)-vs-$($s.label)`t-$($s.kv)`t-$rc`t-$($jsonPath)`t-$log`t$commitFree`t$gpuFree`tPAIR_$verdict`t$verdict`t$($parts[1])`t$($parts[2])" |
+        Add-Content -Path $master -Encoding UTF8
+      if ($verdict -ne 'PASS') {
+        Write-Host "!! PAIR $($prev.label)/$($s.label) token divergence (prefix=$($parts[1])): records kept, STOPPING."
+        Write-Host "   NOT treated as exit-code failure, NOT excused as BF16 drift -- needs targeted diagnosis."
+        "STOPPED_AT_PAIR=$($prev.label)/$($s.label) pair_correctness=$verdict" | Add-Content -Path $master -Encoding UTF8
+        Write-Host "MASTER=$master"
+        exit 1
+      }
+    }
+  }
   if ($rc -ne 0) {
     Write-Host "!! STEP $($s.n) FAILED (rc=$rc): keeping records and STOPPING. No retry, no cherry-picking."
     "STOPPED_AT=$($s.label) rc=$rc" | Add-Content -Path $master -Encoding UTF8
