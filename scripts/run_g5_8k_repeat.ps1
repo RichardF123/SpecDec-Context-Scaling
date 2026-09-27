@@ -1,4 +1,4 @@
-<#
+﻿<#
   run_g5_8k_repeat.ps1 -- 8K 双模型 smoke 的**重复可运行性**编排（3 x base + 3 x V-only，交错顺序）。
 
   为什么要编排脚本：任务要求
@@ -26,15 +26,26 @@ $dry = ($env:REPEAT_DRYRUN -eq '1')
 $master = Join-Path $outdir "$tag.master.tsv"
 $env:PYTHONUTF8 = '1'; $env:PYTHONIOENCODING = 'utf-8'; $env:HF_HUB_OFFLINE = '1'
 
-# 预先固定交错顺序（不因中途结果改变）
-$plan = @(
-  @{ n = 1; label = 'base1';  kv = 'base_bf16' },
-  @{ n = 2; label = 'vfps1';  kv = 'v_fp8' },
-  @{ n = 3; label = 'base2';  kv = 'base_bf16' },
-  @{ n = 4; label = 'vfps2';  kv = 'v_fp8' },
-  @{ n = 5; label = 'base3';  kv = 'base_bf16' },
-  @{ n = 6; label = 'vfps3';  kv = 'v_fp8' }
-)
+# 预先固定顺序（不因中途结果改变）。REPEAT_PLAN: repeat6（默认）| ar_spec4
+$planSel = if ($env:REPEAT_PLAN) { $env:REPEAT_PLAN } else { 'repeat6' }
+if ($planSel -eq 'ar_spec4') {
+  # 8K/64-token 同后端 AR/SpecDec 对照：每条件独立进程、串行、各一次
+  $plan = @(
+    @{ n = 1; label = 'base_ar';   kv = 'base_bf16'; mode = 'ar'   },
+    @{ n = 2; label = 'base_spec'; kv = 'base_bf16'; mode = 'spec' },
+    @{ n = 3; label = 'vfps_ar';   kv = 'v_fp8';     mode = 'ar'   },
+    @{ n = 4; label = 'vfps_spec'; kv = 'v_fp8';     mode = 'spec' }
+  )
+} else {
+  $plan = @(
+    @{ n = 1; label = 'base1';  kv = 'base_bf16'; mode = 'spec' },
+    @{ n = 2; label = 'vfps1';  kv = 'v_fp8';     mode = 'spec' },
+    @{ n = 3; label = 'base2';  kv = 'base_bf16'; mode = 'spec' },
+    @{ n = 4; label = 'vfps2';  kv = 'v_fp8';     mode = 'spec' },
+    @{ n = 5; label = 'base3';  kv = 'base_bf16'; mode = 'spec' },
+    @{ n = 6; label = 'vfps3';  kv = 'v_fp8';     mode = 'spec' }
+  )
+}
 
 function Sample-Env {
   param([string]$StepTag)
@@ -53,30 +64,30 @@ function Sample-Env {
   return $line
 }
 
-"step`tlabel`tkv`texit_code`tjson`tlog`tcommit_free`tgpu_free`tstatus" | Set-Content -Path $master -Encoding UTF8
+"step`tlabel`tmode`tkv`texit_code`tjson`tlog`tcommit_free`tgpu_free`tstatus" | Set-Content -Path $master -Encoding UTF8
 
 foreach ($s in $plan) {
   Write-Host ""
   Write-Host ("=" * 70)
-  Write-Host "STEP $($s.n)/6  label=$($s.label)  target_kv=$($s.kv)"
+  Write-Host "STEP $($s.n)/$($plan.Count)  label=$($s.label)  mode=$($s.mode)  target_kv=$($s.kv)"
   Write-Host ("=" * 70)
   $e = Sample-Env -StepTag $s.label
   $commitFree = ([regex]::Match($e.py, 'commit_free=([0-9.]+)')).Groups[1].Value
   $gpuFree = ($e.gpu -split ',')[2].Trim()
   if ($dry) {
-    "$($s.n)`t$($s.label)`t$($s.kv)`tDRYRUN`t-`t-`t$commitFree`t$gpuFree`tdryrun" |
+    "$($s.n)`t$($s.label)`t$($s.mode)`t$($s.kv)`tDRYRUN`t-`t-`t$commitFree`t$gpuFree`tdryrun" |
       Add-Content -Path $master -Encoding UTF8
     continue
   }
   $log = Join-Path $outdir "$($tag)_$($s.label).log"
   # 独立进程；**不传第 2 个参数** ⇒ 保持默认 16 GiB 护栏
-  cmd /c "cd /d $root && set `"SMOKE_KV=$($s.kv)`" && set `"SMOKE_MAXNEW=$maxnew`" && scripts\run_g5_attn_forensics.cmd smoke > `"$log`" 2>&1"
+  cmd /c "cd /d $root && set `"SMOKE_MODE=$($s.mode)`" && set `"SMOKE_KV=$($s.kv)`" && set `"SMOKE_MAXNEW=$maxnew`" && scripts\run_g5_attn_forensics.cmd smoke > `"$log`" 2>&1"
   $rc = $LASTEXITCODE
   # 找出该步写出的 JSON（按时间取最新的一个）
   $json = Get-ChildItem (Join-Path $outdir 'smoke8k_*.json') | Sort-Object LastWriteTime |
           Select-Object -Last 1
   $status = if ($rc -eq 0) { 'PASS' } elseif ($rc -eq 3) { 'ENV_REFUSED' } else { "FAIL_rc$rc" }
-  "$($s.n)`t$($s.label)`t$($s.kv)`t$rc`t$($json.FullName)`t$log`t$commitFree`t$gpuFree`t$status" |
+  "$($s.n)`t$($s.label)`t$($s.mode)`t$($s.kv)`t$rc`t$($json.FullName)`t$log`t$commitFree`t$gpuFree`t$status" |
     Add-Content -Path $master -Encoding UTF8
   Write-Host "[step $($s.n)] exit=$rc status=$status json=$($json.Name)"
   if ($rc -ne 0) {
@@ -88,11 +99,11 @@ foreach ($s in $plan) {
 }
 if ($dry) {
   Write-Host ""
-  Write-Host "DRY RUN complete: env sampled for all 6 steps, NOTHING was run."
+  Write-Host "DRY RUN complete: env sampled for all $($plan.Count) steps, NOTHING was run."
   Write-Host "MASTER=$master"
   exit 0
 }
 Write-Host ""
-Write-Host "ALL 6 STEPS EXIT 0 (each once, serial, interleaved, default guard)"
+Write-Host "ALL $($plan.Count) STEPS EXIT 0 (each once, serial, interleaved, default guard)"
 Write-Host "MASTER=$master"
 exit 0

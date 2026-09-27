@@ -33,7 +33,10 @@ from . import model_self as M
 from . import spec_dec
 from . import g5_8k_spec_variance_probe as P5V
 from . import g5_driver as D
-from .smoke_checks import CheckRegistry, FinitenessError, evaluate
+from .smoke_checks import (CheckRegistry, FinitenessError, evaluate,
+                           verify_decision_coverage)
+from .smoke_hooks import DecisionHooks
+from . import spec_cache
 
 ROOT = Path(__file__).resolve().parents[2]
 OUTDIR = ROOT / "output" / "g5" / "attn"
@@ -45,10 +48,17 @@ K = int(os.environ.get("SMOKE_K", "4"))
 MAXNEW = int(os.environ.get("SMOKE_MAXNEW", "16"))
 KV = os.environ.get("SMOKE_KV", "base_bf16")
 ARM = os.environ.get("SMOKE_ARM", "cudnn_prefill")
+# SMOKE_MODE=spec（SpecDec，default）| ar（**target-only** 自回归；不是 dual-resident）
+MODE = os.environ.get("SMOKE_MODE", "spec").strip().lower()
 ALLOW_UNQUALIFIED = S.env_flag("SMOKE_ALLOW_UNQUALIFIED", False)
 DRY_RUN = S.env_flag("SMOKE_DRY_RUN", False)
 # 轻量回归：注入故障以验证"检查失败 ⇒ 落盘 + 非零退出"（**不加载模型**）
 SELFTEST = os.environ.get("SMOKE_SELFTEST", "").strip()
+
+
+def _cache_len(cache) -> int:
+    """KV cache 的当前长度（用引擎自己的 spec_cache.cache_length，不另造口径）。"""
+    return int(spec_cache.cache_length(cache))
 
 
 def mem(tag: str, rec: dict) -> None:
@@ -142,10 +152,11 @@ def main() -> int:
     rec: dict = dict(run_id=run_id, tool="g5_8k_smoke_cudnn",
                      timestamp_utc=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                      git=S.git_meta(ROOT),
-                     config=dict(ctx=CTX, chunk=CHUNK, k=K, max_new=MAXNEW, kv=KV, arm=ARM,
+                     config=dict(mode=MODE, ctx=CTX, chunk=CHUNK, k=K, max_new=MAXNEW, kv=KV, arm=ARM,
                                  target_model=TARGET, draft_model=DRAFT,
                                  load_path="lowmem_load.load_ours_bf16 (双模型, 权重逐位校验)"),
-                     scope="**单次 smoke**：只回答能不能跑 + 峰值多少。不是吞吐测量，不是稳定性验证。",
+                     scope="**单次 smoke**：只回答能不能跑 + 峰值多少。不是吞吐测量，不是稳定性验证。"
+                     if False else "**单次 smoke**：只回答能不能跑 + 峰值多少。不是吞吐测量，不是稳定性验证。",
                      timing_policy="计时字段含插桩，仅供诊断，禁止进入 speedup 表")
     print(f"[smoke] run_id={run_id} arm={ARM} ctx={CTX} chunk={CHUNK} k={K} "
           f"max_new={MAXNEW} kv={KV}")
@@ -191,7 +202,15 @@ def main() -> int:
         rec["stage_target_loaded"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         mem("after_target_load", rec)
         _write(rec, run_id)                       # 逐阶段落盘：target 加载完成
-        drf, _t2, dinfo = load_ours_bf16(DRAFT)
+        if MODE == "ar":
+            # **AR 必须是 target-only**：不加载 draft ⇒ 不可能是 dual-resident 冒充的基线
+            drf, dinfo = None, dict(load_path="not_loaded", weights_bitmatch=True,
+                                    mismatch_keys=[], n_params_checked=None,
+                                    cpu_peak_note="AR 模式不加载 draft")
+            rec["resident_models"] = ["target"]
+        else:
+            drf, _t2, dinfo = load_ours_bf16(DRAFT)
+            rec["resident_models"] = ["target", "draft"]
         rec["load"] = dict(target=tinfo, draft=dinfo, load_s=time.perf_counter() - t0)
         rec["weights_bitmatch"] = bool(tinfo["weights_bitmatch"] and dinfo["weights_bitmatch"])
         rec["weights_checked"] = dict(target=tinfo["n_params_checked"],
@@ -208,13 +227,16 @@ def main() -> int:
 
         tgt.set_kv_format(spec_dec._fmt(KV))
         # `set_kv_format` 收的是**引擎名**（'fp16'/'v_fp8'/'fp8'），不是实验名（'base_bf16'）
-        drf.set_kv_format("fp16")   # draft head_dim=64 < GROUP_V=128 ⇒ 只能 base(bf16 K/V)
-        rec["kv_format"] = dict(target=spec_dec._fmt(KV), draft="fp16")
+        if drf is not None:
+            drf.set_kv_format("fp16")   # draft head_dim=64 < GROUP_V=128 ⇒ 只能 base(bf16 K/V)
+        rec["kv_format"] = dict(target=spec_dec._fmt(KV),
+                                draft=("fp16" if drf is not None else "not_loaded"))
         M.set_attention_strategy(ARM)
         M.reset_attention_stats()
 
         full = P5V.load_ids(tok)
         ids = full[:, :CTX].contiguous()
+        prompt_len = int(ids.shape[1])
         rec["input"] = dict(ctx=int(ids.shape[1]), ids_hash=P5V._gen_hash(
             [int(x) for x in ids[0].tolist()]),
             source="wikitext-2-raw test 前缀（与其它 G5 工具同源）",
@@ -223,80 +245,100 @@ def main() -> int:
                         target_kv_payload=KV, draft_kv_payload="base_bf16"))
         print(f"[smoke] 输入 {ids.shape[1]} token; 开始分块 prefill (chunk={CHUNK}) ...", flush=True)
 
-        # ---- 分块 prefill（显式标注阶段）+ 逐模型阶段状态/耗时/有限性 ----
-        acc: dict = {}
+        # ---- 阶段标注 + 决策点有限性检查：**统一用 smoke_hooks**（与轻量集成测试同一套代码）----
+        # 为什么要抽出去：任务要求"每个实际用于候选选择的 logits 必须在 argmax 之前检查"，
+        # 而 `spec_dec._propose` 循环内的中间步**只能**通过包装 `QwenLM._run` 覆盖；
+        # 抽成模块后可用 stub 模型做**不加载大模型**的集成测试（smoke_midstep_selftest_cpu.py）。
+        acc: dict = {}                           # 分块 prefill 的累计耗时（诊断用）
         inner = P5V.timed_chunked_prefill(acc, CHUNK, tgt)
-        stage: dict = {"target_prefill_done": False, "draft_prefill_done": False}
-        # 有限性检查注册表：**在 argmax/接受判断之前**逐点检查，非有限立即抛错。
-        # 语义与判定规则见 smoke_checks.py（纯逻辑，另有 CPU 轻量回归 smoke_checks_selftest_cpu.py）。
         reg = CheckRegistry()
+        stage: dict = {}
 
-        def prefill(model, ids_):
-            key = "target" if model is tgt else "draft"
-            torch.cuda.synchronize()              # 计时边界同步：不让上一阶段残留引用污染峰值
-            ts = time.perf_counter()
-            with M.attention_phase("prefill"):
-                lg, cache = inner(model, ids_)
-            torch.cuda.synchronize()
-            stage[f"{key}_prefill_s"] = time.perf_counter() - ts
-            # prefill 的 logits 会被解码器取 `[:, -1:]` 做首个 argmax ⇒ 必须先检查
-            reg.check_finite(lg, phase="prefill", model=key, role="prefill_lg",
-                             where=f"prefill({key}) 返回，供 saved_next/首轮 argmax 使用")
+        def on_prefill(key, dt):
+            stage[f"{key}_prefill_s"] = dt
             mem(f"after_{key}_prefill", rec)
             stage[f"{key}_prefill_done"] = True
             rec["stage"] = f"{key}_prefill_done"
             _write(rec, run_id)                   # 逐阶段落盘
-            return lg, cache                      # 必须原样返回：解码要用 lg 取 saved_next
 
-        # ---- 阶段标注：**四个入口都要标**（只标 prefill 会让 propose/verify/repair 落进 'other'，
-        #      那样"融合没有进入 verify"就只能靠 fused_by_phase 间接证明，无法给出分阶段 eager 计数）----
-        orig_fns = dict(prefill=spec_dec._prefill, propose=spec_dec._propose,
-                        verify=spec_dec._verify, step=spec_dec._step)
-
-        def propose(*a, **k):
-            # 签名 `_propose(draft, cache, lg, k_eff, eos_id)`：`a[2]` 就是要被 argmax 的那份 logits
-            if len(a) > 2:
-                reg.check_finite(a[2], phase="propose", model="draft", role="input_lg",
-                                 where="propose 入口的 lg：**紧接**就会被 .argmax() 取候选")
-            with M.attention_phase("propose"):
-                cands, cache, lg_out = orig_fns["propose"](*a, **k)
-            # 返回的 lg 会成为下一轮的输入（all-accept 时经 prop_lg 传回）⇒ 同样先检查
-            reg.check_finite(lg_out, phase="propose", model="draft", role="return_lg",
-                             where="propose 返回的 draft 末位 logits（下一轮 argmax 的输入）")
-            return cands, cache, lg_out
-
-        def verify(*a, **k):
-            with M.attention_phase("verify"):
-                rows, blk = orig_fns["verify"](*a, **k)
-            # rows = lg[0,-kp:]，调用方**紧接着**就做 argmax 得到 g[] ⇒ 必须先检查
-            reg.check_finite(rows, phase="verify", model="target", role="rows",
-                             where="verify 返回的候选行：**紧接**被 argmax 用于接受判断")
-            return rows, blk
-
-        def step(*a, **k):
-            key = "target" if a and a[0] is tgt else "draft"
-            with M.attention_phase("repair"):
-                lg_out, cache = orig_fns["step"](*a, **k)
-            reg.check_finite(lg_out, phase="repair", model=key, role="saved_next",
-                             where="repair 返回的末位 logits（下一轮 g[0] 的来源）")
-            return lg_out, cache
-
-        spec_dec._prefill = prefill             # harness 侧标注阶段（不改 spec_dec.py）
-        spec_dec._propose, spec_dec._verify, spec_dec._step = propose, verify, step
+        hooks = DecisionHooks(tgt=tgt, drf=drf, registry=reg, prefill_impl=inner,
+                              on_prefill=on_prefill)
+        hooks.install()
         rounds: list[dict] = []
         eos_id = tok.eos_token_id
+        gen_ids: list[int] = []
+        ar_inv: list[dict] = []
         try:
-            torch.cuda.synchronize()
-            t1 = time.perf_counter()
-            out = spec_dec.spec_decode_greedy(tgt, drf, ids, MAXNEW, k=K, eos_id=eos_id,
-                                              target_kv=KV, draft_kv="base_bf16",
-                                              log=lambda d: rounds.append(dict(d)))
-            torch.cuda.synchronize()
-            wall = time.perf_counter() - t1
+            if MODE == "ar":
+                # ---------------- AR（target-only，**不是** dual-resident）----------------
+                # 单 token 自回归：每步 `_run` 的 logits 立即被 argmax 使用 ⇒ 必须先检查。
+                #
+                # ⚠️ **必须与生产 AR 语义一致**：引擎自己的 AR 单步 `spec_dec._step` 是在
+                # `torch.inference_mode()` 里调 `model._run` 的（`spec_dec.py:45-51`），
+                # 分块 prefill（`P5V.chunked_prefill`）同样在 inference_mode 内。
+                # 本工具首跑 8K AR 时**漏了这一步**，于是同一个前向在 inference_mode 之外执行，
+                # 8K 解码到中途 `pt_reserved` 从 5722 MiB 涨到 22924 MiB 并 OOM
+                # （见 output/g5/attn/smoke8k_cudnn_prefill_20260927T134045Z.json，已保留为失败样本）。
+                # 这里补齐 inference_mode **不是**放宽条件，而是**恢复**生产计算语义。
+                torch.cuda.synchronize()
+                t1 = time.perf_counter()
+                with torch.inference_mode(), M.attention_phase("prefill"):
+                    lg, cache = inner(tgt, ids)
+                reg.check_finite(lg, phase="prefill", model="target", role="prefill_lg",
+                                 where="AR prefill 返回：首步 argmax 的输入")
+                stage["target_prefill_done"] = True
+                stage["target_prefill_s"] = time.perf_counter() - t1
+                mem("after_target_prefill", rec)
+                rec["stage"] = "target_prefill_done"
+                _write(rec, run_id)
+                nxt = int(lg.reshape(-1, lg.shape[-1])[-1].argmax())
+                # ⚠️ **记账顺序必须与生产 AR 一致**：引擎的 `QwenLM.generate` 与 8K 探针的 AR
+                # （`g5_8k_spec_variance_probe.formal_pass`）都是**先记录本步 token、再喂给下一步**：
+                #     tok = argmax(cur); gen.append(tok); ... cur, cache = _step(tgt, tok, cache)
+                # 本工具首版写成"先 `_run` 再记录"，于是 **prefill 决策出的第一个 token 从未被记录**，
+                # 整条序列错位一位 —— 表现出来就是"AR 与 SpecDec 在 index 0 就分歧"。
+                # 那是**工具记账缺陷**（已保留失败/错位样本为证），**不是**引擎或 cuDNN 分歧；
+                # 修法是恢复生产记账顺序，**不改任何计算语义**。
+                decode_runs = 0
+                for i in range(MAXNEW):
+                    gen_ids.append(nxt)                      # ← 先记录（本步 token 来自上一步的 logits）
+                    clen = _cache_len(cache)
+                    ar_inv.append(dict(step=i, gen_len=len(gen_ids), decode_runs=decode_runs,
+                                       cache_len=clen, expected=prompt_len + decode_runs,
+                                       pt_allocated_mib=torch.cuda.memory_allocated() / 2 ** 20,
+                                       pt_reserved_mib=torch.cuda.memory_reserved() / 2 ** 20,
+                                       cuda_free_mib=torch.cuda.mem_get_info()[0] / 2 ** 20,
+                                       ok=(clen == prompt_len + decode_runs)))
+                    if eos_id is not None and nxt == eos_id:
+                        break
+                    if i == MAXNEW - 1:
+                        break
+                    with torch.inference_mode(), M.attention_phase("decode"):
+                        lg, cache = tgt._run(
+                            tgt.embed_tokens(torch.tensor([[nxt]], device=ids.device)),
+                            cache, need_logits=True)
+                    decode_runs += 1
+                    # **决策前检查**：下一次 argmax 用的就是这份 logits
+                    reg.check_finite(lg, phase="decode", model="target", role="decode_lg",
+                                     round_=i, step=decode_runs,
+                                     where=f"AR 第 {decode_runs} 次解码 forward 返回："
+                                           f"紧接被 argmax 使用")
+                    nxt = int(lg.reshape(-1, lg.shape[-1])[-1].argmax())
+                torch.cuda.synchronize()
+                wall = time.perf_counter() - t1
+                out = dict(gen=gen_ids, ids=list(ids[0].tolist()) + gen_ids,
+                           stats=dict(mode="AR", decode_steps=decode_runs,
+                                      rounds=len(gen_ids)))
+            else:
+                torch.cuda.synchronize()
+                t1 = time.perf_counter()
+                out = spec_dec.spec_decode_greedy(tgt, drf, ids, MAXNEW, k=K, eos_id=eos_id,
+                                                  target_kv=KV, draft_kv="base_bf16",
+                                                  log=lambda d: rounds.append(dict(d)))
+                torch.cuda.synchronize()
+                wall = time.perf_counter() - t1
         finally:
-            spec_dec._prefill = orig_fns["prefill"]
-            spec_dec._propose, spec_dec._verify, spec_dec._step = (
-                orig_fns["propose"], orig_fns["verify"], orig_fns["step"])
+            hooks.remove()
 
         mem("after_decode", rec)
         rec["stage_decode_done"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
@@ -312,10 +354,16 @@ def main() -> int:
                             tgt_len_ok=(r["tgt_len"] == exp_tgt),
                             drf_len_ok=(r["drf_len"] == exp_tgt),
                             lengths_equal=(r["tgt_len"] == r["drf_len"])))
-        rec["round_invariants"] = dict(per_round=inv,
+        rec["round_invariants"] = dict(mode=MODE, per_round=inv,
                                        all_ok=bool(inv) and all(x["tgt_len_ok"] and x["drf_len_ok"]
                                                                 and x["lengths_equal"] for x in inv),
                                        rule="tgt_len == drf_len == pre + (m+1 if m<Kp else Kp)")
+        if MODE == "ar":
+            # AR：不变量 = cache 长度 == prompt + 已生成数（逐门步核对）
+            inv = ar_inv
+            rec["round_invariants"] = dict(mode="ar", per_round=inv,
+                                           all_ok=bool(inv) and all(x["ok"] for x in inv),
+                                           rule="cache_len == prompt_len + len(gen)（每步）")
         gen = [int(x) for x in out["gen"]]
         vocab = int(tgt.embed_tokens.weight.shape[0])
         attn_ok = None
@@ -328,10 +376,16 @@ def main() -> int:
         # **确认新路径确实启用、且没有错误扩展到验证阶段**
         fused_by_phase = a_stats.get("fused_by_phase", {})
         eager_by_phase = a_stats.get("eager_by_phase", {})
-        dispatch_ok = (sorted(k for k, v in fused_by_phase.items() if v > 0) == ["prefill"]
-                       and all(fused_by_phase.get(p, 0) == 0
-                               for p in ("propose", "verify", "repair", "decode"))
-                       and eager_by_phase.get("verify", 0) > 0)
+        if MODE == "ar":
+            dispatch_ok = (sorted(k for k, v in fused_by_phase.items() if v > 0) == ["prefill"]
+                           and all(fused_by_phase.get(p, 0) == 0
+                                   for p in ("propose", "verify", "repair", "decode"))
+                           and eager_by_phase.get("decode", 0) > 0)
+        else:
+            dispatch_ok = (sorted(k for k, v in fused_by_phase.items() if v > 0) == ["prefill"]
+                           and all(fused_by_phase.get(p, 0) == 0
+                                   for p in ("propose", "verify", "repair", "decode"))
+                           and eager_by_phase.get("verify", 0) > 0)
         # ---- 停止原因：**不能少生成却当固定长度完成** ----
         gen_len = len(gen)
         if gen and eos_id is not None and gen[-1] == eos_id:
@@ -359,8 +413,23 @@ def main() -> int:
                           note="计时含插桩，仅诊断；禁止进入任何 speedup 表。"
                                "父子阶段耗时**不可相加**（prefill 是 wall 的子集）。")
         # ---- 通过判定：**执行结束 ≠ 验证通过** ----
+        # ---- 决策步覆盖核对（任务要求：阶段出现过一次检查 ≠ 完整覆盖）----
+        if MODE == "ar":
+            dlg = reg.calls.get(("decode", "target"), {}).get("role_counts", {}).get("decode_lg", 0)
+            steps_n = int(out["stats"].get("decode_steps", len(gen_ids)))
+            cov = dict(name="ar_decode_step_coverage", ok=(dlg == steps_n),
+                       detail=f"decode_lg 检查={dlg} vs 实际解码步数={steps_n}")
+            extra = [cov]
+        else:
+            cov = verify_decision_coverage(
+                reg, draft_calls_expected=int(out["stats"].get("draft_calls", 0)),
+                rounds_expected=int(out["stats"].get("rounds", 0)))
+            cov["name"] = "decision_step_coverage"
+            extra = [cov]
+        rec["decision_coverage"] = cov
         rec["checks"] = evaluate(
             registry=reg, mismatch_rounds=int(out["stats"].get("mismatch_rounds", 0)),
+            extra_required=extra, mode=MODE,
             weights_ok=rec["weights_bitmatch"],
             weights_detail=f"target {tinfo['n_params_checked']} + draft {dinfo['n_params_checked']} 逐位校验",
             invariants_ok=rec["round_invariants"]["all_ok"],
@@ -435,7 +504,8 @@ def main() -> int:
     except torch.OutOfMemoryError as e:
         rec["stage"] = "oom"
         rec["oom"] = str(e)
-        mem("on_oom", rec)
+        rec["traceback"] = traceback.format_exc()      # 缺这条时无法定位到具体语句（首跑教训）
+        rec["alloc_on_oom"] = P5V.allocator_state()
         _write(rec, run_id)
         print(f"[smoke] !! OOM，已落盘并停止（不升级测试）：{e}")
         return 2

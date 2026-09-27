@@ -802,3 +802,43 @@ set "SMOKE_SELFTEST=dispatchfail" & scripts\run_g5_attn_forensics.cmd smoke
 :: 6 次重复可运行性（独立进程、串行、预固定交错顺序、每步重查环境）
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\run_g5_8k_repeat.ps1
 ```
+
+## 9.15 draft 中间步检查 + 8K/64-token 同后端 AR/SpecDec 对照（2026-09-27）
+
+**补齐的检查缺口**：`spec_dec._propose` 循环内每次 `draft._run` 的返回会被**下一次 argmax** 使用，
+入口/出口检查覆盖不到。新增 `smoke_hooks.py`（`DecisionHooks`），在 `QwenLM._run` 上装**普通函数** hook，
+`phase=='propose'` 时对**每次 draft 前向的返回**做检查（role=`mid_lg`，带 `round`/候选步号），
+**不复制投机算法、不改计算语义**；并加**覆盖核对**（`mid_lg 次数 == 解码器 draft 前向次数`、
+`input_lg 次数 == 轮次数`），不符即判「未完整覆盖」。
+轻量集成测试 `smoke_midstep_selftest_cpu.py`：**28 PASS / 0 FAIL**，含**中间步 NaN 必须在进入下一次
+argmax 前停止**（装 hook：第 2 次前向即停、共 2 次前向；不装 hook：4 次全跑、NaN 静默进入 argmax
+⇒ **证明入口/出口检查不能替代内部检查**），并覆盖 Inf / 正常多步 / `k_eff` 缩短 / EOS 提前结束。
+原有回归不变：`smoke_checks_selftest_cpu` 27/27、`attn_phase_selftest_cpu` 43/43、注入故障 5 情形。
+
+**修复的两个 harness 缺陷（如实记录，失败样本保留）**：
+① AR 解码曾**漏 `torch.inference_mode()`**（引擎的 `spec_dec._step` 在模式内）⇒ 8K AR 中途 OOM
+（`pt_reserved` 5722→22924 MiB，记录 `smoke8k_cudnn_prefill_20260927T134045Z.json`）；
+② AR 曾**先 `_run` 再记录**，漏掉 prefill 决策的第一个 token，序列错位一位并**伪造成
+「AR 与 SpecDec 在 index 0 分歧」**——那是工具记账缺陷，**不是**引擎/cuDNN 分歧。
+
+**四个单次条件（独立进程、串行、各一次、默认 16 GiB 护栏、每次重查环境）**
+
+| 条件 | mode | target KV | gen | peak alloc/reserved | cuda_free | 覆盖核对 | exit |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| base_ar | AR（**target-only**） | base_bf16 | 64 | 5261.7 / **5722.0** | 1343.0 | `decode_lg 63 vs 63` ✓ | 0 |
+| base_spec | SpecDec | base_bf16 | 64 | 6906.4 / **7332.0** | 0.0 | `mid_lg 78 vs 78; input_lg 20 vs 20` ✓ | 0 |
+| vfps_ar | AR（target-only） | v_fp8 | 64 | 5203.4 / **5588.0** | 1477.0 | `decode_lg 63 vs 63` ✓ | 0 |
+| vfps_spec | SpecDec | v_fp8 | 64 | 6847.6 / **7178.0** | 0.0 | `mid_lg 75 vs 75; input_lg 19 vs 19` ✓ | 0 |
+
+**对照（同一 KV 档内 AR vs SpecDec）**
+
+| KV | 完整序列相同 | 共同前缀 | 首个分歧（index 31） |
+| --- | --- | --- | --- |
+| base_bf16 | 否 | **31 / 64** | AR=`1083` vs Spec=`5880` |
+| v_fp8 | 否 | **31 / 64** | AR=`5880` vs Spec=`1083` |
+
+前 31 token 在**两条路径 × 两种 KV** 下完全一致；分歧在**同一 index**，且两种 KV **恰好交换**该对候选。
+⚠️ **本轮到此为止**：仅 token 分歧时**保存配对结果并停止自动推进**；
+**不**判定为逻辑错误，**也****不**豁免为「BF16 漂移」。
+下一步（**未执行**）：在**完全相同的共同前缀**下比较该决策点的 **target 决策行**（top1/top2/margin），
+**不**用已分叉的后续上下文归因，**不**自动放宽 exact-id 门。详见台账 §4.28。

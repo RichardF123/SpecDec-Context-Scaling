@@ -1750,6 +1750,75 @@ target KV = base_bf16 或 v_fp8，draft 恒 base_bf16，策略 `cudnn_prefill`�
 汇总 `repeat6_summary.json`；编排主表 `run_g5_8k_repeat_*.master.tsv`；
 控制台 `run_g5_8k_repeat_console.log`；注入故障回归的 5 个 JSON 亦全部保留（未删除失败样本）。
 
+### 4.28 draft 中间步有限性检查 + 8K/64-token 同后端 AR/SpecDec 对照（2026-09-27）
+
+**1. 补齐 `_propose` 中间步检查（新模块 `smoke_hooks.py`，不改生产语义）**
+
+`spec_dec._propose` 的循环是 `t=argmax(lg)` → `lg,cache=draft._run(...)` → 下一轮再用 `lg`，
+因此循环内每次 `draft._run` 的返回值**会在下一次 argmax 处被使用**；只在入口/出口检查覆盖不到它。
+做法：把"阶段标注 + 决策点检查"抽成 `DecisionHooks`，并在 `QwenLM._run`（或测试用 stub 的 `_run`）上
+装一个**普通函数** hook，在 `phase=='propose'` 时对**每次 draft 前向的返回**做检查
+（role=`mid_lg`，记录 `round` 与**候选步编号**）。**不复制投机算法、不插入任何计算**。
+另加**覆盖核对** `verify_decision_coverage()`：`mid_lg 次数 == 解码器报告的 draft 前向次数`
+且 `input_lg 次数 == 轮次数`，不符即判"未完整覆盖"（"阶段出现过一次检查" ≠ 完整覆盖）。
+
+**2. 轻量集成测试（不加载大模型）** `smoke_midstep_selftest_cpu.py`：**28 PASS / 0 FAIL**
+覆盖：正常多步、**中间步 NaN**、Inf、入口非有限、**k_eff 缩短**、**EOS 提前结束**、步号/轮次记账、
+以及"**入口/出口检查不能替代内部检查**"的对照（不装 hook 时同一脚本 4 次前向全跑、NaN 静默进入 argmax；
+装了 hook 则第 2 次前向返回即停、只发生 2 次前向）。hook 卸载按**对象身份**核对，且测试期间不碰生产类。
+其余回归：`smoke_checks_selftest_cpu` 27/27、`attn_phase_selftest_cpu` 43/43、注入故障 5 情形（normal→0，四类→exit 5 / runner 1）。
+
+**3. 两个**我自己**的 harness 缺陷（如实记录，均已修，失败样本保留）**
+
+| # | 现象 | 根因 | 修法 |
+| --- | --- | --- | --- |
+| a | 8K AR 首跑**中途 OOM**：`pt_reserved` 5722 → 22924 MiB（`smoke8k_cudnn_prefill_20260927T134045Z.json` 保留） | 我的 AR 解码循环**漏了 `torch.inference_mode()`**，而引擎自己的 AR 单步 `spec_dec._step`（`spec_dec.py:45-51`）与分块 prefill 都在 inference_mode 内 ⇒ 同一前向在模式外执行，显存行为完全不同 | 补齐 inference_mode（**恢复**生产语义，不是放宽条件）；并新增 OOM/crash 的 `traceback` 记录与**逐步内存采样**（首跑缺这两项，无法定位） |
+| b | AR 与 SpecDec "**在 index 0 就分歧**" | 我的 AR 循环**先 `_run` 再记录**，于是 **prefill 决策出的第一个 token 从未被记录**，整条序列错位一位（引擎 `generate` 与 8K 探针的 AR 都是**先记录再喂**） | 改为先记录再喂；修正后 ctx=512 的 AR 序列开头与 SpecDec 一致（`[438,330,264,883]`）。**这曾表现为"分歧"，实为工具记账缺陷，不是引擎/cuDNN 分歧** |
+
+**4. 四个单次条件（独立进程、串行、各一次、默认 16 GiB 护栏、每次重查环境）**
+
+| 条件 | mode | target KV | 完成 | gen | stop | peak alloc/reserved | cuda_free | 覆盖核对 | 退出码 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| base_ar | AR | base_bf16 | ✓ | 64 | max_new_reached | 5261.7 / **5722.0** | 1343.0 | `decode_lg 63 vs 63` ✓ | 0 |
+| base_spec | SpecDec | base_bf16 | ✓ | 64 | max_new_reached | 6906.4 / **7332.0** | 0.0 | `mid_lg 78 vs 78; input_lg 20 vs 20` ✓ | 0 |
+| vfps_ar | AR | v_fp8 | ✓ | 64 | max_new_reached | 5203.4 / **5588.0** | 1477.0 | `decode_lg 63 vs 63` ✓ | 0 |
+| vfps_spec | SpecDec | v_fp8 | ✓ | 64 | max_new_reached | 6847.6 / **7178.0** | 0.0 | `mid_lg 75 vs 75; input_lg 19 vs 19` ✓ | 0 |
+
+- **AR 是 target-only**（`resident_models=['target']`，权重校验 338），**不是** dual-resident 冒充；
+  SpecDec 为 `['target','draft']`（338+290）。
+- 阶段分流：AR `fused={'prefill':112}`（28×4 块）+ `eager={'decode':1764=63×28}`，
+  `s_max={'prefill':2048,'decode':1}`；SpecDec `fused={'prefill':208}`，
+  `eager={'propose':1872=78×24, 'verify':560=20×28, 'repair':468=9×52}`（v_fp8 为 1800/532/312）
+  ⇒ **只有 prefill 融合，`verify` 的 `s_max=4` 而 fused=0**。
+- SpecDec 统计自洽：base `rounds=20, proposed=78, accepted=55, mismatch=9` ⇒ 55+9=64 ✓；
+  v_fp8 `rounds=19, proposed=75, accepted=58, mismatch=6` ⇒ 58+6=64 ✓。
+- 逐轮 cache 不变量 `all_ok`（AR：`cache_len==prompt+decode_runs`；SpecDec：`tgt_len==drf_len==pre+(m+1 if m<Kp else Kp)`）。
+- 耗时**仅诊断**：AR prefill 3.26/3.79 s、wall 5.64/6.70 s；SpecDec prefill 5.51/6.40 s、wall 9.17/10.14 s。
+  **不算 speedup、父子阶段不可相加**。
+
+**5. 对照结论：共同前缀 31/64，随后在同一个决策点分歧（记录，不立刻归因）**
+
+| KV | 完整序列相同 | 共同前缀 | 首个分歧（index 31） |
+| --- | --- | --- | --- |
+| base_bf16 | 否 | **31 / 64** | AR=`1083` vs SpecDec=`5880` |
+| v_fp8 | 否 | **31 / 64** | AR=`5880` vs SpecDec=`1083` |
+
+- 前 31 个 token 在**两条解码路径 × 两种 KV** 下**完全一致** ⇒ 两条路径在同一起点、同一上下文下高度一致；
+- 分歧发生在**同一个 index（31）**，且两种 KV **恰好交换**了这两个候选（1083 ↔ 5880）；
+- **本轮到此为止**（任务要求：仅 token 分歧时保存配对结果并停止自动推进）。
+  **不**判定为逻辑错误，**也****不**豁免为"BF16 漂移"——两者都需要证据。
+- 下一步（**尚未执行**）：在**完全相同的共同前缀**（prompt + 前 31 个 token）下，
+  比较该决策点的 **target 决策行**：top1/top2 与 margin；**不**比较已分叉的后续上下文来归因，
+  **不**自动放宽 exact-id 门。
+
+**6. 边界**：旧 eager 对齐 FAIL 保持原样；未采用任何待批准验收判据；
+本轮**未**做重复长跑、参数搜索或正式矩阵；耗时字段不构成性能稳定性或加速结论。
+
+**7. 原始结果**：`output/g5/attn/smoke8k_cudnn_prefill_2026{0927T135218Z,0927T135254Z,0927T135336Z,0927T135413Z}.json`
+（base_ar/base_spec/vfps_ar/vfps_spec）与同名 `.log`；主表 `run_g5_8k_repeat_20260927T135208Z.master.tsv`；
+汇总 `arspec4_summary_v2.json`；**失败的 AR 首跑** `...T134045Z.json`、
+**错位样本**（首版 AR 四条件）`...T13{4512,4547,4630,4706}Z.json` 与 `arspec4_summary.json` **全部保留**。
+
 ## 5. 复现设置（每次记录必须带上）- seed=42（测试）；性能脚本 seed=0，3 reps 取最优 + warmup；
 - prompt 固定（bench_basic.PROMPT，38 tok）；decode 数 64；
 - dtype/设备随行标注（fp32/CPU、fp16/CUDA）；attn eager；no_grad；

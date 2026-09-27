@@ -33,31 +33,56 @@ class FinitenessError(RuntimeError):
 
 
 class CheckRegistry:
-    """记录每次有限性检查的 (阶段, 模型, 角色)，并给出覆盖情况。"""
+    """记录每次有限性检查的 (阶段, 模型, 角色)，并给出覆盖情况。
+
+    **轮次/步号记账**：`round` 由 verify（每个解码轮调用一次）推进；
+    `propose_step` 每次进入 `_propose` 归零、每次 propose 阶段的 `_run` 自增。
+    这样"中间步检查"能带上 (round, 候选步编号)，而不只是"这个阶段出现过检查"。
+    """
 
     def __init__(self) -> None:
         self.calls: dict[tuple[str, str], dict] = {}
         self.events: list[dict] = []
         self.n_checked = 0
         self.first_bad: dict | None = None
+        self.round = -1
+        self.propose_step = 0
+
+    def begin_round(self) -> int:
+        self.round += 1
+        return self.round
+
+    def begin_propose(self) -> None:
+        self.propose_step = 0
+
+    def next_propose_step(self) -> int:
+        self.propose_step += 1
+        return self.propose_step
 
     def _slot(self, phase: str, model: str) -> dict:
-        return self.calls.setdefault((phase, model), dict(n=0, roles=[], ok=True, bad=[]))
+        return self.calls.setdefault((phase, model), dict(n=0, roles=[], role_counts={},
+                                                          ok=True, bad=[], steps=[]))
 
-    def check_finite(self, t, *, phase: str, model: str, role: str, where: str = "") -> bool:
+    def check_finite(self, t, *, phase: str, model: str, role: str, where: str = "",
+                     round_: int | None = None, step: int | None = None) -> bool:
         """在**决策之前**检查。返回是否有限；非有限时抛 `FinitenessError`（先落记录再抛）。"""
         if t is None:
             self.events.append(dict(phase=phase, model=model, role=role, where=where,
-                                    checked=False, note="张量为 None（该分支未产生决策用 logits）"))
+                                    checked=False, round=round_, step=step,
+                                    note="张量为 None（该分支未产生决策用 logits）"))
             return False
         finite = bool(torch.isfinite(t).all())
         slot = self._slot(phase, model)
         slot["n"] += 1
+        slot["role_counts"][role] = slot["role_counts"].get(role, 0) + 1
         if role not in slot["roles"]:
             slot["roles"].append(role)
+        if step is not None:
+            slot["steps"].append(dict(round=round_, step=step, role=role))
         self.n_checked += 1
         rec = dict(phase=phase, model=model, role=role, where=where, checked=True,
-                   finite=finite, shape=[int(x) for x in t.shape], dtype=str(t.dtype))
+                   finite=finite, round=round_, step=step,
+                   shape=[int(x) for x in t.shape], dtype=str(t.dtype))
         self.events.append(rec)
         if not finite:
             slot["ok"] = False
@@ -67,6 +92,7 @@ class CheckRegistry:
             self.first_bad = dict(rec, n_nan=n_nan, n_inf=n_inf)
             raise FinitenessError(
                 f"非有限值：phase={phase} model={model} role={role} {where} "
+                f"round={round_} step={step} "
                 f"shape={list(t.shape)} NaN={n_nan} Inf={n_inf}"
                 f"（在 argmax/接受判断**之前**检出，已停止）")
         return True
@@ -78,8 +104,51 @@ class CheckRegistry:
                 "first_bad": self.first_bad}
 
 
-def expected_map(*, mismatch_rounds: int) -> dict[tuple[str, str], dict]:
-    """本次 run **应当**有哪些检查（由执行结构决定，不由结果决定）。"""
+def verify_decision_coverage(registry: CheckRegistry, *, draft_calls_expected: int,
+                             rounds_expected: int) -> dict:
+    """
+ounds_expected = **进入 _propose 的次数**（真实 SpecDec 里等于解码轮次）。"""
+    """**核对"实际决策步数"与"检查覆盖"**（任务要求：阶段出现过一次检查 ≠ 完整覆盖）。
+
+    论证（对应 `spec_dec._propose` 的真实结构）
+      * 循环内第 j 次 `draft._run` 产出的 logits，会在第 j+1 次迭代被 `argmax` 使用
+        ⇒ 必须在它**返回时**检查（role=`mid_lg`，逐 (round, 步号) 记录）。
+      * 每轮进入 `_propose` 时传入的 lg 会被**第一次** argmax 使用（role=`input_lg`）。
+      ⇒ 因此本轮要求：`mid_lg 次数 == 解码器报告的 draft 前向次数`，
+        且 `input_lg 次数 == 轮次`。任一不符即判**未完整覆盖**。
+    """
+    slot = registry.calls.get(("propose", "draft"), {})
+    rc = slot.get("role_counts", {})
+    mid = rc.get("mid_lg", 0)
+    entry = rc.get("input_lg", 0)
+    ok = (mid == draft_calls_expected) and (rounds_expected < 0 or entry == rounds_expected)
+    return dict(ok=bool(ok), mid_step_checks=mid, entry_checks=entry,
+                draft_calls_reported=draft_calls_expected, rounds_reported=rounds_expected,
+                detail=f"mid_lg 检查={mid} vs 解码器 draft 前向={draft_calls_expected}；"
+                       f"input_lg 检查={entry} vs 轮次={rounds_expected}",
+                steps=slot.get("steps", [])[:64])
+
+
+AR_REQUIRED = (("prefill", "target"), ("decode", "target"))
+AR_NOT_APPLICABLE = (("prefill", "draft"), ("propose", "draft"),
+                     ("verify", "target"), ("repair", "target"), ("repair", "draft"))
+
+
+def expected_map(*, mismatch_rounds: int, mode: str = "spec") -> dict[tuple[str, str], dict]:
+    """本次 run **应当**有哪些检查（由执行结构决定，不由结果决定）。
+
+    mode="ar"（target-only 自回归）不使用 draft/propose/verify/repair ⇒ 那些分支记为
+    **不适用**（显式列出），而不是要求它们存在或静默当作通过。
+    """
+    if mode == "ar":
+        out: dict[tuple[str, str], dict] = {}
+        for key in AR_REQUIRED:
+            out[key] = dict(required=True, why="AR 模式无条件必需")
+        for key in AR_NOT_APPLICABLE:
+            out[key] = dict(required=False, na=True, why="AR 模式不使用该分支")
+        for key in NEVER_USED:
+            out[key] = dict(required=False, na=True, why="按结构不应出现")
+        return out
     out: dict[tuple[str, str], dict] = {}
     for key in ALWAYS_REQUIRED:
         out[key] = dict(required=True, why="无条件必需（该分支必然执行）")
@@ -97,9 +166,10 @@ def evaluate(*, registry: CheckRegistry, mismatch_rounds: int, weights_ok: bool,
              dispatch_ok: bool, dispatch_detail: str, attention_assert: str,
              gen_len: int, max_new: int, eos_id, gen: list, stop_reason: str,
              exception: str | None, alloc_ok: bool = True,
-             alloc_detail: str = "") -> dict:
+             alloc_detail: str = "", extra_required: list | None = None,
+             mode: str = "spec") -> dict:
     """把"执行结束"升级为"验证通过/不通过"。**只有 passed=True 才允许 exit 0。**"""
-    exp = expected_map(mismatch_rounds=mismatch_rounds)
+    exp = expected_map(mismatch_rounds=mismatch_rounds, mode=mode)
     checks: list[dict] = []
     failures: list[dict] = []
     uncovered: list[str] = []
@@ -108,7 +178,7 @@ def evaluate(*, registry: CheckRegistry, mismatch_rounds: int, weights_ok: bool,
     # ---- 1) 有限性检查的**覆盖与结果** ----
     for (phase, model), meta in sorted(exp.items()):
         name = f"finiteness:{phase}/{model}"
-        if (phase, model) in NEVER_USED:
+        if (phase, model) in NEVER_USED or meta.get("na"):
             # 结构上不存在的组合：**不算未覆盖**（它不是"该跑没跑"，而是"根本不会跑"），
             # 但必须**显式列出**以免被误读成"已覆盖且通过"。
             not_applicable.append(name)
@@ -150,6 +220,10 @@ def evaluate(*, registry: CheckRegistry, mismatch_rounds: int, weights_ok: bool,
     len_ok = (stop_reason == "max_new_reached" and gen_len == max_new) or \
              (stop_reason == "eos" and 0 < gen_len <= max_new
               and eos_id is not None and gen and gen[-1] == eos_id)
+    # ---- 2b) 调用方追加的必需检查（如决策步覆盖核对）----
+    for item in (extra_required or []):
+        req(item["name"], bool(item["ok"]), item.get("detail", ""))
+
     req("generation_length_and_stop_reason", len_ok,
         f"gen_len={gen_len} max_new={max_new} stop_reason={stop_reason} "
         f"eos_id={eos_id} last={gen[-1] if gen else None}")
