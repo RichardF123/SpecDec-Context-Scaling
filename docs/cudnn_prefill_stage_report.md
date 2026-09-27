@@ -747,3 +747,58 @@ R3 只能靠 §9.2 的逐层张量阶梯测量。**这是限制，不是结论�
 | 6 | "128-token 上**未检出质量损失** / v_fp8 **无损失**" | **"该（单）窗口未见平均 NLL 恶化"**；**不**称普遍无损、**不**称质量提升 | §9.5，单窗口 128 token |
 | 7 | 把 `hf_sdpa` 当作已确认的对照 | **`hf_sdpa` 只表示配置了 `attn_implementation="sdpa"`，未核实 HF 实际选中哪个 kernel**（flash / mem-efficient / cudnn / math）⇒ 只作"另一条后端路径与量级参照"，**不得**当作"已确认的 cuDNN 对照" | `g5_attn_nll_quality.py` 只读取并记录 `config._attn_implementation`，**未**做 kernel 级核实 |
 | 8 | "R1/R2/R3 = 去掉某个舍入点"的因果口吻 | 改为**精度干预口吻**（提高 QK/score 精度、提高概率精度、提高 AV 输出精度），因为干预是**提升精度**，不是"移除一个已被隔离的 cast" | 同 #2 |
+
+## 9.13 8K 重复可运行性（3×base + 3×V-only，2026-09-27）—— **默认护栏、6/6 完成**
+
+先修复检查缺口（工具层，**未改生产算法**）：① 旧字段 `logits_all_finite` **只**含两模型 prefill
+⇒ 新运行改名 `prefill_logits_finite` 并在 `verdict` 里写明旧口径（**旧 JSON 不改写**）；
+② 有限性检查点扩到 **propose 入口（紧接 argmax）/ propose 返回 / verify 返回候选行（紧接 argmax）/
+repair 返回 / prefill 返回**，**非有限立即停止**；③ 区分 `required / executed / ok`，
+并输出 `uncovered`（该跑没跑）与 `not_applicable`（结构上不存在，显式列出）；
+④ **执行结束 ≠ 验证通过**：`stage=run_ended` 与 `checks.passed` 分离，**只有 passed 才 exit 0**；
+⑤ 记录 `stop_reason` 并校验生成长度，`other_short` 判失败；⑥ `reserved ≤ 物理容量` 降级为事实记录
+（`not_a_whole_card_safety_verdict=True`）；⑦ runner 新增 `exit 5 = CHECKS FAILED` 并停止后续。
+
+**轻量回归（不加载大模型）**：纯逻辑 `smoke_checks_selftest_cpu.py` **27 PASS / 0 FAIL**
+（正常 / 非有限 / 分流失败 / 不变量失败 / **缺失检查**）；另用 `SMOKE_SELFTEST=<scenario>` 注入故障，
+**走真实判定+落盘+退出码路径**：`normal`→exit 0，`nonfinite/dispatchfail/invariantfail/missing`
+→ tool **exit 5** 且 runner **exit 1**，五种情形 JSON 全部落盘。
+
+**重复运行**（`scripts/run_g5_8k_repeat.ps1`；每步独立进程、串行、预固定交错
+`base1→vfps1→base2→vfps2→base3→vfps3`；**每次重查环境**；**默认 16 GiB 护栏、无覆盖**）：
+
+| step | KV | stage | gen / stop_reason | passed | 不变量 | 有限性检查 | peak alloc | peak reserved | cuda_free | exit |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| base1 | base_bf16 | run_ended | 16 / max_new_reached | True | ✓ 5 轮 | 19 次 | 6902.4 | **7296.0** | 0.0 | 0 |
+| vfps1 | v_fp8 | run_ended | 16 / max_new_reached | True | ✓ 5 轮 | 19 次 | 6847.1 | **7178.0** | 0.0 | 0 |
+| base2 | base_bf16 | run_ended | 16 / max_new_reached | True | ✓ 5 轮 | 19 次 | 6902.4 | **7296.0** | 0.0 | 0 |
+| vfps2 | v_fp8 | run_ended | 16 / max_new_reached | True | ✓ 5 轮 | 19 次 | 6847.1 | **7178.0** | 0.0 | 0 |
+| base3 | base_bf16 | run_ended | 16 / max_new_reached | True | ✓ 5 轮 | 19 次 | 6902.4 | **7296.0** | 0.0 | 0 |
+| vfps3 | v_fp8 | run_ended | 16 / max_new_reached | True | ✓ 5 轮 | 19 次 | 6847.1 | **7178.0** | 0.0 | 0 |
+
+**零方差项**：`peak_allocated` / `peak_reserved`（7296.0 或 7178.0）、
+`fused={'prefill':208}`、`eager={'propose':432,'verify':140,'repair':52}`、`s_max_by_phase`
+（`verify` 的 `s_max=4` 而 **fused=0**）、最终 cache 长度 **8208**、输入 hash、**16 个 token id 六次相同**。
+设备侧 `smi_mem_used` 有 5–6 MiB 抖动（base 7845/7845/7840、v_fp8 7729/7723/7724）
+⇒ **PyTorch 记账零方差，但设备侧受其它 20 个消费者影响**；6 次 `cuda_free` 均 **0.0 MiB**。
+
+⚠️ **不得**由本节推出：性能稳定性或加速（耗时 5.64–6.36 s prefill / 6.69–7.72 s wall **仅诊断**，
+父子阶段不可相加，分页文件扩容 ≠ 显存增加）；**也不得**由"两档生成 id 相同"推出 SpecDec 与 AR 等价。
+旧 eager 对齐门**仍 FAIL**。详见台账 §4.27。
+
+## 9.14 复现命令（8K 重复 smoke）
+
+```bat
+:: 单次 smoke（默认护栏；不要传第 2 个参数）
+set "SMOKE_KV=base_bf16" & scripts\run_g5_attn_forensics.cmd smoke
+set "SMOKE_KV=v_fp8"     & scripts\run_g5_attn_forensics.cmd smoke
+
+:: 检查逻辑的轻量回归（不加载模型）
+.venv\Scripts\python.exe -m specdec.engine.smoke_checks_selftest_cpu
+
+:: 注入故障：验证"检查失败 ⇒ 落盘 + 非零退出"（不加载模型）
+set "SMOKE_SELFTEST=dispatchfail" & scripts\run_g5_attn_forensics.cmd smoke
+
+:: 6 次重复可运行性（独立进程、串行、预固定交错顺序、每步重查环境）
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts\run_g5_8k_repeat.ps1
+```

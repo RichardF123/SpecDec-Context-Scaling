@@ -33,6 +33,7 @@ from . import model_self as M
 from . import spec_dec
 from . import g5_8k_spec_variance_probe as P5V
 from . import g5_driver as D
+from .smoke_checks import CheckRegistry, FinitenessError, evaluate
 
 ROOT = Path(__file__).resolve().parents[2]
 OUTDIR = ROOT / "output" / "g5" / "attn"
@@ -46,6 +47,8 @@ KV = os.environ.get("SMOKE_KV", "base_bf16")
 ARM = os.environ.get("SMOKE_ARM", "cudnn_prefill")
 ALLOW_UNQUALIFIED = S.env_flag("SMOKE_ALLOW_UNQUALIFIED", False)
 DRY_RUN = S.env_flag("SMOKE_DRY_RUN", False)
+# 轻量回归：注入故障以验证"检查失败 ⇒ 落盘 + 非零退出"（**不加载模型**）
+SELFTEST = os.environ.get("SMOKE_SELFTEST", "").strip()
 
 
 def mem(tag: str, rec: dict) -> None:
@@ -81,6 +84,59 @@ def _write(rec: dict, run_id: str) -> None:
     tmp.replace(p)
 
 
+def _selftest(scenario: str, rec: dict, run_id: str) -> int:
+    """**不加载模型**地验证"检查失败 ⇒ 落盘 + 非零退出"这条路径。
+
+    为什么需要它：任务要求"轻量回归…不要为了测试错误分支加载大模型"，
+    同时要证明"错误会被拦住、结果能落盘、runner 不会继续推进"。
+    本函数复用与真实运行**同一套** `smoke_checks` 判定逻辑与 `_write`，
+    只是把故障**注入**进来（而非真的跑出故障）。
+    """
+    reg = CheckRegistry()
+    ok = torch.zeros(1, 4)
+    rec["selftest"] = dict(scenario=scenario,
+                           note="**非真实运行**：故障为注入，用于回归判定/退出码/落盘路径")
+    exc = None
+    non_finite = None
+    if scenario == "nonfinite":
+        try:
+            reg.check_finite(ok, phase="prefill", model="target", role="prefill_lg")
+            reg.check_finite(torch.tensor([1.0, float("nan")]), phase="verify",
+                             model="target", role="rows", where="selftest 注入")
+        except FinitenessError as e:
+            exc = f"FinitenessError: {e}"
+            non_finite = dict(error=str(e), first_bad=reg.first_bad, coverage=reg.coverage())
+    else:
+        for (ph, md, role) in (("prefill", "target", "prefill_lg"), ("prefill", "draft", "prefill_lg"),
+                               ("propose", "draft", "input_lg"), ("verify", "target", "rows"),
+                               ("repair", "target", "saved_next"), ("repair", "draft", "saved_next")):
+            if scenario == "missing" and ph in ("propose", "verify"):
+                continue                       # 注入"预期检查缺失"
+            reg.check_finite(ok, phase=ph, model=md, role=role)
+    rec["checks"] = evaluate(
+        registry=reg, mismatch_rounds=1,
+        weights_ok=True, weights_detail="338+290 逐位校验（selftest 注入）",
+        invariants_ok=(scenario != "invariantfail"),
+        invariants_detail="selftest 注入" + ("：不变量失败" if scenario == "invariantfail" else "：通过"),
+        dispatch_ok=(scenario != "dispatchfail"),
+        dispatch_detail="selftest 注入" + ("：融合出现在 verify" if scenario == "dispatchfail" else "：仅 prefill"),
+        attention_assert="ok" if scenario != "dispatchfail" else "RuntimeError: 静默不生效",
+        gen_len=16, max_new=16, eos_id=151645, gen=[1] * 16,
+        stop_reason="max_new_reached", exception=exc,
+        alloc_ok=True, alloc_detail="selftest 注入")
+    if non_finite:
+        rec["non_finite"] = non_finite
+    rec["stage"] = "run_ended" if rec["checks"]["passed"] else "run_ended_checks_failed"
+    rec["verdict"] = dict(ran=True, passed=bool(rec["checks"]["passed"]), selftest=True,
+                          claim="selftest：只验证判定/退出码/落盘路径，**不是**任何 GPU 结论")
+    _write(rec, run_id)
+    rc = 0 if rec["checks"]["passed"] else 5
+    print(f"[smoke/selftest] scenario={scenario} passed={rec['checks']['passed']} "
+          f"failures={[f['name'] for f in rec['checks']['failures']]} "
+          f"uncovered={rec['checks']['uncovered']} exit={rc}")
+    return rc
+
+
 def main() -> int:
     run_id = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
     rec: dict = dict(run_id=run_id, tool="g5_8k_smoke_cudnn",
@@ -93,6 +149,8 @@ def main() -> int:
                      timing_policy="计时字段含插桩，仅供诊断，禁止进入 speedup 表")
     print(f"[smoke] run_id={run_id} arm={ARM} ctx={CTX} chunk={CHUNK} k={K} "
           f"max_new={MAXNEW} kv={KV}")
+    if SELFTEST:
+        return _selftest(SELFTEST, rec, run_id)
     if DRY_RUN:
         rec["stage"] = "dry_run"
         _write(rec, run_id)
@@ -119,6 +177,7 @@ def main() -> int:
     rec["allow_unqualified"] = ALLOW_UNQUALIFIED
 
     from .lowmem_load import load_ours_bf16
+    reg: CheckRegistry | None = None      # 先声明：FinitenessError 处理器需要它（避免 NameError 掩盖原始错误）
     try:
         # **关闭所有诊断精度开关**：本 smoke 只回答"能否完成完整双模型流程"，
         # 不许把诊断用的精度干预混进来（它们只在 §9 的定位实验里启用）。
@@ -168,7 +227,9 @@ def main() -> int:
         acc: dict = {}
         inner = P5V.timed_chunked_prefill(acc, CHUNK, tgt)
         stage: dict = {"target_prefill_done": False, "draft_prefill_done": False}
-        fin = {"target": None, "draft": None}
+        # 有限性检查注册表：**在 argmax/接受判断之前**逐点检查，非有限立即抛错。
+        # 语义与判定规则见 smoke_checks.py（纯逻辑，另有 CPU 轻量回归 smoke_checks_selftest_cpu.py）。
+        reg = CheckRegistry()
 
         def prefill(model, ids_):
             key = "target" if model is tgt else "draft"
@@ -178,8 +239,9 @@ def main() -> int:
                 lg, cache = inner(model, ids_)
             torch.cuda.synchronize()
             stage[f"{key}_prefill_s"] = time.perf_counter() - ts
-            if lg is not None:
-                fin[key] = bool(torch.isfinite(lg).all())
+            # prefill 的 logits 会被解码器取 `[:, -1:]` 做首个 argmax ⇒ 必须先检查
+            reg.check_finite(lg, phase="prefill", model=key, role="prefill_lg",
+                             where=f"prefill({key}) 返回，供 saved_next/首轮 argmax 使用")
             mem(f"after_{key}_prefill", rec)
             stage[f"{key}_prefill_done"] = True
             rec["stage"] = f"{key}_prefill_done"
@@ -192,24 +254,41 @@ def main() -> int:
                         verify=spec_dec._verify, step=spec_dec._step)
 
         def propose(*a, **k):
+            # 签名 `_propose(draft, cache, lg, k_eff, eos_id)`：`a[2]` 就是要被 argmax 的那份 logits
+            if len(a) > 2:
+                reg.check_finite(a[2], phase="propose", model="draft", role="input_lg",
+                                 where="propose 入口的 lg：**紧接**就会被 .argmax() 取候选")
             with M.attention_phase("propose"):
-                return orig_fns["propose"](*a, **k)
+                cands, cache, lg_out = orig_fns["propose"](*a, **k)
+            # 返回的 lg 会成为下一轮的输入（all-accept 时经 prop_lg 传回）⇒ 同样先检查
+            reg.check_finite(lg_out, phase="propose", model="draft", role="return_lg",
+                             where="propose 返回的 draft 末位 logits（下一轮 argmax 的输入）")
+            return cands, cache, lg_out
 
         def verify(*a, **k):
             with M.attention_phase("verify"):
-                return orig_fns["verify"](*a, **k)
+                rows, blk = orig_fns["verify"](*a, **k)
+            # rows = lg[0,-kp:]，调用方**紧接着**就做 argmax 得到 g[] ⇒ 必须先检查
+            reg.check_finite(rows, phase="verify", model="target", role="rows",
+                             where="verify 返回的候选行：**紧接**被 argmax 用于接受判断")
+            return rows, blk
 
         def step(*a, **k):
+            key = "target" if a and a[0] is tgt else "draft"
             with M.attention_phase("repair"):
-                return orig_fns["step"](*a, **k)
+                lg_out, cache = orig_fns["step"](*a, **k)
+            reg.check_finite(lg_out, phase="repair", model=key, role="saved_next",
+                             where="repair 返回的末位 logits（下一轮 g[0] 的来源）")
+            return lg_out, cache
 
         spec_dec._prefill = prefill             # harness 侧标注阶段（不改 spec_dec.py）
         spec_dec._propose, spec_dec._verify, spec_dec._step = propose, verify, step
         rounds: list[dict] = []
+        eos_id = tok.eos_token_id
         try:
             torch.cuda.synchronize()
             t1 = time.perf_counter()
-            out = spec_dec.spec_decode_greedy(tgt, drf, ids, MAXNEW, k=K, eos_id=tok.eos_token_id,
+            out = spec_dec.spec_decode_greedy(tgt, drf, ids, MAXNEW, k=K, eos_id=eos_id,
                                               target_kv=KV, draft_kv="base_bf16",
                                               log=lambda d: rounds.append(dict(d)))
             torch.cuda.synchronize()
@@ -253,9 +332,23 @@ def main() -> int:
                        and all(fused_by_phase.get(p, 0) == 0
                                for p in ("propose", "verify", "repair", "decode"))
                        and eager_by_phase.get("verify", 0) > 0)
-        rec["run"] = dict(gen=gen, gen_len=len(gen),
+        # ---- 停止原因：**不能少生成却当固定长度完成** ----
+        gen_len = len(gen)
+        if gen and eos_id is not None and gen[-1] == eos_id:
+            stop_reason = "eos"
+        elif gen_len >= MAXNEW:
+            stop_reason = "max_new_reached"
+        else:
+            stop_reason = "other_short"       # 既没到 max_new 也没 EOS ⇒ 必须判失败
+        rec["run"] = dict(gen=gen, gen_len=gen_len, max_new=MAXNEW, eos_id=eos_id,
+                          stop_reason=stop_reason,
                           gen_ids_in_vocab=bool(all(0 <= g < vocab for g in gen)),
-                          logits_finite=fin, prefill_s=acc.get("t"),
+                          # 历史字段口径澄清：旧的 `logits_all_finite` **只**覆盖两模型 prefill 的 logits，
+                          # 名称夸大覆盖范围 ⇒ 新运行改用下面的显式命名（**旧 JSON 不改写**）
+                          prefill_logits_finite=all(
+                              reg.calls.get(("prefill", m), {}).get("ok", False)
+                              for m in ("target", "draft")),
+                          prefill_s=acc.get("t"),
                           prefill_target_s=acc.get("target"), prefill_draft_s=acc.get("draft"),
                           stage_prefill_s=rec.get("stage_flags"),
                           wall_s=wall, specdec_stats=out["stats"],
@@ -263,31 +356,82 @@ def main() -> int:
                           dispatch_only_prefill=dispatch_ok,
                           s_max_by_phase=a_stats.get("s_max_by_phase"),
                           eager_reason_kinds=a_stats.get("eager_reason_kinds"),
-                          note="计时含插桩，仅诊断；禁止进入任何 speedup 表")
-        print(f"[smoke] 完成：gen={len(gen)} logits_finite={fin} "
-              f"prefill={acc.get('t', 0):.2f}s wall={wall:.2f}s")
+                          note="计时含插桩，仅诊断；禁止进入任何 speedup 表。"
+                               "父子阶段耗时**不可相加**（prefill 是 wall 的子集）。")
+        # ---- 通过判定：**执行结束 ≠ 验证通过** ----
+        rec["checks"] = evaluate(
+            registry=reg, mismatch_rounds=int(out["stats"].get("mismatch_rounds", 0)),
+            weights_ok=rec["weights_bitmatch"],
+            weights_detail=f"target {tinfo['n_params_checked']} + draft {dinfo['n_params_checked']} 逐位校验",
+            invariants_ok=rec["round_invariants"]["all_ok"],
+            invariants_detail=f"{len(inv)} 轮，全部满足 tgt_len==drf_len==pre+(m+1 if m<Kp else Kp)"
+                              if inv else "无轮次记录",
+            dispatch_ok=dispatch_ok,
+            dispatch_detail=f"fused={fused_by_phase} eager={eager_by_phase}",
+            attention_assert=attn_ok, gen_len=gen_len, max_new=MAXNEW, eos_id=eos_id,
+            gen=gen, stop_reason=stop_reason, exception=None,
+            alloc_ok=bool(rec.get("mem_timeline")),
+            alloc_detail=f"时间线 {len(rec.get('mem_timeline', []))} 个时点")
+        passed = bool(rec["checks"]["passed"])
+        print(f"[smoke] 完成：gen={gen_len} stop_reason={stop_reason} "
+              f"有限性检查 {reg.n_checked} 次（覆盖 {sorted(reg.calls)}）")
         print(f"[smoke] 阶段分流：fused_by_phase={fused_by_phase} "
               f"eager_by_phase={eager_by_phase} 仅prefill融合={dispatch_ok}")
         print(f"[smoke] 逐轮不变量 all_ok={rec['round_invariants']['all_ok']} "
               f"rounds={len(rounds)}")
-        rec["stage"] = "complete"
+        print(f"[smoke] 验证：passed={passed} 必需检查={rec['checks']['n_required']} "
+              f"未覆盖={rec['checks']['uncovered']} 不适用={rec['checks']['not_applicable']} "
+              f"失败={[f['name'] for f in rec['checks']['failures']]}")
+        rec["stage"] = "run_ended" if passed else "run_ended_checks_failed"
         rec["verdict"] = dict(
-            ran=True, weights_bitmatch=rec["weights_bitmatch"],
-            logits_all_finite=all(v for v in fin.values() if v is not None),
+            ran=True, passed=passed,
+            weights_bitmatch=rec["weights_bitmatch"],
+            prefill_logits_finite=rec["run"]["prefill_logits_finite"],
+            finiteness_coverage_note="新运行覆盖 prefill/propose/verify/repair 的**决策用** logits；"
+                                     "旧 JSON 的 `logits_all_finite` 仅指 prefill，口径已在此澄清",
             gen_in_vocab=rec["run"]["gen_ids_in_vocab"],
+            stop_reason=stop_reason, gen_len=gen_len,
             attention_assert=attn_ok,
             dispatch_only_prefill=dispatch_ok,
             round_invariants_ok=rec["round_invariants"]["all_ok"],
             pt_peak_reserved_mib=rec["mem_timeline"][-1]["pt_peak_reserved_mib"],
             pt_peak_allocated_mib=rec["mem_timeline"][-1]["pt_peak_allocated_mib"],
             physical_limit_mib=rec["mem_timeline"][-1]["cuda_total_mib"],
-            under_physical_line=bool(rec["mem_timeline"][-1]["pt_peak_reserved_mib"]
-                                     <= rec["mem_timeline"][-1]["cuda_total_mib"]),
-            claim="**首次跑通只代表『能跑』**：单一 run、无重复 ⇒ 不构成正确性/稳定性/性能结论；"
-                  "allocated ≠ 整卡物理占用，reserved 超 8 GiB 不单独证明分页。")
+            # 预登记口径：这只是"PyTorch 记账峰值 ≤ 物理容量"的**事实记录**，
+            # **不得**据此推断整卡安全（另有 20+ 消费者；见 smi_mem_used / cuda_free 各时点）。
+            pt_reserved_within_physical_line=bool(
+                rec["mem_timeline"][-1]["pt_peak_reserved_mib"]
+                <= rec["mem_timeline"][-1]["cuda_total_mib"]),
+            not_a_whole_card_safety_verdict=True,
+            claim="**单次跑完只代表『能跑』**：单一 run ⇒ 不构成正确性/稳定性/性能结论；"
+                  "allocated ≠ 整卡物理占用，reserved 超物理容量不单独证明分页。")
         _write(rec, run_id)
         del tgt, drf
         torch.cuda.empty_cache()
+        if not passed:
+            print("[smoke] !! 验证未通过（执行已结束）："
+                  + ", ".join(f["name"] for f in rec["checks"]["failures"]))
+            return 5
+    except FinitenessError as e:
+        # 非有限值：**立即**停止（已在 check_finite 里落记录），落盘并非零退出
+        M.set_attention_strategy("eager")
+        M.reset_attention_stats()
+        rec["stage"] = "finiteness_failed"
+        rec["checks"] = evaluate(
+            registry=reg if reg is not None else CheckRegistry(),
+            mismatch_rounds=-1,          # -1 = "未知"（run 被中止）⇒ 不作有条件必需
+            weights_ok=False, weights_detail="未完成",
+            invariants_ok=False, invariants_detail="未完成", dispatch_ok=False,
+            dispatch_detail="未完成", attention_assert="not_reached", gen_len=0, max_new=MAXNEW,
+            eos_id=None, gen=[], stop_reason="aborted_non_finite",
+            exception=f"FinitenessError: {e}", alloc_ok=bool(rec.get("mem_timeline")),
+            alloc_detail=f"{len(rec.get('mem_timeline', []))} 个时点")
+        rec["non_finite"] = dict(error=str(e), first_bad=(reg.first_bad if reg else None),
+                                 coverage=(reg.coverage() if reg else None))
+        mem("on_non_finite", rec)
+        _write(rec, run_id)
+        print(f"[smoke] !! 非有限值，已在决策前停止并落盘：{e}")
+        return 5
     except torch.OutOfMemoryError as e:
         rec["stage"] = "oom"
         rec["oom"] = str(e)

@@ -1674,6 +1674,82 @@ smoke 只标注了 `_prefill`，使 `propose/verify/repair` 落进 `'other'` 相
 `仅prefill融合=True`）后才推进 8K。`output/g5/attn/` 下三次运行的 JSON 与日志全部保留
 （含此前被护栏拒绝与失败的历史记录，未删除）。
 
+### 4.27 smoke 工具检查缺口修复 + 8K 重复可运行性（3×base + 3×V-only，2026-09-27）
+
+**1. 修复的检查缺口（工具层，未改生产算法）**
+
+| # | 原问题 | 修复 | 原理/作用 |
+| --- | --- | --- | --- |
+| 1 | `logits_all_finite` **只**检查两模型 prefill 返回的 logits，名称夸大覆盖范围 | 新运行的字段改为显式命名 `prefill_logits_finite`，并在 `verdict` 里写明旧字段口径（**旧 JSON 不改写**） | 口径与名称一致，避免"看起来全查了" |
+| 2 | 有限性检查不在决策点 | 新增 `smoke_checks.CheckRegistry.check_finite()`，在 **propose 入口（紧接 argmax）、propose 返回、verify 返回的候选行（紧接 argmax）、repair 返回、prefill 返回** 五处检查；**非有限立即抛 `FinitenessError` 并停止** | 任务要求"检查必须发生在 argmax/接受判断之前"；且覆盖"实际用于决策的 logits" |
+| 3 | "未执行的分支"可能被空过 | `evaluate()` 区分 `required/executed/ok`，并输出 `uncovered`（该跑没跑的**可选**分支）与 `not_applicable`（**结构上不存在**的组合，显式列出而不是默认为已覆盖） | "没有执行的分支标为未覆盖，不能空过" |
+| 4 | 执行结束即 `stage=complete`、exit 0 | 拆成 `stage=run_ended` 与 `checks.passed`；**只有 passed=True 才 exit 0**，否则 **exit 5**；`attention_assert` 失败/必需检查缺失/异常/生成长度异常一律判失败 | 区分"执行结束"与"验证通过" |
+| 5 | 少生成可能被当成完成 | 记录 `stop_reason ∈ {max_new_reached, eos, other_short}`，并校验 `gen_len==max_new`（或 EOS 且末位为 eos）；`other_short` **判失败** | "不能少生成却当固定长度完成" |
+| 6 | 可能由 `reserved ≤ 物理容量` 推断整卡安全 | 字段改名 `pt_reserved_within_physical_line`，并加 `not_a_whole_card_safety_verdict=True`；同时记录设备侧 `smi_mem_used` 与各阶段 `cuda_free` | 预登记口径：`allocated ≠ 整卡占用`，不能据此推断整卡安全 |
+| 7 | runner 只认 0/2/3 | 新增 `exit 5 → CHECKS FAILED` 分支，且**上层编排遇非零即停** | "上层 runner 必须传播失败退出码，并停止后续测试" |
+
+**2. 轻量回归（不加载大模型）**
+- 纯逻辑回归 `smoke_checks_selftest_cpu.py`：**27 PASS / 0 FAIL**，覆盖
+  ① 正常通过 ② 非有限值（NaN/Inf 在决策前被拦、记录含 NaN 计数与相位）③ 分流失败
+  ④ cache 不变量失败 ⑤ **缺失检查**（含"空过"语义：未执行的可选分支不算失败但必须列入 `uncovered`；
+  mismatch>0 时 repair 转为必需并判失败）；另测生成长度/停止原因与其余必需项。
+- **注入故障回归**（`SMOKE_SELFTEST=<scenario>`，**不加载模型**，走的是与真实运行同一套判定+落盘+退出码）：
+
+| scenario | runner 退出码 | tool 退出码 | 结果 |
+| --- | --- | --- | --- |
+| `normal` | **0** | 0 | passed=True |
+| `nonfinite` | **1** | **5** | 失败项含 `run_no_exception`；`first_bad.role=rows` |
+| `dispatchfail` | **1** | **5** | 失败项 `dispatch_only_prefill` + `attention_assert` |
+| `invariantfail` | **1** | **5** | 失败项 `cache_invariants` |
+| `missing` | **1** | **5** | 失败项 `finiteness:propose/draft` + `finiteness:verify/target` |
+
+⇒ 五种情形的 JSON **全部落盘**、错误**全部被拦住**、runner **不再判成功**（符合"错误会被拦住、结果能落盘、
+runner 不会继续推进"）。审计工具已把该回归纳入（**54/54**）。
+
+**3. 重复可运行性：6 次独立进程、串行、预固定交错顺序、默认护栏**
+
+编排 `scripts/run_g5_8k_repeat.ps1`（每步一个全新 `cmd`/python 进程；**每次重查环境**；
+**不给 runner 传第 2 个参数**⇒ 默认 16 GiB 护栏）。顺序：`base1 → vfps1 → base2 → vfps2 → base3 → vfps3`。
+配置：target 1.5B + draft 0.5B，BF16，`ctx=8192 / chunk=2048 / k=4 / max_new=16`，
+target KV = base_bf16 或 v_fp8，draft 恒 base_bf16，策略 `cudnn_prefill`（仅 prefill 融合）。
+
+| step | KV | stage | gen/stop | passed | 不变量 | 有限性检查 | peak allocated | peak reserved | cuda_free | 退出码 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| base1 | base_bf16 | run_ended | 16 / max_new_reached | True | ✓ 5 轮 | 19 次 | 6902.4 | **7296.0** | 0.0 | 0 |
+| vfps1 | v_fp8 | run_ended | 16 / max_new_reached | True | ✓ 5 轮 | 19 次 | 6847.1 | **7178.0** | 0.0 | 0 |
+| base2 | base_bf16 | run_ended | 16 / max_new_reached | True | ✓ 5 轮 | 19 次 | 6902.4 | **7296.0** | 0.0 | 0 |
+| vfps2 | v_fp8 | run_ended | 16 / max_new_reached | True | ✓ 5 轮 | 19 次 | 6847.1 | **7178.0** | 0.0 | 0 |
+| base3 | base_bf16 | run_ended | 16 / max_new_reached | True | ✓ 5 轮 | 19 次 | 6902.4 | **7296.0** | 0.0 | 0 |
+| vfps3 | v_fp8 | run_ended | 16 / max_new_reached | True | ✓ 5 轮 | 19 次 | 6847.1 | **7178.0** | 0.0 | 0 |
+
+- **6/6 完成且 `passed=True`**；`required=13`、`failures=[]`、`uncovered=[]`、
+  `not_applicable=['finiteness:propose/target','finiteness:verify/draft']`（结构上不存在）。
+- **零方差项**：`peak_allocated`（base 6902.3798828125 ×3、v_fp8 6847.1298828125 ×3）、
+  `peak_reserved`（7296.0 ×3 / 7178.0 ×3）、`fused={'prefill':208}`、
+  `eager={'propose':432,'verify':140,'repair':52}`、`s_max_by_phase`、最终 cache 长度 8208、
+  输入 hash `bf6a34a82018fd39`、**生成的 16 个 token id 六次完全相同**。
+- 设备侧占用（`smi_mem_used`）有 5–6 MiB 抖动：base 7845/7845/7840、v_fp8 7729/7723/7724 ⇒
+  **PyTorch 记账稳定，但设备侧受其它 20 个消费者影响**；6 次 `cuda_free` 均为 **0.0 MiB**。
+- 环境（每次重查）：C/D 两个分页文件均活跃（8192/16384 MiB），
+  commit 上限 **55.64 GiB**、可用 **35.69–36.71 GiB**、`P5V_MIN_COMMIT_GIB=16.0`、`overridden=False`（6/6）；
+  GPU 空闲 7534–7538 MiB；P-state 全部合格（sm 2220–2325 MHz）。
+- 阶段耗时**仅诊断**：prefill 5.64–6.36 s、wall 6.69–7.72 s（插桩含在内）。
+  **不得**据此声称性能稳定性、**不得**进 speedup 表；**父子阶段耗时不可相加**（prefill 是 wall 的子集）；
+  **分页文件扩容不等于 GPU 显存增加**（显存压力未消失：`cuda_free=0`）。
+
+**4. 本轮的证与未证**
+- **已证**：该配置在**默认护栏**下**重复可运行**（6/6）、结构检查与内存记账**零方差**、
+  有限性检查**覆盖全部 6 个决策点组合**且未发现非有限值、融合**只**在 prefill（`verify` 的 `s_max=4` 而 fused=0）、
+  逐轮 cache 不变量全通过、检查逻辑的失败路径在注入故障下**确实被拦住并落盘**。
+- **未证**：AR/SpecDec 严格等价（**两档生成 id 相同不等于 SpecDec 与 AR 等价**）、质量无损、
+  性能稳定性/加速、更长生成长度（64 token）与更大质量窗口的行为。
+  旧 eager 对齐门**仍然 FAIL**，历史记录未改，未采用任何待批准的新验收判据。
+
+**5. 原始结果**：`output/g5/attn/smoke8k_cudnn_prefill_20260927T1246{12,10,54,36,16,56}Z.json`
+（依次 base1/vfps1/base2/vfps2/base3/vfps3）与各同名 `.log`；
+汇总 `repeat6_summary.json`；编排主表 `run_g5_8k_repeat_*.master.tsv`；
+控制台 `run_g5_8k_repeat_console.log`；注入故障回归的 5 个 JSON 亦全部保留（未删除失败样本）。
+
 ## 5. 复现设置（每次记录必须带上）- seed=42（测试）；性能脚本 seed=0，3 reps 取最优 + warmup；
 - prompt 固定（bench_basic.PROMPT，38 tok）；decode 数 64；
 - dtype/设备随行标注（fp32/CPU、fp16/CUDA）；attn eager；no_grad；

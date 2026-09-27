@@ -82,7 +82,15 @@ set "RC=%errorlevel%"
 if "%RC%"=="0" goto :ok
 if "%RC%"=="2" goto :crashed
 if "%RC%"=="3" goto :refused
+if "%RC%"=="5" goto :checks_failed
 echo !! smoke failed with exit %RC%
+goto :fail
+
+:checks_failed
+echo.
+echo !! CHECKS FAILED, exit 5: the run ENDED but verification did NOT pass.
+echo    Read the "checks" block in the result JSON: failures / uncovered / not_applicable.
+echo    Do NOT treat an ended run as a passed run, and do NOT advance to later steps.
 goto :fail
 
 :refused

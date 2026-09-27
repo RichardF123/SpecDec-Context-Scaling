@@ -296,6 +296,17 @@ def main() -> int:
     except Exception as e:                                     # noqa: BLE001
         check("CPU 自测可运行", False, f"{type(e).__name__}: {e}")
 
+    print("\n== smoke 检查逻辑的轻量回归（不加载模型）==")
+    try:
+        pr = subprocess.run([sys.executable, "-m", "specdec.engine.smoke_checks_selftest_cpu"],
+                            cwd=str(ROOT), capture_output=True, text=True, encoding="utf-8",
+                            errors="replace", timeout=900)
+        tail = (pr.stdout or "").strip().splitlines()[-1] if pr.stdout else ""
+        check("smoke 检查逻辑回归 PASS 27 / FAIL 0（覆盖 正常/非有限/分流/不变量/缺失）",
+              pr.returncode == 0 and "PASS 27 / FAIL 0" in tail, tail)
+    except Exception as e:                                     # noqa: BLE001
+        check("smoke 检查逻辑回归可运行", False, f"{type(e).__name__}: {e}")
+
     bad = [n for n, ok, _ in RESULTS if not ok]
     print(f"\n审计：{len(RESULTS) - len(bad)} / {len(RESULTS)} 条与原始结果一致")
     if bad:
