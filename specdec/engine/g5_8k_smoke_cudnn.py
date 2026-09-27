@@ -120,15 +120,27 @@ def main() -> int:
 
     from .lowmem_load import load_ours_bf16
     try:
+        # **关闭所有诊断精度开关**：本 smoke 只回答"能否完成完整双模型流程"，
+        # 不许把诊断用的精度干预混进来（它们只在 §9 的定位实验里启用）。
+        rec["diag_precision"] = M.set_diag_preset("eager")
+        rec["profiler_used"] = False              # 本工具不使用 profiler
+        rec["default_strategy_at_start"] = M.attention_strategy()
+
         mem("before_load", rec)
         t0 = time.perf_counter()
         tgt, tok, tinfo = load_ours_bf16(TARGET)
+        rec["stage_target_loaded"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        mem("after_target_load", rec)
+        _write(rec, run_id)                       # 逐阶段落盘：target 加载完成
         drf, _t2, dinfo = load_ours_bf16(DRAFT)
         rec["load"] = dict(target=tinfo, draft=dinfo, load_s=time.perf_counter() - t0)
         rec["weights_bitmatch"] = bool(tinfo["weights_bitmatch"] and dinfo["weights_bitmatch"])
+        rec["weights_checked"] = dict(target=tinfo["n_params_checked"],
+                                      draft=dinfo["n_params_checked"])
         rec["stage"] = "loaded"
+        rec["stage_draft_loaded"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         mem("after_load", rec)
-        _write(rec, run_id)                     # 先落盘：加载是历史崩溃高发点
+        _write(rec, run_id)                       # 加载是历史崩溃高发点
         if not rec["weights_bitmatch"]:
             print("[smoke] !! 权重校验未通过 -> 停止（不产生后续数字）")
             rec["stage"] = "aborted_weight_mismatch"
@@ -138,41 +150,74 @@ def main() -> int:
         tgt.set_kv_format(spec_dec._fmt(KV))
         # `set_kv_format` 收的是**引擎名**（'fp16'/'v_fp8'/'fp8'），不是实验名（'base_bf16'）
         drf.set_kv_format("fp16")   # draft head_dim=64 < GROUP_V=128 ⇒ 只能 base(bf16 K/V)
+        rec["kv_format"] = dict(target=spec_dec._fmt(KV), draft="fp16")
         M.set_attention_strategy(ARM)
         M.reset_attention_stats()
 
         full = P5V.load_ids(tok)
         ids = full[:, :CTX].contiguous()
         rec["input"] = dict(ctx=int(ids.shape[1]), ids_hash=P5V._gen_hash(
-            [int(x) for x in ids[0].tolist()]))
+            [int(x) for x in ids[0].tolist()]),
+            source="wikitext-2-raw test 前缀（与其它 G5 工具同源）",
+            vocab_size=int(tgt.embed_tokens.weight.shape[0]),
+            dtypes=dict(model=str(next(tgt.parameters()).dtype),
+                        target_kv_payload=KV, draft_kv_payload="base_bf16"))
         print(f"[smoke] 输入 {ids.shape[1]} token; 开始分块 prefill (chunk={CHUNK}) ...", flush=True)
 
-        # ---- 分块 prefill（显式标注阶段）+ 捕获 logits 有限性 ----
+        # ---- 分块 prefill（显式标注阶段）+ 逐模型阶段状态/耗时/有限性 ----
         acc: dict = {}
         inner = P5V.timed_chunked_prefill(acc, CHUNK, tgt)
-        seen: dict = {}
+        stage: dict = {"target_prefill_done": False, "draft_prefill_done": False}
         fin = {"target": None, "draft": None}
 
         def prefill(model, ids_):
+            key = "target" if model is tgt else "draft"
+            torch.cuda.synchronize()              # 计时边界同步：不让上一阶段残留引用污染峰值
+            ts = time.perf_counter()
             with M.attention_phase("prefill"):
                 lg, cache = inner(model, ids_)
-            key = "target" if model is tgt else "draft"
+            torch.cuda.synchronize()
+            stage[f"{key}_prefill_s"] = time.perf_counter() - ts
             if lg is not None:
                 fin[key] = bool(torch.isfinite(lg).all())
-            return lg, cache
+            mem(f"after_{key}_prefill", rec)
+            stage[f"{key}_prefill_done"] = True
+            rec["stage"] = f"{key}_prefill_done"
+            _write(rec, run_id)                   # 逐阶段落盘
+            return lg, cache                      # 必须原样返回：解码要用 lg 取 saved_next
 
         orig_prefill = spec_dec._prefill        # 保存后在 finally 里**原样**还原
         spec_dec._prefill = prefill             # harness 侧标注阶段（不改 spec_dec.py）
+        rounds: list[dict] = []
         try:
+            torch.cuda.synchronize()
             t1 = time.perf_counter()
             out = spec_dec.spec_decode_greedy(tgt, drf, ids, MAXNEW, k=K, eos_id=tok.eos_token_id,
-                                              target_kv=KV, draft_kv="base_bf16")
+                                              target_kv=KV, draft_kv="base_bf16",
+                                              log=lambda d: rounds.append(dict(d)))
             torch.cuda.synchronize()
             wall = time.perf_counter() - t1
         finally:
             spec_dec._prefill = orig_prefill
 
         mem("after_decode", rec)
+        rec["stage_decode_done"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        rec["stage_flags"] = dict(stage)
+        rec["rounds"] = rounds
+        # ---- 冻结的逐轮不变量（与 spec_dec 的契约一致）----
+        inv = []
+        for r in rounds:
+            pre, kp, m = r["pre"], r["Kp"], r["m"]
+            exp_tgt = pre + (m + 1 if m < kp else kp)
+            inv.append(dict(round=r["round"], pre=pre, Kp=kp, m=m,
+                            tgt_len=r["tgt_len"], drf_len=r["drf_len"],
+                            tgt_len_ok=(r["tgt_len"] == exp_tgt),
+                            drf_len_ok=(r["drf_len"] == exp_tgt),
+                            lengths_equal=(r["tgt_len"] == r["drf_len"])))
+        rec["round_invariants"] = dict(per_round=inv,
+                                       all_ok=bool(inv) and all(x["tgt_len_ok"] and x["drf_len_ok"]
+                                                                and x["lengths_equal"] for x in inv),
+                                       rule="tgt_len == drf_len == pre + (m+1 if m<Kp else Kp)")
         gen = [int(x) for x in out["gen"]]
         vocab = int(tgt.embed_tokens.weight.shape[0])
         attn_ok = None
@@ -181,29 +226,47 @@ def main() -> int:
             attn_ok = "ok"
         except RuntimeError as e:
             attn_ok = f"RuntimeError: {e}"
+        a_stats = M.attention_stats()
+        # **确认新路径确实启用、且没有错误扩展到验证阶段**
+        fused_by_phase = a_stats.get("fused_by_phase", {})
+        eager_by_phase = a_stats.get("eager_by_phase", {})
+        dispatch_ok = (sorted(k for k, v in fused_by_phase.items() if v > 0) == ["prefill"]
+                       and all(fused_by_phase.get(p, 0) == 0
+                               for p in ("propose", "verify", "repair", "decode"))
+                       and eager_by_phase.get("verify", 0) > 0)
         rec["run"] = dict(gen=gen, gen_len=len(gen),
                           gen_ids_in_vocab=bool(all(0 <= g < vocab for g in gen)),
                           logits_finite=fin, prefill_s=acc.get("t"),
                           prefill_target_s=acc.get("target"), prefill_draft_s=acc.get("draft"),
+                          stage_prefill_s=rec.get("stage_flags"),
                           wall_s=wall, specdec_stats=out["stats"],
-                          attention_ok=attn_ok, attention_stats=M.attention_stats(),
-                          note="计时含插桩，仅诊断")
+                          attention_ok=attn_ok, attention_stats=a_stats,
+                          dispatch_only_prefill=dispatch_ok,
+                          s_max_by_phase=a_stats.get("s_max_by_phase"),
+                          eager_reason_kinds=a_stats.get("eager_reason_kinds"),
+                          note="计时含插桩，仅诊断；禁止进入任何 speedup 表")
         print(f"[smoke] 完成：gen={len(gen)} logits_finite={fin} "
-              f"prefill={acc.get('t', 0):.2f}s wall={wall:.2f}s "
-              f"fused={rec['run']['attention_stats']['fused_by_phase']} "
-              f"short_fb={rec['run']['attention_stats']['eager_reason_kinds']}")
+              f"prefill={acc.get('t', 0):.2f}s wall={wall:.2f}s")
+        print(f"[smoke] 阶段分流：fused_by_phase={fused_by_phase} "
+              f"eager_by_phase={eager_by_phase} 仅prefill融合={dispatch_ok}")
+        print(f"[smoke] 逐轮不变量 all_ok={rec['round_invariants']['all_ok']} "
+              f"rounds={len(rounds)}")
         rec["stage"] = "complete"
         rec["verdict"] = dict(
             ran=True, weights_bitmatch=rec["weights_bitmatch"],
             logits_all_finite=all(v for v in fin.values() if v is not None),
             gen_in_vocab=rec["run"]["gen_ids_in_vocab"],
             attention_assert=attn_ok,
+            dispatch_only_prefill=dispatch_ok,
+            round_invariants_ok=rec["round_invariants"]["all_ok"],
             pt_peak_reserved_mib=rec["mem_timeline"][-1]["pt_peak_reserved_mib"],
             pt_peak_allocated_mib=rec["mem_timeline"][-1]["pt_peak_allocated_mib"],
             physical_limit_mib=rec["mem_timeline"][-1]["cuda_total_mib"],
             under_physical_line=bool(rec["mem_timeline"][-1]["pt_peak_reserved_mib"]
                                      <= rec["mem_timeline"][-1]["cuda_total_mib"]),
-            claim="**首次跑通只代表『能跑』**；重复稳定性验证是后续独立任务。")
+            claim="**首次跑通只代表『能跑』**：单一 run、无重复 ⇒ 不构成正确性/稳定性/性能结论；"
+                  "allocated ≠ 整卡物理占用，reserved 超 8 GiB 不单独证明分页。")
+        _write(rec, run_id)
         del tgt, drf
         torch.cuda.empty_cache()
     except torch.OutOfMemoryError as e:

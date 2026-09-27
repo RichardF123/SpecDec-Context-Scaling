@@ -8,7 +8,10 @@
 
 预测器
   hf_eager   HF `attn_implementation="eager"`（**显式指定并记录**）
-  hf_sdpa    HF `attn_implementation="sdpa"`（HF 自身另一条后端路径 ⇒ 提供"后端差异的自然量级"参照）
+  hf_sdpa    HF `attn_implementation="sdpa"` —— **只表示"已配置为 sdpa"**：本工具**不核实** HF
+             内部实际选中了哪个 kernel（flash / mem-efficient / cudnn / math 之一）
+             ⇒ 它只提供"另一条后端路径"与"后端差异的自然量级"参照，
+             **不得**当作"已确认的 cuDNN 对照"
   ours_eager / ours_cudnn       自建引擎，`base_bf16`
   ours_eager_vfp8 / ours_cudnn_vfp8  自建引擎，`v_fp8`（**与对应的未量化路径比**）
   每个 ours 预测器各跑 `chunk=L`（单块、无历史）与 `chunk=L/2`（两块、非方阵 offset mask）
@@ -129,6 +132,10 @@ def hf_pass(ids, attn_impl: str) -> dict:
         nll = nll_of(logits, ids.to("cuda"), logit_offset=0, local_start=W - 1, n=N)
         r = dict(predictor=f"hf_{attn_impl}", engine="huggingface",
                  attn_implementation_requested=attn_impl, attn_implementation_actual=actual,
+                 attn_kernel_verified=False,
+                 attn_kernel_note="只记录并核对了 attn_implementation；"
+                                  "**未**核实 HF 内部实际选中的 kernel"
+                                  "（flash/mem-efficient/cudnn/math）",
                  dtype="bfloat16", load_s=load_s, logits_finite=finite,
                  logit_offset=0, logits_shape=list(logits.shape),
                  **_summarise(nll, ids.to("cuda"), N))
