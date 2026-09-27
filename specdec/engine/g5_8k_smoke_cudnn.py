@@ -186,8 +186,25 @@ def main() -> int:
             _write(rec, run_id)                   # 逐阶段落盘
             return lg, cache                      # 必须原样返回：解码要用 lg 取 saved_next
 
-        orig_prefill = spec_dec._prefill        # 保存后在 finally 里**原样**还原
+        # ---- 阶段标注：**四个入口都要标**（只标 prefill 会让 propose/verify/repair 落进 'other'，
+        #      那样"融合没有进入 verify"就只能靠 fused_by_phase 间接证明，无法给出分阶段 eager 计数）----
+        orig_fns = dict(prefill=spec_dec._prefill, propose=spec_dec._propose,
+                        verify=spec_dec._verify, step=spec_dec._step)
+
+        def propose(*a, **k):
+            with M.attention_phase("propose"):
+                return orig_fns["propose"](*a, **k)
+
+        def verify(*a, **k):
+            with M.attention_phase("verify"):
+                return orig_fns["verify"](*a, **k)
+
+        def step(*a, **k):
+            with M.attention_phase("repair"):
+                return orig_fns["step"](*a, **k)
+
         spec_dec._prefill = prefill             # harness 侧标注阶段（不改 spec_dec.py）
+        spec_dec._propose, spec_dec._verify, spec_dec._step = propose, verify, step
         rounds: list[dict] = []
         try:
             torch.cuda.synchronize()
@@ -198,7 +215,9 @@ def main() -> int:
             torch.cuda.synchronize()
             wall = time.perf_counter() - t1
         finally:
-            spec_dec._prefill = orig_prefill
+            spec_dec._prefill = orig_fns["prefill"]
+            spec_dec._propose, spec_dec._verify, spec_dec._step = (
+                orig_fns["propose"], orig_fns["verify"], orig_fns["step"])
 
         mem("after_decode", rec)
         rec["stage_decode_done"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())

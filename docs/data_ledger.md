@@ -1609,6 +1609,71 @@ v_fp8 略降 NLL（方向一致但样本仅 128 token）。
 
 **4. 本轮未做的其它事**：不启动正式性能矩阵、不做重复稳定性、不做参数搜索、不改 chunk/k/dtype/量化/cache/logits。
 
+### 4.26 受控 8K 双模型 smoke：**两档均单次完成**（2026-09-27，分页文件激活后，**默认 16 GiB 护栏、无覆盖**）
+
+**环境前提（本机自查，不沿用任何转述数字）**：`C:\pagefile.sys` 8192 MiB（在用 78 MiB）、
+`D:\pagefile.sys` 16384 MiB ⇒ **commit 上限 39.6 → 55.64 GiB**，可用 **37.0 GiB**；
+默认护栏 `P5V_MIN_COMMIT_GIB=16` 直接通过（结果 JSON 中 `overridden=False`）。
+GPU：8188 MiB 总量 / 空闲 7513 MiB / 其它 C+G 进程 20 个；P-state 合格（sm 2385–2467 MHz）。
+git `a7c8677` 干净。**未下调护栏、未杀进程、未改系统配置、未同时跑其它 GPU 实验。**
+⚠️ pagefile 激活状态**不是**持久保证：任务方明确指出"启动时未自动激活的原因尚不明确，
+重启后需重新确认，不能假设永久修复"。
+
+**执行**：三次**独立进程、串行、各一次**（`scripts\run_g5_attn_forensics.cmd smoke`，**不传第 2 个参数**）
+
+| # | 条件 | ctx | chunk/k/max_new | target KV | 结果 |
+| --- | --- | --- | --- | --- | --- |
+| 1 | 短排练 | 512 | 2048/4/4 | base_bf16 | 完成（exit 0） |
+| 2 | 8K smoke A | 8192 | 2048/4/16 | base_bf16 | **完成（exit 0）** |
+| 3 | 8K smoke B | 8192 | 2048/4/16 | **v_fp8**（draft 固定 base） | **完成（exit 0）** |
+
+**结果（全部字段来自落盘 JSON；三轮均 `default_strategy_at_start=eager`、
+`diag_precision={'qk_fp32': False, 'prob_fp32': False}`、`profiler_used=False`）**
+
+| 量 | 排练 ctx=512 | 8K base_bf16 | 8K v_fp8 |
+| --- | --- | --- | --- |
+| 权重逐位校验 | 338+290 ✓ | 338+290 ✓ | 338+290 ✓ |
+| 输入 hash | `49ea7dbe1395d898` | `bf6a34a82018fd39` | 同左（同一输入） |
+| 生成数 / 在词表内 / logits 有限 | 4 / ✓ / ✓ | **16 / ✓ / ✓** | **16 / ✓ / ✓** |
+| `fused_by_phase` | `{'prefill': 52}` | **`{'prefill': 208}`** | **`{'prefill': 208}`** |
+| `eager_by_phase` | `{propose:96, verify:28, repair:52}` | `{propose:432, verify:140, repair:52}` | 同左 |
+| `s_max_by_phase` | `{prefill:512, propose:1, verify:4, repair:1}` | `{prefill:2048, propose:1, **verify:4**, repair:1}` | 同左 |
+| `dispatch_only_prefill` | True | **True** | **True** |
+| 逐轮不变量 | all_ok（1 轮） | **all_ok（5 轮）** | **all_ok（5 轮）** |
+| 最终 cache 长度 tgt/drf | 516 / 516 | **8208 / 8208** | **8208 / 8208** |
+| peak allocated / reserved | 4594.3 / 4874.0 MiB | **6902.4 / 7296.0 MiB** | **6847.1 / 7178.0 MiB** |
+| 物理线 8188 MiB | ✓ | **✓ 达标** | **✓ 达标** |
+
+- 计数自洽：`fused=208=(28+24)×4 块`；`propose=432=18 次 draft 步×24 层`；`verify=140=5 轮×28 层`；
+  `repair=52=28+24`（**仅 r1 一轮 `m<Kp`**）。
+- **关键安全性质**：`verify` 的 `s_max=4`（多 token 候选验证）而 **fused 计数为 0**
+  ⇒ **融合没有进入验证阶段**。
+- 逐轮（两档相同）：`pre 8192→8196→8198→8202→8206`，`(Kp,m)` = `(4,4)(4,1)(4,4)(4,4)(2,2)`，
+  `tgt_len==drf_len==pre+(m+1 if m<Kp else Kp)` 全 ✓。
+- **两档生成的 16 个 token id 完全相同** —— 这是**事实观察**（单 prompt、16 token），
+  **不**构成"v_fp8 与 base 等价"的结论。
+- v_fp8 峰值 reserved 比 base **低 118 MiB**（7178 vs 7296）；两档 `after_decode` 时
+  `cuda_free=0.0 MiB`、设备侧占用 7845/7727 MiB（**设备已满，但没有 OOM**）。
+
+**⚠️ 口径纪律（必须随数字引用）**
+1. **"smoke 通过"仅表示：该配置单次跑完、结构检查与有限性检查通过。**
+   **不**代表 AR/SpecDec 严格等价、**不**代表质量无损、**不**代表重复稳定、**不**代表性能加速。
+2. **阶段时间仅作诊断**（含插桩）：target/draft prefill 3.22/2.34 s（base）、3.09/2.34 s（v_fp8），
+   总 prefill 5.55/5.42 s，wall 6.58/6.51 s。**禁止**据此与历史 8K 数字（§4.19 的 28–36 s）说成
+   "加速 x 倍"——工具、插桩、并发占用、decode 长度均不同。
+3. `allocated` ≠ 整卡物理占用；`reserved` 超显存**不单独**证明分页。
+4. 本轮**不是**新质量验收、**不改变**旧 FAIL（旧 eager 对齐门仍 FAIL）、**未采用**任何未经批准的新判据。
+5. `lowmem_load` 是相对共享 `load_ours` 的**受控替代**（只改"何时转 bf16"，终点权重与 HF state dict
+   **逐位相同** 338+290），把加载需求从 ~9.1–9.6 GiB 降到 ~5.7 GiB。**未改** chunk/k/dtype/量化/cache/logits/allocator。
+
+**过程记录（如实）**：首次 512 排练（`smoke512_20260927T122151Z.log`）暴露**我自己工具的一处缺口**——
+smoke 只标注了 `_prefill`，使 `propose/verify/repair` 落进 `'other'` 相位
+（`仅prefill融合=False`、`eager_by_phase={'other':176}`）。**引擎无问题**
+（`fused_by_phase={'prefill':52}` 仍正确），是标注不全导致分相位计数无法举证。
+已修（四个入口全部标注，与其它工具一致）并**重跑排练**确认（`smoke512_20260927T122317Z.log`，
+`仅prefill融合=True`）后才推进 8K。`output/g5/attn/` 下三次运行的 JSON 与日志全部保留
+（含此前被护栏拒绝与失败的历史记录，未删除）。
+
 ## 5. 复现设置（每次记录必须带上）- seed=42（测试）；性能脚本 seed=0，3 reps 取最优 + warmup；
 - prompt 固定（bench_basic.PROMPT，38 tok）；decode 数 64；
 - dtype/设备随行标注（fp32/CPU、fp16/CUDA）；attn eager；no_grad；
