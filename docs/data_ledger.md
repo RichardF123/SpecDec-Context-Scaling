@@ -2060,6 +2060,69 @@ P-state `qualified=True`；生产精度（`qk_fp32=False, prob_fp32=False`）；
 该 run 的 `capture_check.all_match=True`，即捕获成功但**未生成成功结论**）；
 同 tag 另两个产物一并作废，避免混用代码状态。
 
+### 4.32 QK FP32 最小精度干预测试：控制组 vs 干预组（8 次完整 64-token 生成，2026-09-28）
+
+**目的**：仅把 **target** 的 QK 打分改 fp32（`DIAG_QK_FP32`）能否改善 8K 下 AR 与 SpecDec 的输出不一致。
+
+**先检查（CPU，未上 GPU）：开关实际改变什么**
+- **影响计算的读取点只有 1 处**，在 `QwenLM.forward` 的 **eager 分支**（`model_self.py:411`）；
+  `diag_precision()` 里那处只是状态读取器。AST 扫描 + 自测断言。
+- 改变：`matmul(q,kᵀ)` 与 `1/sqrt(head_dim)` 缩放改 fp32 ⇒ softmax 的**输入**不再是 bf16 舍入后的 scores。
+- **不变**：softmax 本身（本来就 float32）、`attn→bf16` 回转、AV matmul、`o_proj`/MLP/RMSNorm/lm_head/
+  权重/缓存 dtype、并列规则、验收阈值。**输出 dtype 不变（仍 bf16）**。
+- **融合 prefill 绕过该开关**：`_fused_prefill_attention` 源码里没有该开关名；`decide_attention_path`
+  仅当 `phase=="prefill"` 且 `s>=2` 才返回 `fused`。⇒ 生效阶段 = target 的 **decode/verify/repair**。
+  **不是全链路升精度**；未为启用开关而换 backend（仍 `cudnn_prefill`）。
+- 开关原是**模块级全局**、无 per-model 作用域。新增 `diag_qk_scope.QKScopeHook`（包 `QwenLM._run`，
+  按模型实例逐次开关、异常也复位），**未改 `model_self.py`**；`qk_scope_selftest_cpu.py` **36 PASS / 0 FAIL**。
+
+**运行**：ctx=8192、chunk=2048、**max_new=64**、**k=4**、greedy；输入 hash `bf6a34a82018fd39`；
+target KV ∈ {base_bf16, v_fp8}、draft KV=`base_bf16`；tag `qk32c_20260928T025500Z`；
+每步独立进程、串行、无重试循环；`overridden=False`；**无性能测量**。
+
+**控制组原样复现**：4 条序列与原 64-token 失败实验的 4 份原始 run **逐 token 完全相同**，
+峰值显存也相同 ⇒ 复现无问题，可归因于干预。
+
+**结果表（控制组 vs 干预组）**
+
+| KV | 组 | AR↔Spec 共同前缀 | 首个分歧 | AR token | Spec token | 判定 |
+| --- | --- | --- | --- | --- | --- | --- |
+| base_bf16 | control | **31** | 31 | **1083** | **5880** | 复现已知分歧 |
+| base_bf16 | qk32 | **52** | 52 | **279** | **64871** | **分歧推迟（+21），部分改善≠PASS** |
+| v_fp8 | control | **31** | 31 | **5880** | **1083** | 复现已知分歧 |
+| v_fp8 | qk32 | **58** | 58 | **16** | **15** | **分歧推迟（+27），部分改善≠PASS** |
+
+**作用域落地（任务硬要求）**：干预组 target 开关**全开**（`calls_target == flag_on_calls`：
+67/67、33/33、67/67、31/31），draft **全关**（`calls_other == flag_off_calls`：0/93、0/86）；
+控制组全关。峰值 alloc/reserved 与历史逐位相同，未抬高 reserved。
+
+**决策行（同共同前缀、两侧 input_position 相同）**
+- 先核对 `_verify` 位置语义 `argmax(rows[j-1]) == g[j]`：4 份 spec run 共 **229 项 / 0 不一致**。
+- **必须区分"该位置存在一行"与"该行真的决定了输出"**：某轮被否决(`m<Kp`)后其后续行**被丢弃**；
+  首版分析误用了这种行（把 base idx52 的 Spec 行报成 `verify_rows[14][2]` argmax=1084），
+  已改为按 `rounds[].emitted` 定位槽位，槽位 0 的行由 `saved_next`（上一轮 `m==Kp ? rows[Kp-1] : repair 行`）**重建**。
+  - base/control idx31：AR 单步@8222 argmax **1083** 并列`[1083,5880]` margin=0 ↔ Spec `rows[0]`@8222 argmax **5880** margin **0.125**
+  - base/qk32 idx52：AR 单步@8243 argmax **279** 并列`[279,64871]` margin=0 ↔ Spec saved_next(repair)@8243 argmax **64871** margin **0.125**
+  - v_fp8/control idx31：AR@8222 argmax **5880** 并列`[5880,22909]` margin=0 ↔ Spec `rows[0]`@8222 argmax **1083** 三并列 margin=0
+  - v_fp8/qk32 idx58：AR@8249 argmax **16** margin **0.125** ↔ Spec saved_next@8249 argmax **15** 并列`[15,16]` margin=0
+- 干预后 **index 31 不再分歧**（两档 AR=Spec=5880）；**残余分歧与 idx31 同形态**：
+  一侧顶部**精确并列**、另一侧不并列。
+
+**干预改变了参考生成（不可含糊）**：base AR 首个差异位置 **31**（1083→5880）、Spec **34**（23→16）；
+v_fp8 AR **34**（23→16）、Spec **31**（1083→5880）。
+⇒ **"新精度下 index 31 对齐"不得写成"原配置原样通过"**；QK FP32 产出的是**另一条**轨迹。
+无 fp64 真值 ⇒ **不能**说新轨迹更正确，只能说两路径数值在 fp32 QK 下**更久落在同一侧**。
+
+**结论**：两档均为 `DIVERGENCE_POSTPONED_PARTIAL_NOT_PASS` —— **部分改善，不是 PASS**。
+按判读规则本轮**停止**：未扩展全模型 FP32、未换 backend、未堆叠其它精度开关、未改并列规则或验收协议。
+**正确性阻塞未解除**：分歧仍在；参考生成被改变；融合 prefill 仍 bf16（链路仍混合精度）；
+干预会改变生产输出。
+
+**保留的失败记录（不覆盖）**：tag `qk32_20260928T010000Z`
+`control_base_bf16_spec_20260928T023107Z.json`（`_verify_spy` 形参顺序错 ⇒ `TypeError`）；
+tag `qk32b_20260928T024500Z` `control_base_bf16_ar_20260928T023204Z.json`
+（签名自检误看已被包装的函数 ⇒ `AssertionError`）。二者均为**工具自身缺陷**，各自以新 tag 完整重跑。
+
 ## 5. 复现设置（每次记录必须带上）
 - seed=42（测试）；性能脚本 seed=0，3 reps 取最优 + warmup；
 - prompt 固定（bench_basic.PROMPT，38 tok）；decode 数 64；
