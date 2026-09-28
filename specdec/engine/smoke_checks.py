@@ -234,3 +234,62 @@ def evaluate(*, registry: CheckRegistry, mismatch_rounds: int, weights_ok: bool,
                 n_checks=len(checks), n_required=sum(1 for c in checks if c["required"]),
                 finiteness_coverage=registry.coverage(),
                 rule="只有 passed=True 才允许 exit 0；执行结束(stage=run_ended) ≠ 验证通过")
+
+
+def prefill_finiteness(checks: list, not_applicable: list | None = None) -> dict:
+    """按**实际驻留并执行过** prefill 的模型，汇总 `prefill logits` 的有限性。
+
+    ⚠️ 修正的缺陷（本函数存在的理由）
+        旧汇总写成
+            `all(reg.calls.get(("prefill", m), {}).get("ok", False) for m in ("target","draft"))`
+        **AR 模式不加载 draft** ⇒ `("prefill","draft")` 根本不存在 ⇒ `.get(...,{})` 取到 `False`
+        ⇒ **AR 运行恒定报 `prefill_logits_finite=False`**，而同一份记录里
+        `checks.passed=True`、`uncovered=[]`、`failures=[]`、且 `finiteness:prefill/draft`
+        明确列在 `not_applicable` 里 —— 三者自相矛盾。
+        **未驻留的模型是 not_applicable，不是失败。**
+
+    语义：对每个**执行过** prefill 的模型要求 `ok is True`；未执行（未驻留）的记为
+    `not_applicable` 并**排除**在合取之外；若一个都没执行则返回 False（不能凭"没跑"当通过）。
+    """
+    by_model: dict = {}
+    na: list = []
+    for e in (checks or []):
+        name = e.get("name", "")
+        if name.startswith("finiteness:prefill/"):
+            m = name.split("/", 1)[1]
+            by_model[m] = dict(required=bool(e.get("required")), executed=bool(e.get("executed")),
+                               ok=e.get("ok"), detail=e.get("detail", ""))
+    for name in (not_applicable or []):
+        if name.startswith("finiteness:prefill/"):
+            m = name.split("/", 1)[1]
+            if m not in by_model:
+                na.append(m)
+                by_model[m] = dict(required=False, executed=False, ok=None,
+                                   detail="该模型未驻留（not_applicable）⇒ **不计入失败**")
+    executed = sorted(m for m, v in by_model.items() if v["executed"])
+    all_ok = bool(executed) and all(by_model[m]["ok"] is True for m in executed)
+    return dict(by_model=by_model,
+                executed_models=executed,
+                not_applicable_models=sorted(na),
+                all_executed_ok=all_ok,
+                semantics="只对**实际执行过 prefill** 的模型求合取；未驻留模型记 not_applicable",
+                corrected=True)
+
+
+def prefill_finiteness_live(registry: "CheckRegistry", models) -> dict:
+    """`prefill_finiteness` 的**运行中**入口：直接读 registry，未调用过的模型记 not_applicable。
+
+    `models` 必须传**实际驻留**的模型列表（AR 模式是 `["target"]`），
+    这样 draft 才不会被当成"该跑没跑"。
+    """
+    checks, na = [], []
+    for m in models:
+        slot = registry.calls.get(("prefill", m))
+        if slot is not None:
+            checks.append(dict(name=f"finiteness:prefill/{m}", required=True, executed=True,
+                               ok=bool(slot.get("ok")), detail=f"调用 {slot.get('n')} 次"))
+        else:
+            na.append(f"finiteness:prefill/{m}")
+    return prefill_finiteness(checks, na)
+
+

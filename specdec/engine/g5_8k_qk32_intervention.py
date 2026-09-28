@@ -39,7 +39,8 @@ from . import diag_qk_scope as QS
 from . import model_self as M
 from . import spec_cache
 from . import spec_dec
-from .smoke_checks import CheckRegistry, evaluate, verify_decision_coverage
+from .smoke_checks import (CheckRegistry, evaluate, prefill_finiteness_live,
+                           verify_decision_coverage)
 from .smoke_hooks import DecisionHooks
 from . import g5_8k_spec_variance_probe as P5V
 
@@ -301,11 +302,17 @@ def main() -> int:
                        and all(fused_by_phase.get(p, 0) == 0
                                for p in ("propose", "verify", "repair", "decode")))
         rec["rounds"] = rounds
+        # ⚠️ 修正：旧写法 `all(reg.calls.get(("prefill", m), {}).get("ok", False)
+        #                    for m in ("target","draft"))` 会把"draft 未驻留 ⇒ 该检查不存在"
+        # 当成失败 ⇒ **AR 恒报 False**（与同记录的 checks.passed=True 自相矛盾）。
+        # 现在只对**实际驻留并执行过** prefill 的模型求合取，未驻留记 not_applicable。
+        pf_finite = prefill_finiteness_live(reg, rec["resident_models"])
         rec["run"] = dict(
             gen=gen, gen_len=gen_len, max_new=MAXNEW, eos_id=eos_id, stop_reason=stop_reason,
             gen_ids_in_vocab=bool(all(0 <= g < vocab for g in gen)),
-            prefill_logits_finite=all(reg.calls.get(("prefill", m), {}).get("ok", False)
-                                      for m in ("target", "draft")),
+            prefill_logits_finite=pf_finite["all_executed_ok"],
+            prefill_logits_finite_by_model=pf_finite,
+            prefill_logits_finite_semantics=pf_finite["semantics"],
             attention_ok=attn_ok, attention_stats=a_stats,
             dispatch_only_prefill=dispatch_ok,
             wall_s=wall, specdec_stats=out["stats"],

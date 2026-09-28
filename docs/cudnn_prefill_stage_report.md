@@ -1237,3 +1237,113 @@ tag `qk32c_20260928T025500Z`；每步**独立进程、串行、无重试循环**
 才能回答"是消除成因还是移动交点"。
 **不**因此扩展全模型 FP32、**不**换 backend、**不**堆叠其它精度开关、**不**启动正式矩阵。
 
+## 9.20 两处收尾：(a) `prefill_logits_finite` 汇总缺陷修正，(b) base_bf16 残余分歧的缓存历史单变量探针（2026-09-28）
+
+### 9.20.1 修正 `prefill_logits_finite` 的 AR 误报
+
+**缺陷**：汇总写成
+```python
+prefill_logits_finite = all(reg.calls.get(("prefill", m), {}).get("ok", False)
+                            for m in ("target", "draft"))
+```
+**AR 模式不加载 draft** ⇒ `("prefill","draft")` 根本不存在 ⇒ `.get(...,{})` 取到 `False`
+⇒ **所有 AR 运行恒报 `prefill_logits_finite=False`**。而同一份记录里 `checks.passed=True`、
+`uncovered=[]`、`failures=[]`，且 `finiteness:prefill/draft` 明确列在 `not_applicable` —— **自相矛盾**。
+**未驻留的模型是 not_applicable，不是失败。**
+
+**修法**：新增 `smoke_checks.prefill_finiteness(checks, not_applicable)` 与
+`prefill_finiteness_live(registry, models)`，只对**实际执行过** prefill 的模型求合取；
+未驻留记 `not_applicable_models` 并排除在外；**一个都没执行 ⇒ False**（不能凭"没跑"当通过）。
+`g5_8k_qk32_intervention.py` 与 `g5_8k_smoke_cudnn.py` 均已改用该函数，
+并在 `run` 里新增 `prefill_logits_finite_by_model` 记录逐步依据。
+回归自测 `prefill_finite_selftest_cpu.py`：**15 PASS / 0 FAIL**（含"真失败仍须被抓住"与"空记录不得判通过"）。
+
+**修订分析（不覆盖原 JSON）**：`g5_8k_prefill_finite_revise.py` 从已有记录重算，产出
+`output/g5/attn/qk32c_20260928T025500Z_prefill_finite_revision_20260928T151333Z.json`：
+
+| 组/KV/模式 | 旧值 | 新值 | checks.passed | 执行过 prefill 的模型 | not_applicable |
+| --- | --- | --- | --- | --- | --- |
+| control/base_bf16/ar | **False** | **True** | True | target | draft |
+| control/v_fp8/ar | **False** | **True** | True | target | draft |
+| qk32/base_bf16/ar | **False** | **True** | True | target | draft |
+| qk32/v_fp8/ar | **False** | **True** | True | target | draft |
+| 4 个 spec run | True | True | True | draft, target | — |
+
+⇒ 8 份里 **4 份发生变化**，且**旧值全部与 `checks.passed` 矛盾**；修正后 8/8 一致。
+**原 JSON 一律未改动**（本文件是修订分析，供引用）。
+
+### 9.20.2 探针：只改变缓存历史，是否足以复现不同 argmax？
+
+**只定位 base_bf16 干预组的新分歧**：生成 index **52**、输入位置 **8243**
+（tag `qk32c_20260928T025500Z`/`qk32` 组：AR=**279**、Spec=**64871**）。
+**不做**泛化 2×2、**不扩展** v_fp8、**不改** backend、**不缩短** max_new=64、不改算法或验收标准。
+
+**为什么这个对照是干净的（全部逐项核对，`compare` 阶段输出 `all_controls_equal=true`）**
+
+| 控制量 | AR 侧 | SpecDec 侧 | 一致 |
+| --- | --- | --- | --- |
+| 前向入口 | `spec_dec._step` | `spec_dec._step` | ✔ |
+| 当前 token | 323（`gen[51]`） | 323（上一轮 `g[0]`） | ✔ |
+| 该 token 的位置 | 8243 | 8243 | ✔ |
+| 送入前 cache 长度 | 8243 | 8243 | ✔ |
+| 预测位置 / 生成 index | 8244 / 52 | 8244 / 52 | ✔ |
+| 精度 | target-only QK FP32 | target-only QK FP32 | ✔ |
+
+`_step` 的函数体是 `model._run(model.embed_tokens([[token]]), cache, need_logits=True)`，
+与 AR 解码单步（`g5_8k_smoke_cudnn` 的 AR 循环）**是同一个表达式** ⇒ 两次重放用的是**同一个单 token 前向入口**。
+共同前缀由捕获断言核对：AR 自由轨迹前 52 个 token 与参考逐 token 一致；SpecDec 捕获轮
+`round/Kp/候选/g/emitted` 与参考 round 15 全字段一致（`all_match=true`），本轮自身 emitted 前 52 个也一致。
+
+**先证明重放匹配真实行，再判断**
+
+| 侧 | 真实行来源 | 真实行 argmax | 重放 argmax | 重放 vs 真实 | 快照完整性 |
+| --- | --- | --- | --- | --- | --- |
+| AR | 真实 decode 单步（`tgt._run` 单 token） | **279** | **279** | `elementwise_equal=True`，max\|Δ\|=**0.0** | `all_equal=True`，56 张量，独立副本 |
+| SpecDec | 真实 target repair（`_step`） | **64871** | **64871** | `elementwise_equal=True`，max\|Δ\|=**0.0** | `all_equal=True`，56 张量，独立副本 |
+
+**结论**
+
+| 量 | AR 缓存 | SpecDec 缓存 |
+| --- | --- | --- |
+| 重放行 argmax | **279** | **64871** |
+| `max_score` | 20.75 | 20.875 |
+| 顶部并列集合 | **`[279, 64871]`（2 并列）** | `[64871]`（不并列） |
+| `margin_top1_top2` | **0.0** | **0.125** |
+
+- 两份缓存：`all_equal=False`、**max\|Δ\|=0.375**（bf16 原始载荷，56 个张量）。
+- 两行：`elementwise_equal=False`、`argmax_same=False`、max\|Δ\|=0.25。
+- **`VERDICT = HISTORY_ALONE_SUFFICES`** —— 在**同一位置、同一当前 token、同一精度、同一前向入口**
+  之下，**只把缓存从 AR 历史换成 SpecDec 历史，就足以复现不同的 argmax**。
+- 机制与 index 31 同类：**一侧顶部精确并列、另一侧不并列**（此处并列在 AR 侧）；
+  AR 侧 279 与 64871 精确相等（均 20.75）⇒ `argmax` 取较小下标 **279**；
+  SpecDec 侧两者被分开（64871=20.875，margin 0.125）⇒ 取 **64871**。
+- 与 index 31 的差别：那里 AR/Spec 的**决策行形状**并不总是相同（SpecDec 侧可能是块行），
+  而这里**两侧形状完全相同（都是 s=1 单步）** ⇒ 残余分歧**不需要**形状效应来解释，
+  **缓存历史的数值差 + 顶部并列的 tie-break** 就够了。
+
+**边界（不得外推）**：本探针只回答 base_bf16 / index 52 / 这一组缓存。
+它**不**说明 v_fp8 的 index 58 成因相同，**不**说明"缓存历史是唯一成因"，
+也**不**给出并列发生频率。修好并列 tie-break 或提高缓存精度是否能把分歧消掉，**本轮未测**。
+
+### 9.20.3 本轮修正的两处自身缺陷（保留记录）
+
+1. `reshist_20260928T152000Z_base_bf16_ar_20260928T151621Z.json`（`stage=crashed`）：
+   `dict(**compare_rows(...), note=...)` 撞键 —— `compare_rows` 已含 `note`，
+   报 `TypeError: dict() got multiple values for keyword argument 'note'`。
+   改用 `dict(...)` + `update()`；并全仓扫描同类写法（`g5_8k_divergence_2x2.py` 早已是正确写法）。
+2. `reshistb_20260928T153000Z_base_bf16_spec_*.json`（`stage=crashed`）：
+   `_run_spec` 在 `main()` 已安装 `DecisionHooks` 的情况下**又装了一份**；
+   而 `smoke_hooks._HOOK_REGISTRY` 以**类**为键，第二份覆盖第一份 ⇒
+   `_run_hook → qk._wrapper → _run_hook(第二份) → _wrapper → …` **无限递归**
+   （`RecursionError`）。改为**不重复安装**，捕获逻辑放进 `_verify_spy`。
+3. 另修一处**误标**：`repair_cache_len_before` 原先在调用 `_step` **之后**读取，
+   而 `_step` 会就地追加 token ⇒ 记成 8244；已在调用前读取并新增 `repair_cache_len_after`。
+   本轮结论依赖的是 `trimmed_to=8243` 与 `cross_check_vs_pre_verify_snapshot` 的
+   `all_equal=True, max|Δ|=0`，不依赖那个被误标的字段。
+
+**运行纪律**：每步独立进程、串行、无重试循环；`overridden=False`（可用 ≈29.4–29.5 GiB ≥ 16 GiB）；
+生产精度仅 target 打开 QK FP32（`flag_on_calls == calls_target`，draft 全关）；**未做性能测量**。
+
+**原始结果**：`output/g5/attn/reshistc_20260928T154500Z_base_bf16_{ar,spec,compare}_*.json`
++ `.cache.pt` / `.rows.pt` + 日志；失败记录见 9.20.3，**一律保留未覆盖**。
+

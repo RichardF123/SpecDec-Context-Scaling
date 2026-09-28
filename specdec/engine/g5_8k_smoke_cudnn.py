@@ -34,7 +34,7 @@ from . import spec_dec
 from . import g5_8k_spec_variance_probe as P5V
 from . import g5_driver as D
 from .smoke_checks import (CheckRegistry, FinitenessError, evaluate,
-                           verify_decision_coverage)
+                           prefill_finiteness_live, verify_decision_coverage)
 from .smoke_hooks import DecisionHooks
 from . import spec_cache
 
@@ -396,14 +396,18 @@ def main() -> int:
             stop_reason = "max_new_reached"
         else:
             stop_reason = "other_short"       # 既没到 max_new 也没 EOS ⇒ 必须判失败
+        # ⚠️ 修正：旧写法把"draft 未驻留 ⇒ 该检查不存在"当成失败 ⇒ **AR 恒报 False**
+        # （与同记录的 checks.passed=True 自相矛盾）。现在只对**实际驻留并执行过** prefill
+        # 的模型求合取，未驻留记 not_applicable。**旧 JSON 不改写**（见修订分析产物）。
+        pf_finite = prefill_finiteness_live(reg, rec["resident_models"])
         rec["run"] = dict(gen=gen, gen_len=gen_len, max_new=MAXNEW, eos_id=eos_id,
                           stop_reason=stop_reason,
                           gen_ids_in_vocab=bool(all(0 <= g < vocab for g in gen)),
                           # 历史字段口径澄清：旧的 `logits_all_finite` **只**覆盖两模型 prefill 的 logits，
                           # 名称夸大覆盖范围 ⇒ 新运行改用下面的显式命名（**旧 JSON 不改写**）
-                          prefill_logits_finite=all(
-                              reg.calls.get(("prefill", m), {}).get("ok", False)
-                              for m in ("target", "draft")),
+                          prefill_logits_finite=pf_finite["all_executed_ok"],
+                          prefill_logits_finite_by_model=pf_finite,
+                          prefill_logits_finite_semantics=pf_finite["semantics"],
                           prefill_s=acc.get("t"),
                           prefill_target_s=acc.get("target"), prefill_draft_s=acc.get("draft"),
                           stage_prefill_s=rec.get("stage_flags"),
