@@ -64,7 +64,11 @@ def compare_rows(a: torch.Tensor, b: torch.Tensor) -> dict:
     finite = bool(torch.isfinite(x).all() and torch.isfinite(y).all())
     out = dict(abs_err_max=float(d.max()), abs_err_mean=float(d.mean()),
                abs_err_p99=float(torch.quantile(d, 0.99)) if d.numel() else None,
-               finite=finite, argmax_same=bool(int(torch.argmax(x)) == int(torch.argmax(y))))
+               finite=finite, argmax_same=bool(int(torch.argmax(x)) == int(torch.argmax(y))),
+               # ⚠️ `argmax_same=True` **不能**代替"两行相同"：必须显式给出逐元素相等
+               elementwise_equal=bool(torch.equal(x, y)),
+               n_elements_raw=int(a.numel()),
+               note="`argmax_same` 只说明两者取到同一下标；逐元素是否相同看 `elementwise_equal`")
     if finite:
         ulp = bf16_ulp(x)
         # ⚠️ **近零元素的 ULP 不是有意义的尺度**：x_i≈0 时相邻间距也≈0，

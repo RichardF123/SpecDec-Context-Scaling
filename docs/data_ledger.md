@@ -1978,7 +1978,90 @@ target KV = base_bf16 或 v_fp8，draft 恒 base_bf16，策略 `cudnn_prefill`�
 日志同目录 `div2x2_*.log`。旧一轮定点诊断 `divdiag_base_bf16_20260927T233506Z.json`
 **保留不动**（其字段口径已被本轮更正）。
 
-## 5. 复现设置（每次记录必须带上）- seed=42（测试）；性能脚本 seed=0，3 reps 取最优 + warmup；
+### 4.31 修正 2×2 诊断的实验配置与快照校验后重跑（base_bf16 + v_fp8，2026-09-28）
+
+**本节更正 §4.30 的两处证据缺陷（§4.30 原文保留、不覆盖）**
+
+1. **生成预算改变了被诊断的计算形状**：§4.30 的 `run_spec` 用 `max_new=32`（原实验 **64**）。
+   目标轮前已生成 30 token ⇒ `k_eff = min(4, 32−30) = **2**`，而对照重放用**硬编码的 4 候选**
+   ⇒ **实际执行的是 Kp=2 的块**。证据就在原 JSON 里（未改动）：
+   v_fp8 `spec_actual_rows0.argmax_id=**5880**`、`cells.block.argmax_id=1083`、
+   `spec_actual_vs_replayed_block.argmax_same=**false**`。
+   ⇒ **§4.30 把"Kp=4 重放行"标成"实测 `rows[0]`"是错的**；「两档实测输出都被精确复现」的说法**作废**。
+   （数值 1083 本身没错，它对应的是**原 64-token 实验**真正执行的 Kp=4。）
+   另：§4.30 称"两档的并列**不是**同一对候选"仍然成立（base AR×single 并列 `[1083,5880]`；
+   v_fp8 AR×single 并列 `[5880,22909]`；v_fp8 Spec×block 三并列 `[1083,5880,22909]`）。
+2. **快照校验是空证据**：§4.30 的参照是**浅 dict 拷贝**（张量共享）⇒
+   `torch.equal(snap_ref[i]['k'], snap[i]['k'])` 比的是**同一对象**、**恒为真**，
+   且只覆盖 `k`/`v`、漏掉 `v_scale`/`fmt`/层数/长度。
+   ⇒ `snapshot_unchanged_all_layers=True` **不构成证据**（这属于**证据不足**，
+   **不代表**已经发现缓存污染）。
+3. 另更正一处口径：§4.30 的 v_fp8 历史差 `1.0625` 用的是 **bf16** 反量化；
+   改用 **float32** 后为 **1.0089292526245117**（float32 下 `q*scale` 精确可比，是更可靠的口径）。
+
+**新增工具与轻量测试（全部 exit 0）**
+- `diag_cache_cmp.py`：`deep_clone`（逐张量独立副本）、`shallow_clone`（保留旧行为供对照）、
+  `compare_caches`（全层全键 + `fmt` + 层数 + 长度；`dequant_dtype` 默认 float32）、
+  `integrity_check`、`metadata`（**全层**）。CPU 自测 **28 PASS / 0 FAIL**，其中专门证明：
+  ★ 浅拷贝参照**检不出**原地修改（all_equal 恒 True）；deep_clone 参照**能**检出原地修改（max\|Δ\|=7.0）、
+  键重绑、**只改 `v_scale`**、`fmt`/层数/长度/dtype/shape 变化；
+  ★ e4m3 在 ~288 处相邻间距为 32 ⇒ "载荷 +1"是**无效突变**（会被舍入回原值，第一版自测就踩了这个坑）。
+- `g5_8k_divergence_2x2.py` **v2**：`max_new=64`/`k=4` + 捕获 hook 停止（`stop_policy` 记录）；
+  `capture_verdict` 逐字段断言；重放用**捕获到的真实候选**；`real` / `single` / `block` 与
+  更短候选的 **`is_real_executed_row=False`** 额外对照；完整 logits 落盘；
+  AR 侧改**自由生成**并逐步交叉核对。CPU 自测 **22 PASS / 0 FAIL**（含"Kp=2 ⇒ all_match=False"、
+  "`argmax_same=True` 但 `elementwise_equal=False`"、"并列 `margin_top1_top2=0` 而
+  `gap_to_next_distinct` 不为 0"）。
+- `diag_fields.compare_rows` 新增 `elementwise_equal`（**不得**以 argmax 相同代替逐元素相同）。
+
+**本次定点诊断结果（tag `div2x2v2b_20260928T004000Z`）**
+
+| KV | max_new/k | 捕获 round/pre/Kp | 候选 | `g` | all_match | run_id |
+| --- | --- | --- | --- | --- | --- | --- |
+| base_bf16 | **64/4** | 8 / 8222 / **4** | [572,5230,304,279] | [572,**5880**,304,279] | **True** | spec 20260928T003353Z |
+| v_fp8 | **64/4** | 8 / 8222 / **4** | [572,5230,304,279] | [572,**1083**,304,279] | **True** | spec 20260928T003459Z |
+
+- **实测行 vs Kp=4 重放行**：两档都 `elementwise_equal=True`、`max|Δ|=0.0`、`argmax_same=True`
+  ⇒ 重放正确，且 `on_verify_pre` 的快照**未被 `_verify` 的就地改写污染**。
+- **2×2（输入位置 8222 / 预测 token 位置 8223 / 生成 index 31）**
+  - base：AR×single = **1083**（`tied=2 [1083,5880]`，`margin_top1_top2=0`）= 实测 AR g31 ✓；
+    Spec×block = **5880** = 实测 Spec g31 ✓；AR×block = 5880；Spec×single = 5880。
+  - v_fp8：AR×single = **5880**（`tied=2 [5880,22909]`，margin 0）= 实测 AR g31 ✓；
+    Spec×block = **1083**（**三并列** `[1083,5880,22909]`，margin 0）= 实测 Spec g31 ✓；
+    AR×block = 5880；Spec×single = 5880。
+- **形状效应（逐元素）**：4 种组合 `elementwise_equal` **全为 False**（max|Δ| 0.15625 / 0.21875 /
+  0.2109375 / 0.1875），但只有 base×AR 与 v_fp8×Spec **翻转 argmax**；
+  另两格 argmax 相同而行不同 ⇒「argmax 相同」不能当作"形状无影响"。
+- **cache 历史效应**：base 56 个张量**无一逐位相同**（max|Δ|=**0.6259765625**；k 0.626 / v 0.281）；
+  v_fp8 84 个里**仅 1 个**逐位相同（max|Δ|=**1.0089292526245117**；k 0.5 / v 1.009 / v_scale 4.19e-4）。
+  层数/长度/dtype/shape 全一致（`structural=[]`）⇒ 差异是数值层面的，不是结构错配。
+- **快照完整性（有效口径）**：四个 run 全部 `all_equal=True`、`max|Δ|=0.0`、
+  `shapes_are_independent_copies=True`、`master_vs_workcopy_shared_storage=False`
+  ⇒ single/block **互不污染**得到可失败的检验。
+- **AR 轨迹**：自由生成（`teacher_forced=False`），30 步与来源轨迹**逐步一致**、`n_steps_disagreeing=0`。
+- **额外对照（更短候选）**：base×AR 的 Kp=2/3 与 Kp=4 的 `rows[0]` **逐元素相同**（max|Δ|=0），
+  而 base×Spec、v_fp8×AR、v_fp8×Spec 则不同（0.0625–0.25）。
+  ⇒ **"形状效应"不是简单的 s=1 vs s=4**；机制未定位，列为**未解释项**。这些格 `is_real_executed_row=False`。
+
+**三档分类（严格）**
+- **已确认**：捕获条件与原实验逐字段一致且实测 Kp=4；实测行与重放逐元素相等；形状效应存在；
+  同前缀两条路径的 cache 不逐位相同；AR 是真实轨迹；快照完整性在有效口径下通过。
+- **支持但未证实**：1083 恰好出现在"有顶部并列"的两格且 `argmax` 取较小下标（缺 fp64 真值、缺并列频率普查）；
+  "两条路径 cache 差来自各自历史"（缺**交叉喂 cache 的因果分离实验**，故形状/历史不能拆成可加贡献）。
+- **尚未排除**：为何某些格恰好精确并列；为何块长度敏感性在 base×AR 下为 0；非注意力部分
+  （MLP/RMSNorm/lm_head）在两种形状/两段历史下是否逐位一致（**未验证**）；
+  是否所有后端/路径都不做就地张量改写（本轮只核对该诊断路径）。
+
+**运行纪律**：每步独立进程、串行、**无重试循环**；`overridden=False`（可用 ≈33.5–33.7 GiB ≥ 16 GiB）；
+P-state `qualified=True`；生产精度（`qk_fp32=False, prob_fp32=False`）；**不做性能测量**。
+**保留的失败记录（不覆盖）**：tag `div2x2v2_20260928T001500Z` 的
+`base_bf16_spec_20260928T003222Z.json`（`stage="crashed"`，
+`TypeError: dict() got multiple values for keyword argument 'note'`，工具自身缺陷；
+该 run 的 `capture_check.all_match=True`，即捕获成功但**未生成成功结论**）；
+同 tag 另两个产物一并作废，避免混用代码状态。
+
+## 5. 复现设置（每次记录必须带上）
+- seed=42（测试）；性能脚本 seed=0，3 reps 取最优 + warmup；
 - prompt 固定（bench_basic.PROMPT，38 tok）；decode 数 64；
 - dtype/设备随行标注（fp32/CPU、fp16/CUDA）；attn eager；no_grad；
 - 待补：torch/transformers 精确版本、nvidia-smi 输出存档。
