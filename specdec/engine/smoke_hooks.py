@@ -74,11 +74,16 @@ class DecisionHooks:
     """
 
     def __init__(self, *, tgt, drf, registry: CheckRegistry, prefill_impl,
-                 on_prefill=None, on_round_start=None, run_owner=None):
+                 on_prefill=None, on_round_start=None, run_owner=None,
+                 on_verify_pre=None, on_verify_post=None):
         self.tgt, self.drf, self.reg = tgt, drf, registry
         self.prefill_impl = prefill_impl
         self.on_prefill = on_prefill
         self.on_round_start = on_round_start
+        # `on_verify_pre(cache, cands)` 在**调用真 `_verify` 之前**触发 —— 这是唯一能拿到
+        # "本轮开始时、未被就地修改过的 target cache"的时机（`_verify` 会就地改写传入的 dict）。
+        self.on_verify_pre = on_verify_pre
+        self.on_verify_post = on_verify_post
         # `_run` hook 装在**哪个类**上：生产用 `QwenLM`；轻量集成测试用 stub 类，
         # 这样测试跑的是**同一套 hook 代码**而无需加载大模型，且完全不碰生产类。
         self.run_owner = run_owner if run_owner is not None else M.QwenLM
@@ -121,8 +126,12 @@ class DecisionHooks:
         self.reg.begin_round()               # 每轮 verify 一次 ⇒ 轮次在此推进
         if self.on_round_start is not None:
             self.on_round_start(self.reg.round)
+        if self.on_verify_pre is not None and len(a) > 2:
+            self.on_verify_pre(a[1], a[2])   # (cache_before_mutation, cands)
         with M.attention_phase("verify"):
             rows, blk = self._orig["verify"](*a, **k)
+        if self.on_verify_post is not None:
+            self.on_verify_post(rows)
         self.reg.check_finite(rows, phase="verify", model="target", role="rows",
                               round_=self.reg.round,
                               where="verify 返回候选行：**紧接**被 argmax 用于接受判断")
