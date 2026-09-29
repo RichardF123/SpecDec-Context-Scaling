@@ -83,7 +83,8 @@ MANIFEST_MACHINERY = {
     "verify_readiness_selftest_cpu.py",   # G1–G5 自测
 }
 # 本轮**新增**的 opt-in 消费方：只有它带 manifest 输入路径，且默认关闭（SMOKE_FAMILY 未设即 legacy）。
-OPT_IN_CONSUMERS = {"g5_8k_smoke_cudnn.py"}
+OPT_IN_CONSUMERS = {"g5_8k_smoke_cudnn.py",      # fam16 授权轮（SMOKE_FAMILY，默认关闭）
+                    "g5_f06_index25_forensics.py"}  # F06/index25 定点取证（固定 family）
 
 
 def _manifest_consumers() -> list:
@@ -132,7 +133,8 @@ def _family_used_in_existing_runs() -> list:
             continue
         inp = j.get("input") or {}
         if inp.get("source_kind") == "manifest" or inp.get("family"):
-            used.append(dict(file=p.name, family=inp.get("family"), kind=inp.get("source_kind")))
+            used.append(dict(file=p.name, family=inp.get("family"), kind=inp.get("source_kind"),
+                             tool=j.get("tool"), run_id=j.get("run_id")))
     return used
 
 
@@ -225,7 +227,7 @@ def main() -> int:
     seen_files = sorted({h["file"] for h in others})
     check("★ 没有**预期之外**的消费方（唯一 opt-in 消费方是 g5_8k_smoke_cudnn.py，默认关闭）",
           not unexpected, unexpected[:5])
-    check("消费方集合 = 预期的 opt-in 集合（时间边界：本轮之前无任何 runner 消费 manifest）",
+    check("消费方集合 = 预期的 opt-in 集合（授权使用之前无任何 runner 消费 manifest）",
           seen_files == sorted(OPT_IN_CONSUMERS), seen_files)
     man_sources = {f["source"] for f in man["families"]}
     check("manifest 声称的 source 全部是 train.raw",
@@ -237,19 +239,24 @@ def main() -> int:
     used = _family_used_in_existing_runs()
     # 本轮（fam16 授权诊断）确实跑了 16 格 family 运行 ⇒ 不能再说"没有任何一条用过"。
     # 正确口径：**本轮之前**一条都没有；**本轮**恰好 16 格。
-    this_round_ids = _this_round_run_ids()
-    this_round = [u for u in used
-                  if u["file"] in {f"smoke8k_cudnn_prefill_{r}.json" for r in this_round_ids}]
-    prior = [u for u in used if u["file"] not in
-             {f"smoke8k_cudnn_prefill_{r}.json" for r in this_round_ids}]
-    check("★ **本轮之前**的 run 记录中没有任何一条使用过 manifest family"
-          "（经验证据：直接看产出，不依赖 import）", not prior, prior[:5])
-    if this_round_ids:
-        check(f"本轮（fam16 授权诊断）恰好 {len(this_round_ids)} 格用了 family（实测 %d）"
-              % len(this_round), len(this_round) == len(this_round_ids),
-              dict(expected=len(this_round_ids), got=len(this_round)))
-    else:
-        check("尚无 fam16 索引（本轮未跑）⇒ 只断言「本轮之前为空」", not prior)
+    # 授权范围 = ① fam16 授权诊断的 16 格；② 之后的 F06/index25 定点取证 run。
+    # 除此之外**不允许**任何 run 消费 family（这才是可长期复用的检查；
+    # "从来没被用过"在授权使用之后已不成立，改为**授权范围校验**）。
+    fam16_ids = _this_round_run_ids()
+    fam16 = [u for u in used
+             if u["file"] in {f"smoke8k_cudnn_prefill_{r}.json" for r in fam16_ids}]
+    authorize_tools = ("g5_f06_index25_forensics",)
+    forensic = [u for u in used if (u.get("tool") or "").startswith(authorize_tools)]
+    authorized_files = {u["file"] for u in fam16} | {u["file"] for u in forensic}
+    outside = [u for u in used if u["file"] not in authorized_files]
+    check("★ **授权范围之外**没有任何 run 消费 manifest family（授权范围 = fam16 16 格 + F06/index25 定点取证）",
+          not outside, outside[:5])
+    if fam16_ids:
+        check(f"fam16 授权轮恰好 {len(fam16_ids)} 格用了 family（实测 %d）"
+              % len(fam16), len(fam16) == len(fam16_ids),
+              dict(expected=len(fam16_ids), got=len(fam16)))
+    check("F06/index25 定点取证的 run 也被识别（tool 前缀）", len(forensic) >= 2,
+          [u["file"] for u in forensic][:4])
 
     out = dict(
         tool="verify_family_independence_cpu",
@@ -277,6 +284,11 @@ def main() -> int:
                           manifest_machinery_allowlist=sorted(MANIFEST_MACHINERY),
                           opt_in_consumers=sorted(OPT_IN_CONSUMERS),
                           family_used_in_existing_runs=used,
+                          family_use_authorization=dict(
+                              fam16_round_cells=len(fam16), forensic_runs=len(forensic),
+                              outside_authorized=[u["file"] for u in outside],
+                              rule="授权范围 = fam16 16 格 + F06/index25 定点取证；"
+                                   "其他任何 run 消费 family 都算越界"),
                           scan_caveat="源码扫描只覆盖本仓库的 specdec/engine 与 scripts；"
                                       "不覆盖仓库外的手工运行，也不构成「从未使用」的证明。"),
         all_16_prefixes_reproduced=not bad,
