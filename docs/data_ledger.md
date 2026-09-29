@@ -2250,6 +2250,64 @@ tag `qk32b_20260928T024500Z` `control_base_bf16_ar_20260928T023204Z.json`
 **(7) 纪律**：本轮**未**修改模型算法、默认 backend/精度、验收门槛或内存护栏；**未**开启新 GPU 测试；
 **未**宣布正式实验获准启动；旧数据一律保留未覆盖。
 
+### 4.35 验证准备清单（阶段 1 之前，待批准；**未启动 GPU**，2026-09-29）
+
+**产物**：`docs/verification_readiness_2026-09-29.md`（清单本体）+
+`specdec/engine/verify_family_independence_cpu.py`（只读 CPU 自测）。基线 commit `5c2a1e4`。
+**未**启动 GPU、**未**改工具/manifest/默认 backend/精度/验收门槛/内存护栏。
+
+**(1) 固定候选配置（不改默认实现）**：`cudnn_prefill`（仅 prefill 融合，其余 eager）、bf16 计算、
+`set_diag_preset("eager")`（**QK32 关闭**；现有记录键名为 `diag_precision_baseline`，
+另配 `precision_scope_effective`/`qk_scope_report` 佐证未开干预）、
+target KV ∈ {base_bf16(引擎名 fp16), v_fp8}、draft 恒 base_bf16(fp16)、
+ctx 8192 / chunk 2048 / k 4 / max_new **64** / greedy、
+EOS = `tokenizer.eos_token_id` = **151645**（命中即停并记实际长度；未命中且未达 64 ⇒ `other_short` ⇒ 失败）、
+默认 16 GiB 护栏（不上调）、P-state 环境门。以上 ctx/chunk/k/max_new/eos 与 `qk32c` 记录逐项核对一致。
+
+**(2) 输入：两个未参与此前调试的 family**（manifest `v1-draft`，取自 `wiki.train.raw`；
+此前全部诊断都用 `wiki.test.raw` 前 8192 token，hash `bf6a34a82018fd39`）
+- **F06**（`S3_prose`，block 0，win 5，`window_token_start=40960`，8192 前缀 hash `71e630c6cd702180`）
+- **F13**（`S2_high_markup`，block 3，win 3，`window_token_start=24576`，8192 前缀 hash `9a278731d744a859`）
+- ⚠️ **与建议书的偏差**：建议书举例"自然文本与代码"，但本 manifest **无代码档**（strata 仅 S1/S2/S3/S4）
+  ⇒ 改取**该清单自身设计轴（预登记接受率 rank 2 vs 4）差异最大**且**跨 block** 的两档。
+- **CPU 自测 `verify_family_independence_cpu.py`：PASS 12 / FAIL 0**，含
+  **16 family × (2048/4096/8192 + text) = 64/64 hash 全部复现**、调试输入 hash **再次复现 `bf6a34a82018fd39`**、
+  **16/16 family 与调试输入零 32-gram 交集**、候选彼此零交集且不同 block、
+  **除 builder 外无 runner 读取过 manifest**（⇒ 使用历史为空）。产物 `output/g5/attn/family_independence_cpu_check.json`。
+  注：扫描消费方**必须区分大小写** —— 不区分时 `F1[0-6]` 会命中 `bf16`，首版扫描因此误报一串消费方。
+
+**(3) 16 次清单**：2 family × 2 KV × {AR, Spec} × 2 次独立进程重复。AR 为 target-only；
+同 family/KV 的 AR 与 Spec **target 侧配置逐项相同**；重复必须独立进程、串行、从头 prefill（不共享 cache 历史）。
+
+**(4) 脚本记录能力审计的缺项（本轮只列方案，不实施）**
+- **G1**：工具**无法输入 manifest family** —— `P5V.load_ids()` 把 `test.raw` 前缀**写死**
+  ⇒ **第 3 节清单当前不可执行**。最小修：加只读 family 输入解析（`SMOKE_FAMILY`/`SMOKE_MANIFEST`），
+  **未指定时行为逐位不变**。
+- **G2**：`run_g5_8k_repeat.ps1` **一遇 AR/Spec 分歧就 `exit 1`** ⇒ 16 次会在第 2 步中断。
+  最小修：加 `REPEAT_ON_DIVERGENCE=record`（分歧记录并继续，仅硬失败停），默认仍 `stop`。
+- **G3**：无**重复一致性**字段。最小修：复用**已有纯函数** `g5_8k_qk32_analysis.first_divergence`
+  比较 r1/r2 的 `run.gen`，写 `repeat_consistency`；两次不同 ⇒ 标**待查**并停止推进。
+- **G4**：**未做跨层 cache 结构检查**。最小修：prefill 后与 decode 后各调一次引擎自带的
+  `spec_cache.check_consistent`，记 `cache_structure_ok`。
+- **G5**：缺显式 `failure_class` 与 `family_id/window_token_start/token_sha1` 溯源字段。
+- ✅ 已具备：完整 token（`run.gen`/`gen_len`/`stop_reason`）、finite（`checks`+`decision_coverage`+`non_finite`）、
+  显存（`mem_timeline` 8 时点含 `pt_peak_allocated/reserved` + 设备侧）、
+  失败原因（`stage`/`traceback`/`oom`/`verdict`）、结构不变量（`round_invariants`）。
+  ⚠️ 首个分歧只在 master TSV，run JSON 内没有，且受 G2 限制。
+
+**(5) 三类结果分类**：**硬失败**（OOM/崩溃/护栏拒绝/环境不合格、NaN/Inf、必需检查缺失、
+结构不变量失败、`other_short`、重复不一致）⇒ 落盘+停止；**数值差异待评估**（结构与有限性全过但 AR/Spec token 不同）
+⇒ 记录并继续，**不自动归因浮点误差、不自动豁免**；**性能观察** ⇒ 仅观察记录，**禁止**进入 speedup 声明。
+重申：**不得**把"不同缓存历史的 single-vs-single"差异填进 `classify_bf16_compare.own_max_abs`
+（该字段文档定义是**同位置 block-vs-serial**）；`QK FP32 ≠ 全模型 FP32`；bf16 缓存转 fp32 **不等于**从头重算。
+
+**(6) 资源估算（实测值，非新测量）**：peak alloc/reserved = base AR **5261.651/5722.0**、
+base Spec **6906.38/7332.0**、v_fp8 AR **5203.401/5588.0**、v_fp8 Spec **6847.63/7178.0** MiB
+（全部 < 8188 MiB；Spec 余量约 856 MiB ⇒ 不得并行）；commit 近期可用 ≈29–34 GiB；
+串行 16 次 ≈ **11–14 分钟**；每份 JSON 106–179 KB。
+
+**(7)(8)** 停止条件 7 条与待确认事项 7 项详见清单 §8/§9；**清单本身尚不可执行**（依赖 G1/G2 获批）。
+
 ## 5. 复现设置（每次记录必须带上）
 - seed=42（测试）；性能脚本 seed=0，3 reps 取最优 + warmup；
 - prompt 固定（bench_basic.PROMPT，38 tok）；decode 数 64；

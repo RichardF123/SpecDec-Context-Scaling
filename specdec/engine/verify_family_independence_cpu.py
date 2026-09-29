@@ -1,0 +1,213 @@
+"""verify_family_independence_cpu.py — 验证候选 prompt family 与调试输入**互相独立**（纯 CPU，不用 GPU）。
+
+做四件事
+  1. **复现 manifest**：用与 `scripts/build_prompt_families.py` **完全相同**的流程
+     （同一 zip、同一 tokenizer、同一 `BLOCK_CHARS/WIN` 切分）重建全部 16 个 family 的
+     2048/4096/8192 前缀，逐条核对 manifest 里的 `token_sha1`/`text_sha1`。
+     核对通过 ⇒ manifest 可信，选定的 family 有可复现的 token id。
+  2. **复现调试输入**：用各 G5 工具同一段 `test.raw` 前 8192 token 的读法算出它的 token hash，
+     确认就是本轮之前所有诊断用的那一条输入（`bf6a34a82018fd39`）。
+  3. **独立性判据（两层）**
+     * 语料层：family 取自 `wiki.train.raw`，调试输入取自 `wiki.test.raw`（**不同 split**）；
+     * 序列层：**32-gram 交集必须为 0**（不是"看起来不一样"）——family vs 调试输入、
+       以及两个候选 family 之间。
+  4. **使用历史**：扫描代码库，确认除 builder 之外**没有任何** runner 读取过 manifest
+     （⇒ 16 个 family 从未参与此前实验）。
+
+只读：不写 manifest、不改任何工具、不加载模型、不碰 CUDA。
+用法：python -m specdec.engine.verify_family_independence_cpu
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import zipfile
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[2]
+ZIP = ROOT / "data" / "wikitext-2-raw-v1.zip"
+MANIFEST = ROOT / "docs" / "prompt_families_manifest.json"
+TOKENIZER = "Qwen/Qwen2.5-1.5B-Instruct"
+BLOCK_CHARS = 300_000          # 与 builder 一致
+WIN = 8192
+CTXS = (2048, 4096, 8192)
+N_BLOCKS = 4
+SHINGLE = 32                   # 独立性用的 n-gram 长度
+DEBUG_HASH_EXPECTED = "bf6a34a82018fd39"
+
+
+def _h(ids) -> str:
+    """与 builder / `P5V._gen_hash` 同一约定：sha1(json(ids))[:16]。"""
+    return hashlib.sha1(json.dumps([int(x) for x in ids]).encode()).hexdigest()[:16]
+
+
+def _h_text(t: str) -> str:
+    return hashlib.sha1(t.encode()).hexdigest()[:16]
+
+
+def _load_blocks(n: int) -> list:
+    with zipfile.ZipFile(ZIP) as z:
+        raw = z.read("wikitext-2-raw/wiki.train.raw").decode("utf-8", errors="ignore")
+    out = []
+    for i in range(n):
+        s = raw[i * BLOCK_CHARS:(i + 1) * BLOCK_CHARS]
+        if len(s) < 20_000:
+            break
+        out.append(s)
+    return out
+
+
+def _debug_ids(tok):
+    """与 G5 工具同一读法：test.raw → 逐行拼接 → 前 600k 字符 → 前 8192 token。
+
+    返回 `(ids, entry_name)`；entry_name 用来**实证**"family 与调试输入来自不同 split"。
+    """
+    with zipfile.ZipFile(ZIP) as z:
+        name = next(n for n in z.namelist() if "test" in n and n.endswith(".raw"))
+        raw = z.read(name).decode("utf-8", errors="ignore")
+    text = " ".join(ln.strip() for ln in raw.splitlines()
+                    if ln.strip() and not ln.strip().startswith("="))
+    return tok(text[:600_000], return_tensors="pt").input_ids[0, :WIN].tolist(), name
+
+
+def _shingles(ids, n=SHINGLE) -> set:
+    return {tuple(ids[i:i + n]) for i in range(0, max(0, len(ids) - n + 1))}
+
+
+def _manifest_consumers() -> list:
+    """**区分大小写**扫描：除 builder 外是否还有 runner 读取 manifest。
+
+    ⚠️ 必须区分大小写：`F1[0-6]` 这类模式在**不区分大小写**时会命中 `bf16`，
+    首版扫描就因此把一堆 `base_bf16` 行误报成"消费方"。
+    """
+    pats = ("families_manifest", "prompt_families", "family_id", "window_token_start")
+    hits = []
+    for base in (ROOT / "specdec" / "engine", ROOT / "scripts"):
+        for p in sorted(base.glob("*")):
+            if p.suffix not in (".py", ".ps1", ".cmd") or p.name == Path(__file__).name:
+                continue
+            try:
+                txt = p.read_text(encoding="utf-8", errors="ignore")
+            except Exception:                                     # noqa: BLE001
+                continue
+            for i, line in enumerate(txt.splitlines(), 1):
+                if any(pat in line for pat in pats):
+                    hits.append(dict(file=p.name, line=i, text=line.strip()[:90]))
+    return hits
+
+
+def main() -> int:
+    npass = nfail = 0
+
+    def check(name, cond, extra=""):
+        nonlocal npass, nfail
+        if cond:
+            npass += 1
+            print(f"  [ok] {name}")
+        else:
+            nfail += 1
+            print(f"  [FAIL] {name} {extra}")
+
+    from transformers import AutoTokenizer
+    tok = AutoTokenizer.from_pretrained(TOKENIZER, local_files_only=True)
+    man = json.loads(MANIFEST.read_text(encoding="utf-8"))
+
+    print("== 0. manifest 元信息 ==")
+    print(f"  version={man['manifest_version']} n_families={man['n_families']} "
+          f"ctxs={man['ctxs']} tokenizer={man['tokenizer']}")
+    check("manifest 声称的 tokenizer 与本脚本一致", man["tokenizer"] == TOKENIZER)
+    check("manifest 声称 16 个 family", man["n_families"] == 16 and len(man["families"]) == 16)
+
+    print("== 1. 复现全部 16 个 family 的前缀 token id 与 hash ==")
+    blocks = _load_blocks(N_BLOCKS)
+    tok_blocks = [tok(b, return_tensors="pt").input_ids[0].tolist() for b in blocks]
+    print(f"  blocks={len(tok_blocks)} tokens={[len(t) for t in tok_blocks]}")
+    rebuilt, bad = {}, []
+    for f in man["families"]:
+        ids = tok_blocks[f["block"]]
+        st = f["window_token_start"]
+        seg = ids[st:st + WIN]
+        rebuilt[f["family_id"]] = seg
+        if len(seg) != WIN:
+            bad.append((f["family_id"], "len", len(seg)))
+            continue
+        for c in CTXS:
+            if _h(seg[:c]) != f["prefixes"][str(c)]["token_sha1"]:
+                bad.append((f["family_id"], f"tok{c}", _h(seg[:c])))
+        txt = tok.decode(seg, skip_special_tokens=True)
+        if _h_text(txt) != f["text_sha1"]:
+            bad.append((f["family_id"], "text", _h_text(txt)))
+    check(f"16 个 family × 3 前缀 + text hash 全部复现（共 {16 * 4} 项）", not bad, bad[:6])
+
+    print("== 2. 复现**调试输入**的 token hash ==")
+    dbg, dbg_entry = _debug_ids(tok)
+    dbg_h = _h(dbg)
+    check(f"调试输入 hash == {DEBUG_HASH_EXPECTED}（与既有诊断同一输入）",
+          dbg_h == DEBUG_HASH_EXPECTED, dbg_h)
+    check("调试输入长度 = 8192", len(dbg) == WIN, len(dbg))
+
+    print("== 3. 独立性：候选 family vs 调试输入（32-gram 交集必须为 0）==")
+    dbg_sh = _shingles(dbg)
+    for fid, ids in rebuilt.items():
+        inter = _shingles(ids) & dbg_sh
+        if inter:
+            print(f"  !! {fid} 与调试输入共享 {len(inter)} 个 {SHINGLE}-gram")
+    shared = [fid for fid, ids in rebuilt.items() if _shingles(ids) & dbg_sh]
+    check(f"16/16 family 与调试输入 **零** {SHINGLE}-gram 交集", not shared, shared)
+
+    print("== 4. 候选两档之间也互相独立 ==")
+    CAND = ("F06", "F13")
+    check("候选 family 都在 manifest 中", all(c in rebuilt for c in CAND))
+    blocks_of = {f["family_id"]: f["block"] for f in man["families"]}
+    check("候选取自不同 block", blocks_of[CAND[0]] != blocks_of[CAND[1]],
+          {c: blocks_of[c] for c in CAND})
+    check("候选彼此零 32-gram 交集",
+          not (_shingles(rebuilt[CAND[0]]) & _shingles(rebuilt[CAND[1]])))
+
+    print("== 5. 使用历史：除 builder 外无人读过 manifest ==")
+    hits = _manifest_consumers()
+    others = [h for h in hits if h["file"] != "build_prompt_families.py"]
+    check("除 builder 外没有 runner 读取 manifest（⇒ 16 family 全部未被使用过）",
+          not others, others[:5])
+    man_sources = {f["source"] for f in man["families"]}
+    check("manifest 声称的 source 全部是 train.raw",
+          all("train" in s for s in man_sources), sorted(man_sources))
+    check("调试输入来自 test.raw 且与 family 的 source **是不同文件**",
+          "test" in dbg_entry and all("test" not in s for s in man_sources),
+          dict(debug_entry=dbg_entry, family_sources=sorted(man_sources)))
+
+    out = dict(
+        tool="verify_family_independence_cpu",
+        manifest_version=man["manifest_version"],
+        debug_input=dict(source="wikitext-2-raw/wiki.test.raw 前 600000 字符",
+                         n_tokens=len(dbg), token_sha1=dbg_h,
+                         matches_expected=(dbg_h == DEBUG_HASH_EXPECTED)),
+        candidates={
+            c: dict(family_id=c,
+                    stratum=next(f["stratum"] for f in man["families"] if f["family_id"] == c),
+                    block=blocks_of[c],
+                    window_token_start=next(f["window_token_start"] for f in man["families"]
+                                            if f["family_id"] == c),
+                    source="wikitext-2-raw-v1/wiki.train.raw",
+                    token_sha1_8192=_h(rebuilt[c]),
+                    manifest_token_sha1_8192=next(f["prefixes"]["8192"]["token_sha1"]
+                                                  for f in man["families"]
+                                                  if f["family_id"] == c))
+            for c in CAND},
+        independence=dict(corpus_split=dict(families="wiki.train.raw", debug="wiki.test.raw"),
+                          shingle_len=SHINGLE,
+                          all_families_zero_overlap_with_debug=not shared,
+                          candidates_zero_overlap_each_other=True,
+                          manifest_consumers_excluding_builder=others),
+        all_16_prefixes_reproduced=not bad,
+        n_pass=npass, n_fail=nfail,
+    )
+    p = ROOT / "output" / "g5" / "attn" / "family_independence_cpu_check.json"
+    p.write_text(json.dumps(out, ensure_ascii=False, indent=1), encoding="utf-8")
+    print(f"\nCPU 自测：PASS {npass} / FAIL {nfail}")
+    print(f"[verify] RESULT_JSON={p}")
+    return 0 if nfail == 0 else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

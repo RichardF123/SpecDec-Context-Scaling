@@ -1,0 +1,202 @@
+# 验证准备清单（阶段 1 之前的待批准材料）— 2026-09-29
+
+> **状态：准备清单，未获批准，不授权运行。** 本文只固定候选配置、选定输入、列出 16 次运行清单、
+> 审计现有脚本的记录能力并给出最小修改方案，以及分类/停止/待确认事项。
+> **本轮未启动 GPU、未修改任何工具、未修改正式正确性门槛、未开展正式矩阵。**
+> 分层验收（关键决策建议书的路线 B）**仍待小组批准**。
+
+## 0. 本文的证据来源（全部已核）
+
+| 项 | 值 | 出处 |
+| --- | --- | --- |
+| 基线 commit | `5c2a1e4` | `git log` |
+| family manifest | `docs/prompt_families_manifest.json`，`v1-draft`，16 families | 本文件 |
+| manifest 可复现性 | **16 family × (2048/4096/8192 前缀 + text) = 64/64 hash 全部复现** | `family_independence_cpu_check.json` |
+| 调试输入 | `wiki.test.raw` 前 600k 字符的前 8192 token，hash **`bf6a34a82018fd39`**（本轮**已再次复现**） | 同上 |
+| 独立性 | 16/16 family 与调试输入 **零 32-gram 交集**；候选取自不同 block 且彼此零交集；除 builder 外**无任何 runner 读过 manifest** | 同上 |
+
+CPU 自测：`python -m specdec.engine.verify_family_independence_cpu` → **PASS 12 / FAIL 0**
+（工具为 `specdec/engine/verify_family_independence_cpu.py`，只读 zip/manifest，不加载模型、不碰 CUDA）。
+
+## 1. 固定候选配置（**本轮不改变任何默认实现**）
+
+| 维度 | 固定值 | 说明 |
+| --- | --- | --- |
+| commit | `5c2a1e4` | 运行时另记 `git.dirty_worktree`；运行前须为 clean |
+| attention backend | `cudnn_prefill`（**仅 prefill 走融合 cuDNN**，其余阶段 eager） | 由 `M.set_attention_strategy("cudnn_prefill")` 显式设定；`assert_strategy_used()` 必须 ok；`fused_by_phase` **只允许含 `prefill`** |
+| 计算 dtype | **bf16**（权重 bf16；无 fp32 权重、无全模型 fp32） | 与历史 G1–G5 一致 |
+| 诊断精度开关 | **全部关闭**：`set_diag_preset("eager")` = `{qk_fp32: False, prob_fp32: False}`（记录键名在现有工具里是 `diag_precision_baseline`，另配 `precision_scope_effective` 与 `qk_scope_report` 佐证"未开干预"） | **不启用 QK32**；不新增/不堆叠精度开关 |
+| target KV | `base_bf16` 与 `v_fp8` 两档 | 引擎名分别是 `fp16` / `v_fp8`（`spec_dec.FMT`）；v_fp8 = K bf16 + V fp8 e4m3 group=128 |
+| draft KV | 恒 `base_bf16`（引擎名 `fp16`） | draft head_dim=64 < GROUP_V=128 ⇒ v_fp8 对其**结构上不可用** |
+| ctx / chunk | **8192** / **2048** | 禁改（不改 chunk 以规避历史不可比） |
+| k | **4** | 固定链 |
+| 生成长度 | **max_new = 64** | 不得为提前停止而缩短 |
+| 解码 | **greedy**（`argmax`），无采样、无温度 | |
+| EOS 规则 | `eos_id = tokenizer.eos_token_id`（Qwen2.5 → 151645）；命中即停并记 `stop_reason="eos"` **与实际长度** | 未命中且未达 64 ⇒ `stop_reason="other_short"` ⇒ **判失败** |
+| 内存护栏 | 沿用默认（commit ≥ 16 GiB 线），**不提高** | 记录 `commit_guard.overridden` |
+| 环境门 | P-state `qualified=True` | 不合格则 `stage=refused` 且不加载 |
+
+## 2. 输入：两个未参与此前调试的 8K family
+
+**选择依据**：manifest 取自 `wiki.train.raw`，而此前**全部**诊断（含 8K 分歧、2×2、QK32 干预、
+缓存历史探针）都用 `wiki.test.raw` 的同一段前缀 ⇒ **split 级独立**；且 manifest **无任何消费者**
+⇒ 使用历史为空。
+
+⚠️ **与决策建议书的偏差（需确认）**：建议书举例"自然文本与代码"，但本 manifest 的 stratum 只有
+`S1_low_entropy / S3_prose / S4_mixed / S2_high_markup`，**没有代码档**。故改取
+**该 manifest 自身设计轴（预登记接受率序 rank）上差异最大**的两档，且**分属不同 block**：
+
+| | Family A | Family B |
+| --- | --- | --- |
+| family_id | **F06** | **F13** |
+| stratum | `S3_prose`（rank 2） | `S2_high_markup`（rank 4） |
+| source | `wikitext-2-raw-v1/wiki.train.raw` | 同左 |
+| block / window_index | **block 0** / win 5 | **block 3** / win 3 |
+| 截取位置 `window_token_start` | **40960**（= 5 × 8192） | **24576**（= 3 × 8192） |
+| 窗口长度 | 8192 token | 8192 token |
+| 8192 前缀 token hash | **`71e630c6cd702180`** | **`9a278731d744a859`** |
+| 2048 / 4096 前缀 hash | `dde4b84095b7cb2d` / `0f1567932074438c` | `f846a2d2c2e59aa9` / `66e1c61d836d57a7` |
+| text_sha1 | `e896ef193068dc2b` | `941bbcc6e4284397` |
+| 独立性 | 与调试输入零 32-gram 交集；与 F13 零交集 | 同左 |
+
+**取用规则（必须写进运行记录）**：`ids = tokenize(block_text)[window_token_start : window_token_start+8192]`，
+`block_text = raw_train[i*300000 : (i+1)*300000]`，tokenizer `Qwen/Qwen2.5-1.5B-Instruct`，
+`add_special_tokens` 用库默认（与 builder 一致）；**ctx=8192 即取窗口全长的前 8192 token**。
+
+## 3. 16 次运行清单
+
+`2 families × 2 KV × {AR, Spec} × 2 次独立进程重复 = 16`
+
+| # | family | KV | mode | 重复 | 备注 |
+| --- | --- | --- | --- | --- | --- |
+| 1–2 | F06 | base_bf16 | AR | r1, r2 | AR 为 **target-only**（不加载 draft） |
+| 3–4 | F06 | base_bf16 | Spec | r1, r2 | 配对条件：同 family/KV 的 target 配置与 AR 完全一致 |
+| 5–6 | F06 | v_fp8 | AR | r1, r2 | |
+| 7–8 | F06 | v_fp8 | Spec | r1, r2 | |
+| 9–10 | F13 | base_bf16 | AR | r1, r2 | |
+| 11–12 | F13 | base_bf16 | Spec | r1, r2 | |
+| 13–14 | F13 | v_fp8 | AR | r1, r2 | |
+| 15–16 | F13 | v_fp8 | Spec | r1, r2 | |
+
+**配对纪律**：AR 与 Spec 的 target 侧配置（backend/dtype/KV/ctx/chunk/k/max_new/EOS/精度开关）
+必须逐项相同；差异只允许是"AR 单步解码" vs "SpecDec 块验证 + 修复"。重复运行必须**独立进程**、
+串行、同配置、**不共享 cache 历史**（每跑从头 prefill）。
+
+## 4. 现有脚本记录能力审计（含缺项与最小修改方案）
+
+审计对象：`g5_8k_smoke_cudnn.py`（单次运行的记录主体）与 `scripts/run_g5_8k_repeat.ps1`（多步编排 + 配对比较）。
+
+| 需求 | 现状 | 结论 |
+| --- | --- | --- |
+| 完整生成 token | ✅ `run.gen`、`gen_len`、`stop_reason`、`gen_ids_in_vocab` | 够 |
+| finite | ✅ `checks`（逐阶段逐模型）+ `decision_coverage` + `non_finite` 事件 + `stage_*` 逐阶段落盘 | 够 |
+| 显存 | ✅ `mem_timeline`：8 个时点，每点含 `pt_allocated_mib` / `pt_peak_allocated_mib` / `pt_peak_reserved_mib` / `cuda_free_mib` + 设备侧占用 + `gpu_consumers_before` | 够 |
+| 失败原因 | ✅ `stage` / `traceback` / `oom` / `non_finite` / `alloc_on_oom` / `verdict` | 基本够；建议补一个显式 `failure_class`（见 G5） |
+| 首个分歧（AR vs Spec） | ⚠️ **run JSON 里没有**；只有 `run_g5_8k_repeat.ps1` 在 master TSV 里算 `pair_correctness` / `common_prefix` / `first_divergence` | **部分**：**且该 runner 一旦分歧就 `exit 1` 停止**（G2） |
+| 重复一致性 | ❌ 无任何字段或比较 | **缺**（G3） |
+| 缓存结构检查 | ⚠️ 只用 `cache_length` 做 AR 不变量与 `round_invariants`（`tgt_len == drf_len == pre + (m+1 或 Kp)`）；**未调用** `spec_cache.check_consistent`（跨层 token 维一致） | **缺**（G4） |
+| 输入身份 | ⚠️ 只有 `input.ids_hash`（且**只能**用写死的 `test.raw` 那一段） | **缺**（G1/G5） |
+
+### 缺项与**最小**修改方案
+
+| 编号 | 缺项 | 最小修改（**本轮不实施**） |
+| --- | --- | --- |
+| **G1** | 工具**无法输入 manifest family**：`P5V.load_ids()` 把 `test.raw` 前缀写死，`g5_8k_smoke_cudnn.py` 直接调它 ⇒ 第 3 节的清单**当前无法执行** | 新增**只读**的输入解析：`SMOKE_FAMILY=F06`（+ `SMOKE_MANIFEST`）时，按第 2 节的取用规则重建 ids，并在 `input` 里写 `source/block/window_token_start/token_sha1/ids_hash`；未设该变量时**行为与现在逐位一致**（回归保护） |
+| **G2** | 编排器**遇到 AR/Spec 分歧就停**，会让 16 次清单在第 2 步中断 | 加一个显式开关（如 `REPEAT_ON_DIVERGENCE=record`）：分歧时**记录并继续**，仅在**硬失败**时停（硬失败定义见 §5）。默认仍为 `stop`，避免改变历史语义 |
+| **G3** | 无重复一致性字段 | 复用**已有的纯函数** `g5_8k_qk32_analysis.first_divergence(a,b)`（已单测）比较 r1/r2 的 `run.gen`，写入 `repeat_consistency = {identical, first_diff_index, a_token, b_token}`；两次不同 ⇒ 标 **待查** 并停止推进（按建议书 §6 阶段 1） |
+| **G4** | 未做跨层 cache 结构检查 | 在 prefill 之后与 decode 结束各调一次 `spec_cache.check_consistent(cache)`（引擎自带、纯读取），把异常／`None` 结果记入 `cache_structure_ok`；不新增自造口径 |
+| **G5** | 输入来源与失败分类不够显式 | 在 `run` 里加 `failure_class ∈ {none, env, load, finite, structure, coverage, length, oom, crash}`，由已有字段派生；`input` 里加 `family_id` / `window_token_start` / `token_sha1`（G1 一并完成） |
+
+> G1 的回归保护很重要：新分支必须做到"未指定 family 时，输出与改动前逐字段一致"，
+> 才能避免把"支持新输入"变成"悄悄改了历史口径"。
+
+## 5. 结果分类（三类，互不替代）
+
+| 类别 | 判据（全部可机检） | 处置 |
+| --- | --- | --- |
+| **硬失败** | OOM / 原生崩溃 / 护栏拒绝 / 环境不合格；权重逐位校验失败；**NaN 或 Inf**；必需检查缺失（契约 v2 `all_required_ok=False`）；结构不变量失败（跨层 cache 长度不一致、`round_invariants.all_ok=False`）；`stop_reason="other_short"`；同配置重复**不一致** | **落盘 + 停止**；不重试、不换参数、不挑成功样本 |
+| **数值差异待评估** | 结构 / 有限性 / 覆盖 / 长度全部通过，但同 family 同 KV 的 AR 与 Spec 的 token 序列不同 | **记录并继续**（须在获准路线下）：记 `common_prefix`、`first_divergence` 位置与两侧 token。**不自动归因为浮点误差**、**不自动豁免**、**不自动标"可生产使用"** |
+| **性能观察** | `pt_*` 峰值、设备侧占用、各阶段计时 | **仅作观察记录**；含插桩的计时**禁止**进入任何 speedup 声明；不同轨迹会改变接受率与工作量，属解释限制 |
+
+**特别纪律（对应决策建议书 §7）**：
+- **不得**把本轮"不同缓存历史下的 single-vs-single"差异直接填入 `classify_bf16_compare.own_max_abs`
+  —— 该字段的文档定义是"同位置 **block-vs-serial**"；填错语义正是"缺证据不得豁免"要防的事。
+- 因此**未达标**的分歧一律停在"**待评估**"，并**逐项列出缺哪些输入**，不追求一个标签而启动昂贵实验。
+- `QK FP32 ≠ 全模型 FP32`；把已有 BF16 缓存转 FP32 **不等于**从共同前缀重算高精度历史 ⇒
+  两者都**不得**含糊标为"fp32 真值"。
+
+## 6. 运行命令（**预登记；获准后才执行**）
+
+单次运行（与现有工具同一入口，仅增加 family 输入 —— 依赖 G1）：
+
+```bat
+REM family=F06 / base_bf16 / AR（重复 r1）
+set "SMOKE_MODE=ar" & set "SMOKE_KV=base_bf16" & set "SMOKE_CTX=8192" & set "SMOKE_CHUNK=2048" ^
+ & set "SMOKE_K=4" & set "SMOKE_MAXNEW=64" & set "SMOKE_FAMILY=F06" & set "SMOKE_ARM=cudnn_prefill" ^
+ & python -m specdec.engine.g5_8k_smoke_cudnn
+```
+
+编排（16 次，串行、独立进程；依赖 G2）：
+
+```powershell
+$env:REPEAT_PLAN='families16'; $env:REPEAT_ON_DIVERGENCE='record'; $env:REPEAT_TAG='fam16_<UTC>'
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_g5_8k_repeat.ps1
+```
+
+**纪律**：不并行加载模型；不开自动重试循环；不改 chunk/k/dtype/backend；不提高内存护栏。
+
+## 7. 预计资源开销（基于已完成运行的**实测**值，不是新测量）
+
+| KV / mode | peak allocated | peak reserved | 备注 |
+| --- | --- | --- | --- |
+| base_bf16 / AR | **5261.651 MiB** | **5722.0 MiB** | 单项已实测（`qk32c_*` control/base_bf16/ar） |
+| base_bf16 / Spec | **6906.38 MiB** | **7332.0 MiB** | 双模型驻留 |
+| v_fp8 / AR | **5203.401 MiB** | **5588.0 MiB** | |
+| v_fp8 / Spec | **6847.63 MiB** | **7178.0 MiB** | |
+
+- 全部 **< 8188 MiB** 物理容量；但 Spec 档 `peak_reserved` 已达 7332 MiB（余量约 856 MiB），
+  ⇒ **不得**并行、不得在此时叠加会额外占显存的动作。
+- commit 可用量近期实测 ≈ **29–34 GiB** ≥ 16 GiB 线；`overridden` 应为 `False`。
+- **墙钟**：串行 16 次 × 约 **40–50 s**（含加载）≈ **11–14 分钟**（无重试前提下）。依据：`qk32c` 的
+  run_id 时间戳间隔（base AR `023252` → base Spec `023322` → v_fp8 AR `023404` → v_fp8 Spec `023439` …）。
+- **磁盘**：每份 run JSON 约 **106–179 KB**；现有 `.rows.pt`（只存决策行摘要，**不是**全 logits）
+  约 **4–23 KB**。若本阶段改为转存**完整 logits**（AR 每步一行 ≈ 151936 × 4 B），
+  则每份 AR 约 **39 MB**、每份 Spec 约 **数 MB** —— 这是 §9 第 7 项待确认的资源影响。
+
+## 8. 停止条件
+
+**立即停止并落盘（不重试、不挑样本）**：
+1. OOM / 原生崩溃 / 被护栏拒绝 / 环境门不合格；
+2. 出现 **NaN 或 Inf**；
+3. 必需检查缺失（`all_required_ok=False`）或决策覆盖核对失败；
+4. 结构不变量失败（跨层 cache 长度不一致、`round_invariants.all_ok=False`）；
+5. `stop_reason="other_short"` 或生成长度 ≠ 64 且非 EOS；
+6. **同配置两次独立重复输出不同** ⇒ 标 **待查** 并在推进前停止；
+7. 权重逐位校验不一致。
+
+**不**作为停止条件（但必须记录）：AR 与 Spec 的 token 差异本身 —— 在获准的分层报告路线下它是**观测对象**，
+不是错误；但**也不**因此豁免（见 §5）。若航线未获准，则按现行冻结判据处理（B6 exact-id 门）。
+
+## 9. 待确认事项（**需小组/团队裁决，本文不代为决定**）
+
+| # | 待确认 | 不确认时的状态 |
+| --- | --- | --- |
+| 1 | 是否批准评估**路线 B**（分层正确性与有限精度行为报告），并接受"不再无条件声称生产 BF16 逐 token 复现指定 AR"的声明限制 | 保持现行冻结判据；**不放行**；本轮不跑 |
+| 2 | 是否授权**阶段 1**这 16 次独立 smoke（在 manifest 与运行规则审阅之后） | **不跑 GPU** |
+| 3 | 是否接受 §2 的**family 选择**（manifest 无代码档 ⇒ 改取 rank 差异最大且跨 block 的 F06/F13） | 输入未定 ⇒ 清单不可执行 |
+| 4 | 是否允许为支持 manifest family 而修改 runner（G1/G2）——这是**工具改动**，需先批准 | 现有工具**无法**按第 3 节清单运行 |
+| 5 | 阶段 1 的重复一致性若不一致，按"**硬失败**"还是按"**待查并停止推进**"记录 | 建议后者（与建议书 §6 一致）；需确认 |
+| 6 | `max_new=64` 与 EOS 政策在本阶段是否即为最终口径 | 若正式实验用更长输出，本最小测试**不替代**对应长度回归 |
+| 7 | 是否要求把全 logits 转存纳入本阶段（影响磁盘与后续可复核性） | 默认**不转存**，只存 token 序列与决策行摘要 |
+
+## 10. 本轮**未**做的事（边界声明）
+
+- **未**启动任何 GPU 运行；**未**跑 16 次清单（清单本身尚不可执行，见 G1/G2）；
+- **未**修改任何工具代码、manifest、默认 backend/精度、验收门槛或内存护栏；
+- **未**采用、**未**批准决策建议书的任何路线；协议变更事项**未**生效；
+- **未**把任何旧 FAIL / CHECK 改写，也**未**新增判据；
+- 唯一新增产物是本清单与一个**只读** CPU 自测脚本。
+
+**关联**：`docs/production_correctness_decision_2026-09-29.md`（建议稿，待批准）；
+`docs/cudnn_prefill_stage_report.md` §9.19–§9.21；`docs/data_ledger.md` §4.32–§4.34；
+`docs/prompt_families_manifest.json`（`v1-draft`）。
