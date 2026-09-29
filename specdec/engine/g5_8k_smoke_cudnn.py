@@ -35,6 +35,8 @@ from . import g5_8k_spec_variance_probe as P5V
 from . import g5_driver as D
 from .smoke_checks import (CheckRegistry, FinitenessError, evaluate,
                            prefill_finiteness_live, verify_decision_coverage)
+from . import family_input as FI
+from . import status_fields
 from .smoke_hooks import DecisionHooks
 from . import spec_cache
 
@@ -51,6 +53,10 @@ ARM = os.environ.get("SMOKE_ARM", "cudnn_prefill")
 # SMOKE_MODE=spec（SpecDec，default）| ar（**target-only** 自回归；不是 dual-resident）
 MODE = os.environ.get("SMOKE_MODE", "spec").strip().lower()
 ALLOW_UNQUALIFIED = S.env_flag("SMOKE_ALLOW_UNQUALIFIED", False)
+# G4：跨层 cache 结构检查（`spec_cache.check_consistent`）。**默认关闭** ⇒ 原行为逐字段不变。
+STRUCT_CHECK = S.env_flag("SMOKE_STRUCT_CHECK", False)
+# 汇总/编排侧的 AR↔Spec 分歧处置口径；本工具只把它写进记录，不据此改变计算。
+ON_DIVERGENCE = os.environ.get("REPEAT_ON_DIVERGENCE", "stop").strip().lower()
 DRY_RUN = S.env_flag("SMOKE_DRY_RUN", False)
 # 轻量回归：注入故障以验证"检查失败 ⇒ 落盘 + 非零退出"（**不加载模型**）
 SELFTEST = os.environ.get("SMOKE_SELFTEST", "").strip()
@@ -236,12 +242,23 @@ def main() -> int:
         M.set_attention_strategy(ARM)
         M.reset_attention_stats()
 
-        full = P5V.load_ids(tok)
-        ids = full[:, :CTX].contiguous()
+        # ---- G1：输入来源。**默认 legacy 路径不变**；只有显式 `SMOKE_FAMILY` 才走 manifest ----
+        plan = FI.resolve_input_plan()
+        fam_meta = None
+        if plan["mode"] == "manifest":
+            ids_list, fam_meta = FI.load_family_ids(tok, plan["family_id"], ctx=CTX)
+            ids = torch.tensor([ids_list], device="cuda")
+            input_source = "manifest family（显式 SMOKE_FAMILY）"
+        else:
+            full = P5V.load_ids(tok)
+            ids = full[:, :CTX].contiguous()
+            input_source = "wikitext-2-raw test 前缀（与其它 G5 工具同源；默认路径未变）"
         prompt_len = int(ids.shape[1])
         rec["input"] = dict(ctx=int(ids.shape[1]), ids_hash=P5V._gen_hash(
             [int(x) for x in ids[0].tolist()]),
-            source="wikitext-2-raw test 前缀（与其它 G5 工具同源）",
+            source=input_source,
+            source_kind=plan["mode"], family=fam_meta,
+            eos_config=FI.eos_config(tok),
             vocab_size=int(tgt.embed_tokens.weight.shape[0]),
             dtypes=dict(model=str(next(tgt.parameters()).dtype),
                         target_kv_payload=KV, draft_kv_payload="base_bf16"))
@@ -266,6 +283,28 @@ def main() -> int:
         hooks = DecisionHooks(tgt=tgt, drf=drf, registry=reg, prefill_impl=inner,
                               on_prefill=on_prefill)
         hooks.install()
+        # ---- G4：跨层 cache 结构检查（**显式启用**；只读，不改计算）----
+        struct_seen: list = []
+
+        def _struct_check(cache, where: str):
+            """调引擎自带的 `spec_cache.check_consistent`；异常本身就是要记录的事实。"""
+            if not STRUCT_CHECK or cache is None:
+                return
+            try:
+                spec_cache.check_consistent(cache)
+                struct_seen.append(dict(where=where, ok=True,
+                                        length=int(spec_cache.cache_length(cache))))
+            except Exception as e:                                   # noqa: BLE001
+                struct_seen.append(dict(where=where, ok=False, error=str(e)))
+
+        _orig_verify_for_struct = spec_dec._verify
+        if STRUCT_CHECK and MODE != "ar":
+            def _verify_struct_spy(model, cache, cands, *a, **k):
+                _struct_check(cache, "verify_pre")
+                rows, blk = _orig_verify_for_struct(model, cache, cands, *a, **k)
+                _struct_check(blk, "verify_block_post")
+                return rows, blk
+            spec_dec._verify = _verify_struct_spy
         rounds: list[dict] = []
         eos_id = tok.eos_token_id
         gen_ids: list[int] = []
@@ -288,6 +327,7 @@ def main() -> int:
                     lg, cache = inner(tgt, ids)
                 reg.check_finite(lg, phase="prefill", model="target", role="prefill_lg",
                                  where="AR prefill 返回：首步 argmax 的输入")
+                _struct_check(cache, "ar_prefill_post")
                 stage["target_prefill_done"] = True
                 stage["target_prefill_s"] = time.perf_counter() - t1
                 mem("after_target_prefill", rec)
@@ -326,6 +366,7 @@ def main() -> int:
                                      where=f"AR 第 {decode_runs} 次解码 forward 返回："
                                            f"紧接被 argmax 使用")
                     nxt = int(lg.reshape(-1, lg.shape[-1])[-1].argmax())
+                _struct_check(cache, "ar_decode_post")
                 torch.cuda.synchronize()
                 wall = time.perf_counter() - t1
                 out = dict(gen=gen_ids, ids=list(ids[0].tolist()) + gen_ids,
@@ -340,6 +381,8 @@ def main() -> int:
                 torch.cuda.synchronize()
                 wall = time.perf_counter() - t1
         finally:
+            if STRUCT_CHECK and MODE != "ar":
+                spec_dec._verify = _orig_verify_for_struct
             hooks.remove()
 
         mem("after_decode", rec)
@@ -482,6 +525,23 @@ def main() -> int:
             not_a_whole_card_safety_verdict=True,
             claim="**单次跑完只代表『能跑』**：单一 run ⇒ 不构成正确性/稳定性/性能结论；"
                   "allocated ≠ 整卡物理占用，reserved 超物理容量不单独证明分页。")
+        # ---- 五类状态**分开**记录（诊断完成 ≠ 正式 correctness PASS）----
+        # 单次单模式运行拿不到 AR/Spec 配对与重复 ⇒ 那两个字段是 not_assessable；
+        # `formal_gate_status` 在结构上只可能是 not_established / fail。
+        ran_struct = [c for c in struct_seen]
+        rec["cache_structure_check"] = dict(
+            enabled=bool(STRUCT_CHECK), n_checks=len(ran_struct), checks=ran_struct[:40],
+            note=("未启用（默认）⇒ 状态为 not_checked；不得当作通过"
+                  if not STRUCT_CHECK else
+                  "逐次调用引擎自带的 spec_cache.check_consistent（跨层 token 维一致）"))
+        rec["cache_structure_ok"] = (None if not STRUCT_CHECK
+                                     else bool(ran_struct) and all(c["ok"] for c in ran_struct))
+        rec["status"] = status_fields.summarize_run(
+            rec, ar_rec=None, spec_rec=None, rep_rec=None, on_divergence=ON_DIVERGENCE)
+        rec["failure_class"] = status_fields.failure_class(rec)
+        rec["status"]["diagnostic_scope"] = (
+            "本文件是**单次单模式单 family** 的运行记录；AR/Spec 相等性与重复一致性必须由"
+            "汇总器（family16_summary）跨 run 计算，**不得**在单个 run 里宣告通过。")
         _write(rec, run_id)
         del tgt, drf
         torch.cuda.empty_cache()

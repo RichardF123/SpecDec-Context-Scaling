@@ -23,12 +23,40 @@ $outdir = Join-Path $root 'output\g5\attn'
 $tag = if ($env:REPEAT_TAG) { $env:REPEAT_TAG } else { 'run_g5_8k_repeat_' + (Get-Date).ToUniversalTime().ToString('yyyyMMddTHHmmssZ') }
 $maxnew = if ($env:REPEAT_MAXNEW) { $env:REPEAT_MAXNEW } else { '16' }
 $dry = ($env:REPEAT_DRYRUN -eq '1')
+# 新增（全部**显式启用**；未设置时下面每一项都保持原有行为）
+#   REPEAT_ON_DIVERGENCE=record   AR/Spec 分歧时**记录并继续**（默认 stop = 原行为）
+#   REPEAT_PLAN=families16        G1+G3 的 16 格清单（需要 REPEAT_MAXNEW=64 且 manifest 输入）
+#   REPEAT_STRUCT_CHECK=1         传 SMOKE_STRUCT_CHECK=1（G4 跨层 cache 结构检查）
+$onDiv = if ($env:REPEAT_ON_DIVERGENCE) { $env:REPEAT_ON_DIVERGENCE } else { 'stop' }
+$structCheck = ($env:REPEAT_STRUCT_CHECK -eq '1')
 $master = Join-Path $outdir "$tag.master.tsv"
 $env:PYTHONUTF8 = '1'; $env:PYTHONIOENCODING = 'utf-8'; $env:HF_HUB_OFFLINE = '1'
 
 # 预先固定顺序（不因中途结果改变）。REPEAT_PLAN: repeat6（默认）| ar_spec4
 $planSel = if ($env:REPEAT_PLAN) { $env:REPEAT_PLAN } else { 'repeat6' }
-if ($planSel -eq 'ar_spec4') {
+if ($planSel -eq 'families16') {
+  # G1+G3：2 family × 2 KV × {AR,Spec} × 2 次独立重复。
+  # 顺序：family -> kv -> rep -> mode（AR 与 Spec 同 rep 紧邻，重复则是同 (fam,kv,mode) 的 r1 vs r2）。
+  # **必须**同时给出 REPEAT_MAXNEW=64；否则拒绝（避免误用默认 16 把长输出实验做短）。
+  if (-not $env:REPEAT_MAXNEW) {
+    Write-Host "!! REPEAT_PLAN=families16 需要显式 REPEAT_MAXNEW=64（拒绝用默认 16 运行）"
+    exit 2
+  }
+  $plan = @()
+  $n = 0
+  foreach ($fam in @('F06', 'F13')) {
+    foreach ($kv in @('base_bf16', 'v_fp8')) {
+      foreach ($rep in @(1, 2)) {
+        foreach ($m in @('ar', 'spec')) {
+          $n++
+          $short = if ($kv -eq 'base_bf16') { 'base' } else { 'vfps' }
+          $plan += @{ n = $n; label = "${fam}_${short}_${m}_r${rep}"; kv = $kv; mode = $m;
+                      family = $fam; rep = $rep }
+        }
+      }
+    }
+  }
+} elseif ($planSel -eq 'ar_spec4') {
   # 8K/64-token 同后端 AR/SpecDec 对照：每条件独立进程、串行、各一次
   $plan = @(
     @{ n = 1; label = 'base_ar';   kv = 'base_bf16'; mode = 'ar'   },
@@ -66,22 +94,49 @@ function Sample-Env {
 
 "step`tlabel`tmode`tkv`texit_code`trun_id`tjson`tlog`tcommit_free`tgpu_free`tstatus`tpair_correctness`tcommon_prefix`tfirst_divergence" | Set-Content -Path $master -Encoding UTF8
 
+$indexPath = Join-Path $outdir "$tag.index.json"
+$indexCells = New-Object System.Collections.ArrayList
+function Write-Index {
+  # **每步之后都写**：中途停止时汇总器仍能看到"哪些格缺失"。
+  $obj = [pscustomobject]@{
+    tag = $tag
+    plan = $planSel
+    on_divergence = $onDiv
+    maxnew = $maxnew
+    struct_check = $structCheck
+    cells = @($indexCells)
+  }
+  # **不带 BOM** 写（PS 5.1 的 `Set-Content -Encoding UTF8` 会加 BOM，Python 侧 json 会解析失败）
+  $json = $obj | ConvertTo-Json -Depth 6
+  [System.IO.File]::WriteAllText($indexPath, $json, (New-Object System.Text.UTF8Encoding($false)))
+}
+
 foreach ($s in $plan) {
   Write-Host ""
   Write-Host ("=" * 70)
   Write-Host "STEP $($s.n)/$($plan.Count)  label=$($s.label)  mode=$($s.mode)  target_kv=$($s.kv)"
   Write-Host ("=" * 70)
+  $repVal = if ($s.rep) { [int]$s.rep } else { 0 }
   $e = Sample-Env -StepTag $s.label
   $commitFree = ([regex]::Match($e.py, 'commit_free=([0-9.]+)')).Groups[1].Value
   $gpuFree = ($e.gpu -split ',')[2].Trim()
   if ($dry) {
     "$($s.n)`t$($s.label)`t$($s.mode)`t$($s.kv)`tDRYRUN`t-`t-`t$commitFree`t$gpuFree`tdryrun" |
       Add-Content -Path $master -Encoding UTF8
+    # dry-run 也要登记：预登记材料必须能看到完整 16 格（json 为空 ⇒ 不得当作已跑）
+    [void]$indexCells.Add([pscustomobject]@{
+      n = $s.n; label = $s.label; family = "$($s.family)"; kv = $s.kv; mode = $s.mode
+      rep = $repVal; rc = $null; run_id = $null; json = $null; status = 'dryrun'
+    })
+    Write-Index
     continue
   }
   $log = Join-Path $outdir "$($tag)_$($s.label).log"
   # 独立进程；**不传第 2 个参数** ⇒ 保持默认 16 GiB 护栏
-  cmd /c "cd /d $root && set `"SMOKE_MODE=$($s.mode)`" && set `"SMOKE_KV=$($s.kv)`" && set `"SMOKE_MAXNEW=$maxnew`" && scripts\run_g5_attn_forensics.cmd smoke > `"$log`" 2>&1"
+  $famSet = if ($s.family) { "set `"SMOKE_FAMILY=$($s.family)`" && " } else { "" }
+  $structSet = if ($structCheck) { "set `"SMOKE_STRUCT_CHECK=1`" && " } else { "" }
+  $divSet = "set `"REPEAT_ON_DIVERGENCE=$onDiv`" && "
+  cmd /c "cd /d $root && $divSet$famSet$structSet set `"SMOKE_MODE=$($s.mode)`" && set `"SMOKE_KV=$($s.kv)`" && set `"SMOKE_MAXNEW=$maxnew`" && scripts\run_g5_attn_forensics.cmd smoke > `"$log`" 2>&1"
   $rc = $LASTEXITCODE
   # **按明确 run_id 关联产物**（不再猜"目录里最新的 JSON"）
   $rid = ([regex]::Match((Get-Content $log -Raw -Encoding UTF8), 'RUN_ID=([0-9TZ]+)')).Groups[1].Value
@@ -96,9 +151,49 @@ foreach ($s in $plan) {
     Add-Content -Path $master -Encoding UTF8
   Write-Host "[step $($s.n)] exit=$rc status=$status run_id=$rid json=$(if($hasJson){Split-Path $jsonPath -Leaf}else{'(missing)'})"
 
+  [void]$indexCells.Add([pscustomobject]@{
+    n = $s.n; label = $s.label; family = "$($s.family)"; kv = $s.kv; mode = $s.mode
+    rep = $repVal
+    rc = $rc; run_id = $rid
+    json = $(if ($hasJson) { $jsonPath } else { $null })
+    status = $status
+  })
+  Write-Index
+
+  # ---- G3：同 (family,kv,mode) 的 r1 vs r2 重复一致性 ----
+  if ($repVal -eq 2 -and $hasJson) {
+    $r1 = $plan | Where-Object { $_.rep -eq 1 -and $_.mode -eq $s.mode -and $_.kv -eq $s.kv -and
+                                 ("$($_.family)" -eq "$($s.family)") } | Select-Object -Last 1
+    if ($r1 -and $r1.jsonPath -and (Test-Path $r1.jsonPath)) {
+      $rc2 = & $py -c "import json,sys;a=json.load(open(sys.argv[1],encoding='utf-8'))['run']['gen'];b=json.load(open(sys.argv[2],encoding='utf-8'))['run']['gen'];n=min(len(a),len(b));p=0
+for i in range(n):
+    if a[i]==b[i]: p+=1
+    else: break
+print('%s	%d	%d	%d'%('SAME' if a==b else 'DIFF',p,len(a),len(b)))" $r1.jsonPath $jsonPath
+      $rp = ($rc2 -split "`t")
+      $rverdict = if ($rp[0] -eq 'SAME') { 'IDENTICAL' } else { 'DIFFERENT' }
+      Write-Host "[repeat $($s.label)] repeatability=$rverdict common_prefix=$($rp[1]) lens=$($rp[2])/$($rp[3])"
+      "$($s.n)`tREPEAT:$($r1.label)-vs-$($s.label)`t-$($s.kv)`t-$rc`t-$($jsonPath)`t-$log`t$commitFree`t$gpuFree`tREPEAT_$rverdict`t$rverdict`t$($rp[1])`t-" |
+        Add-Content -Path $master -Encoding UTF8
+      if ($rverdict -ne 'IDENTICAL') {
+        Write-Host "!! REPEAT $($r1.label)/$($s.label) NOT identical: marking 待查 and STOPPING advance."
+        Write-Host "   (same config, independent processes => output must match; not excused.)"
+        "STOPPED_AT_REPEAT=$($r1.label)/$($s.label)" | Add-Content -Path $master -Encoding UTF8
+        Write-Host "MASTER=$master"
+        Write-Index
+        exit 1
+      }
+    } else {
+      Write-Host "!! 缺少 r1 记录，无法做重复一致性比较（$($s.label)）"
+      "MISSING_REPEAT_BASELINE=$($s.label)" | Add-Content -Path $master -Encoding UTF8
+    }
+  }
+
   # ---- 同一 KV 档的 AR/SpecDec 配对：本步一并结束后**立即**比较生成序列 ----
   if ($s.mode -eq 'spec' -and $hasJson) {
-    $prev = $plan | Where-Object { $_.mode -eq 'ar' -and $_.kv -eq $s.kv -and $_.n -lt $s.n } |
+    $prev = $plan | Where-Object { $_.mode -eq 'ar' -and $_.kv -eq $s.kv -and $_.n -lt $s.n -and
+                                       ("$($_.family)" -eq "$($s.family)") -and
+                                       ("$($_.rep)" -eq "$($s.rep)") } |
             Select-Object -Last 1
     if ($prev -and $prev.jsonPath -and (Test-Path $prev.jsonPath)) {
       $cmp = & $py -c "import json,sys;a=json.load(open(sys.argv[1],encoding='utf-8'))['run']['gen'];b=json.load(open(sys.argv[2],encoding='utf-8'))['run']['gen'];n=min(len(a),len(b));p=0
@@ -113,11 +208,19 @@ print('%s	%d	%s	%d	%d'%('SAME' if same else 'DIFF',p,'-' if same else '%d|%d'%((
       "$($s.n)`tPAIR:$($prev.label)-vs-$($s.label)`t-$($s.kv)`t-$rc`t-$($jsonPath)`t-$log`t$commitFree`t$gpuFree`tPAIR_$verdict`t$verdict`t$($parts[1])`t$($parts[2])" |
         Add-Content -Path $master -Encoding UTF8
       if ($verdict -ne 'PASS') {
-        Write-Host "!! PAIR $($prev.label)/$($s.label) token divergence (prefix=$($parts[1])): records kept, STOPPING."
-        Write-Host "   NOT treated as exit-code failure, NOT excused as BF16 drift -- needs targeted diagnosis."
-        "STOPPED_AT_PAIR=$($prev.label)/$($s.label) pair_correctness=$verdict" | Add-Content -Path $master -Encoding UTF8
-        Write-Host "MASTER=$master"
-        exit 1
+        if ($onDiv -eq 'record') {
+          Write-Host "!! PAIR $($prev.label)/$($s.label) token divergence (prefix=$($parts[1])): RECORDED, CONTINUING (REPEAT_ON_DIVERGENCE=record)."
+          Write-Host "   Recorded as ar_spec_equality=different -- NOT excused as BF16 drift, NOT a formal exemption."
+          "PAIR_DIVERGENCE_RECORDED=$($prev.label)/$($s.label) pair_correctness=$verdict common_prefix=$($parts[1])" |
+            Add-Content -Path $master -Encoding UTF8
+        } else {
+          Write-Host "!! PAIR $($prev.label)/$($s.label) token divergence (prefix=$($parts[1])): records kept, STOPPING."
+          Write-Host "   NOT treated as exit-code failure, NOT excused as BF16 drift -- needs targeted diagnosis."
+          "STOPPED_AT_PAIR=$($prev.label)/$($s.label) pair_correctness=$verdict" | Add-Content -Path $master -Encoding UTF8
+          Write-Host "MASTER=$master"
+          Write-Index
+          exit 1
+        }
       }
     }
   }
@@ -125,6 +228,7 @@ print('%s	%d	%s	%d	%d'%('SAME' if same else 'DIFF',p,'-' if same else '%d|%d'%((
     Write-Host "!! STEP $($s.n) FAILED (rc=$rc): keeping records and STOPPING. No retry, no cherry-picking."
     "STOPPED_AT=$($s.label) rc=$rc" | Add-Content -Path $master -Encoding UTF8
     Write-Host "MASTER=$master"
+    Write-Index
     exit 1
   }
 }
@@ -135,6 +239,9 @@ if ($dry) {
   exit 0
 }
 Write-Host ""
+Write-Index
 Write-Host "ALL $($plan.Count) STEPS EXIT 0 (each once, serial, interleaved, default guard)"
 Write-Host "MASTER=$master"
+Write-Host "INDEX=$indexPath"
+Write-Host "NEXT: SUMMARY_INDEX=$indexPath python -m specdec.engine.family16_summary"
 exit 0

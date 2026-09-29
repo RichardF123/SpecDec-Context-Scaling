@@ -74,17 +74,35 @@ def _shingles(ids, n=SHINGLE) -> set:
     return {tuple(ids[i:i + n]) for i in range(0, max(0, len(ids) - n + 1))}
 
 
-def _manifest_consumers() -> list:
-    """**区分大小写**扫描：除 builder 外是否还有 runner 读取 manifest。
+# manifest **机器本身**（读取/校验/汇总/自测）不算"实验 runner 消费方"。
+MANIFEST_MACHINERY = {
+    "build_prompt_families.py",          # builder（生成 manifest）
+    "family_input.py",                   # G1：按 manifest 取输入
+    "family16_summary.py",               # 16 格汇总
+    "verify_family_independence_cpu.py",  # 本文件
+    "verify_readiness_selftest_cpu.py",   # G1–G5 自测
+}
+# 本轮**新增**的 opt-in 消费方：只有它带 manifest 输入路径，且默认关闭（SMOKE_FAMILY 未设即 legacy）。
+OPT_IN_CONSUMERS = {"g5_8k_smoke_cudnn.py"}
 
-    ⚠️ 必须区分大小写：`F1[0-6]` 这类模式在**不区分大小写**时会命中 `bf16`，
-    首版扫描就因此把一堆 `base_bf16` 行误报成"消费方"。
+
+def _manifest_consumers() -> list:
+    """**区分大小写**扫描：除 manifest 机器本身外，是否还有工具读取 manifest 字段。
+
+    ⚠️ 两点口径（都是踩过坑才写下的）：
+      * 必须**区分大小写**：`F1[0-6]` 在**不区分大小写**时会命中 `bf16`，
+        首版扫描因此把一堆 `base_bf16` 行误报成"消费方"；
+      * 扫描结果**不能**被表述成"这 16 个 family 从未被使用过"的证明 —— 它不覆盖
+        仓库外的手工运行、也不覆盖"按 token 内容取同一段语料"的做法。
+        真正可核的是下面 `_family_used_in_existing_runs()`（经验证据）。
     """
     pats = ("families_manifest", "prompt_families", "family_id", "window_token_start")
     hits = []
     for base in (ROOT / "specdec" / "engine", ROOT / "scripts"):
         for p in sorted(base.glob("*")):
             if p.suffix not in (".py", ".ps1", ".cmd") or p.name == Path(__file__).name:
+                continue
+            if p.name in MANIFEST_MACHINERY:
                 continue
             try:
                 txt = p.read_text(encoding="utf-8", errors="ignore")
@@ -94,6 +112,28 @@ def _manifest_consumers() -> list:
                 if any(pat in line for pat in pats):
                     hits.append(dict(file=p.name, line=i, text=line.strip()[:90]))
     return hits
+
+
+def _family_used_in_existing_runs() -> list:
+    """**经验证据**：已有的 run 记录里有没有任何一条真的用了 manifest family？
+
+    比源码扫描强得多：它直接看"跑出来的记录"，不依赖"谁 import 了什么"。
+    判定依据是 `input.source_kind == "manifest"` 或 `input.family` 非空。
+    """
+    used = []
+    for p in sorted((ROOT / "output" / "g5" / "attn").glob("*.json")):
+        if any(x in p.name for x in ("analysis", "revision", "compare", "summary", "index")):
+            continue
+        try:
+            j = json.loads(p.read_text(encoding="utf-8-sig"))
+        except Exception:                                        # noqa: BLE001
+            continue
+        if not isinstance(j, dict):
+            continue
+        inp = j.get("input") or {}
+        if inp.get("source_kind") == "manifest" or inp.get("family"):
+            used.append(dict(file=p.name, family=inp.get("family"), kind=inp.get("source_kind")))
+    return used
 
 
 def main() -> int:
@@ -167,14 +207,23 @@ def main() -> int:
     print("== 5. 使用历史：除 builder 外无人读过 manifest ==")
     hits = _manifest_consumers()
     others = [h for h in hits if h["file"] != "build_prompt_families.py"]
-    check("除 builder 外没有 runner 读取 manifest（⇒ 16 family 全部未被使用过）",
-          not others, others[:5])
+    unexpected = [h for h in others if h["file"] not in OPT_IN_CONSUMERS]
+    seen_files = sorted({h["file"] for h in others})
+    check("★ 没有**预期之外**的消费方（唯一 opt-in 消费方是 g5_8k_smoke_cudnn.py，默认关闭）",
+          not unexpected, unexpected[:5])
+    check("消费方集合 = 预期的 opt-in 集合（时间边界：本轮之前无任何 runner 消费 manifest）",
+          seen_files == sorted(OPT_IN_CONSUMERS), seen_files)
     man_sources = {f["source"] for f in man["families"]}
     check("manifest 声称的 source 全部是 train.raw",
           all("train" in s for s in man_sources), sorted(man_sources))
     check("调试输入来自 test.raw 且与 family 的 source **是不同文件**",
           "test" in dbg_entry and all("test" not in s for s in man_sources),
           dict(debug_entry=dbg_entry, family_sources=sorted(man_sources)))
+    print("== 5b. **经验证据**：现有 run 记录有没有用过 family ==")
+    used = _family_used_in_existing_runs()
+    check("★ 现有 run 记录中**没有任何一条**使用过 manifest family"
+          "（经验证据：直接看跑出来的记录，比源码扫描强；本轮也未跑任何 family 运行）",
+          not used, used[:5])
 
     out = dict(
         tool="verify_family_independence_cpu",
@@ -198,7 +247,12 @@ def main() -> int:
                           shingle_len=SHINGLE,
                           all_families_zero_overlap_with_debug=not shared,
                           candidates_zero_overlap_each_other=True,
-                          manifest_consumers_excluding_builder=others),
+                          manifest_consumers_excluding_machinery=others,
+                          manifest_machinery_allowlist=sorted(MANIFEST_MACHINERY),
+                          opt_in_consumers=sorted(OPT_IN_CONSUMERS),
+                          family_used_in_existing_runs=used,
+                          scan_caveat="源码扫描只覆盖本仓库的 specdec/engine 与 scripts；"
+                                      "不覆盖仓库外的手工运行，也不构成「从未使用」的证明。"),
         all_16_prefixes_reproduced=not bad,
         n_pass=npass, n_fail=nfail,
     )

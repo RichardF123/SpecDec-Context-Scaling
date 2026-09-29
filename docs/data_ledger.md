@@ -2308,6 +2308,61 @@ base Spec **6906.38/7332.0**、v_fp8 AR **5203.401/5588.0**、v_fp8 Spec **6847.
 
 **(7)(8)** 停止条件 7 条与待确认事项 7 项详见清单 §8/§9；**清单本身尚不可执行**（依赖 G1/G2 获批）。
 
+### 4.36 最小工具实现：G1–G5 + 五类状态分开记录（**未启动 GPU**，2026-09-29）
+
+**产物**：`specdec/engine/family_input.py`（G1）、`status_fields.py`（五类状态）、
+`family16_summary.py`（G3/汇总）、`verify_readiness_selftest_cpu.py`（47/0）、
+并小改 `g5_8k_smoke_cudnn.py`（G1/G4/G5，均**显式启用**）与 `scripts/run_g5_8k_repeat.ps1`
+（`families16` 计划、G2、G3、无 BOM 的索引 JSON）。
+
+**(1) G1–G5：全部显式启用，默认行为不变**
+
+| 编号 | 开关 | 未设时的默认 |
+| --- | --- | --- |
+| G1 manifest 输入 | `SMOKE_FAMILY=F06/F13`（+`SMOKE_MANIFEST`） | **mode=legacy**，走原写死 `test.raw` 前缀；hash 不符**拒绝运行**（`FamilyInputError`） |
+| G2 分歧后继续 | `REPEAT_ON_DIVERGENCE=record` | **stop**（原行为：分歧即 `exit 1`） |
+| G3 重复一致性 | `families16` 计划内自动（r1 vs r2，按 (family,kv,mode) 配对） | 不做比较 |
+| G4 跨层 cache 结构检查 | `REPEAT_STRUCT_CHECK=1` → `SMOKE_STRUCT_CHECK=1` | **不检查**；`cache_structure_ok=None` ⇒ 状态 `not_checked`（**不得当通过**） |
+| G5 溯源/失败分类 | 随 G1 写 `input.family`；`failure_class` 恒写出 | 仅追加字段 |
+
+默认保持已验证：`resolve_input_plan()=legacy`、`STRUCT_CHECK=False`、`ON_DIVERGENCE=stop`。
+
+**(2) 五类状态分开记录**（`status_fields.py`，写进每个 run 与汇总）
+`execution_status`（`complete` / `env_refused` / `crashed` / `algorithm_failed` / `incomplete` / `missing`）、
+`structural_status`（`ok` / `fail` / `partial` / **`not_checked`**）、`repeatability_status`、
+`ar_spec_equality`、`formal_gate_status`。
+- **环境拒绝与算法失败分开分类**，但 `stops_advance()` 对**两者都为 True**（都停止本轮推进）。
+- `formal_gate_status` **结构上只可能是 `not_established` / `fail`**：B6 要求 10 类 family × 两档 KV ×
+  exact + determinism + 结构，而本工具每次只跑单 family/单模式 ⇒ **永不 pass**。
+- 汇总器**没有**任何名为 `passed`/`success` 的总体字段；缺格 ⇒ `diagnostic_completeness != complete`
+  且 `complete_success_claimable=False`；退出码 **0 = 诊断齐全自洽（仍非正式通过）/ 3 = 不齐全**。
+
+**(3) CPU 自测**：`verify_readiness_selftest_cpu.py` **47 PASS / 0 FAIL**，覆盖要求的 8 类：
+默认路径不变；manifest/hash 不匹配**拒绝**（含正对照与 `verify_hash=False` 时**如实**记 `hash_verified=False`）；
+必需检查缺失**拒绝**；AR/Spec 分歧在 `record` 下**可记录继续**（`stop` 下停止）；
+结构失败/重复不一致/异常短输出**停止**；**缺失运行不得生成"完整成功"汇总**（缺 1 格即 `incomplete`，
+补齐后也只是 `complete_diagnostics_only`，`formal_gate_status` 仍 `not_established`）。
+自测还抓到并修掉两处**自身缺陷**：`structural_status` 把 `all_ok=None`（未记录）误判成 `fail`；
+hash 篡改测试因传 `tok=None` 先抛 `TypeError` ⇒ 实际没测到 hash 校验（改为真实 tokenizer + 正对照）。
+
+**(4) 文档更正（逐条对应本轮要求）**
+- **选样"接受率序"来源已核实**：`expected_acceptance_rank` 是 builder 里**硬编码的先验**
+  （`rank={S1:1,S3:2,S4:3,S2:4}`，层由 **`distinct_token_ratio` 分位**切出），
+  manifest 自述 `preregistered_hypothesis … （pilot 证伪）` ⇒ **不是实测接受率**；F06/F13 的差距是先验序差距。
+- **不再把"无消费者扫描"说成"从未使用"的证明**：改为
+  "**当前代码库中没有预期之外的消费方**（唯一 opt-in 消费方是 `g5_8k_smoke_cudnn.py`，默认关闭）"
+  + **经验证据**："现有 run 记录中**没有任何一条**用过 manifest family"（直接看产出，不依赖 import）。
+- **不再用 `reserved` 推算物理显存余量**：只保留事实（四格 peak_reserved 5722.0/7332.0/5588.0/7178.0 MiB，
+  均 ≤ 8188 MiB，`pt_reserved_within_physical_line`）与结论"不得并行"；
+  理由改为"Spec 档本身已到 GB 级高位且同刻设备侧占用可观测"，**不是**由 `reserved` 算出的"余量"。
+- **显式固定** `add_special_tokens=True`（写入代码而非依赖库默认）、EOS（`eos_token_id`，期望 **151645**，
+  运行时核对）、tokenizer id；**`revision` 未钉**并**明确记为未钉**（不假装已钉）。
+- 另记一处**manifest 与 zip 的字符串不一致**：manifest 写 `…-raw-v1/wiki.train.raw`，
+  zip 真实条目是 `…-raw/wiki.train.raw`（builder 用的是后者）⇒ 按 basename 解析并在记录里写明差异。
+
+**(5) 本轮未做**：未启动 GPU；**未**启用 QK32；**未**改引擎精度、默认 backend、护栏或验收门槛；
+**未**保存全 logits；现有 FAIL/CHECK 与正式正确性门槛全部保留；两份外部文档**原样入库**（保留待批准状态）。
+
 ## 5. 复现设置（每次记录必须带上）
 - seed=42（测试）；性能脚本 seed=0，3 reps 取最优 + warmup；
 - prompt 固定（bench_basic.PROMPT，38 tok）；decode 数 64；

@@ -39,17 +39,22 @@ CPU 自测：`python -m specdec.engine.verify_family_independence_cpu` → **PAS
 ## 2. 输入：两个未参与此前调试的 8K family
 
 **选择依据**：manifest 取自 `wiki.train.raw`，而此前**全部**诊断（含 8K 分歧、2×2、QK32 干预、
-缓存历史探针）都用 `wiki.test.raw` 的同一段前缀 ⇒ **split 级独立**；且 manifest **无任何消费者**
-⇒ 使用历史为空。
+缓存历史探针）都用 `wiki.test.raw` 的同一段前缀 ⇒ **split 级独立**。
+
+⚠️ **口径更正（不要把扫描说成"从未使用"的证明）**：我做的扫描只能说明"**在当前代码库里，
+除 builder 之外没有 runner 读取这个 manifest**"（区分大小写的文件内容扫描，覆盖 `specdec/engine/*` 与 `scripts/*`）。
+这**不是**"这 16 个 family 从未被任何人使用过"的证明：扫描不覆盖仓库外的手工运行、不覆盖按 token 内容
+（而非按 manifest 字段）取用同一段语料的做法，也不覆盖历史提交之外的环境。因此正确表述是：
+**没有发现会消费它们的现有 runner ∨ 选样只用到 manifest 自身字段**，而不是"保证从未使用"。
 
 ⚠️ **与决策建议书的偏差（需确认）**：建议书举例"自然文本与代码"，但本 manifest 的 stratum 只有
 `S1_low_entropy / S3_prose / S4_mixed / S2_high_markup`，**没有代码档**。故改取
-**该 manifest 自身设计轴（预登记接受率序 rank）上差异最大**的两档，且**分属不同 block**：
+**该 manifest 自身设计轴（见下方"rank 来源核实"）上差异最大**的两档，且**分属不同 block**：
 
 | | Family A | Family B |
 | --- | --- | --- |
 | family_id | **F06** | **F13** |
-| stratum | `S3_prose`（rank 2） | `S2_high_markup`（rank 4） |
+| stratum | `S3_prose`（先验 rank 2） | `S2_high_markup`（先验 rank 4） |
 | source | `wikitext-2-raw-v1/wiki.train.raw` | 同左 |
 | block / window_index | **block 0** / win 5 | **block 3** / win 3 |
 | 截取位置 `window_token_start` | **40960**（= 5 × 8192） | **24576**（= 3 × 8192） |
@@ -61,7 +66,27 @@ CPU 自测：`python -m specdec.engine.verify_family_independence_cpu` → **PAS
 
 **取用规则（必须写进运行记录）**：`ids = tokenize(block_text)[window_token_start : window_token_start+8192]`，
 `block_text = raw_train[i*300000 : (i+1)*300000]`，tokenizer `Qwen/Qwen2.5-1.5B-Instruct`，
-`add_special_tokens` 用库默认（与 builder 一致）；**ctx=8192 即取窗口全长的前 8192 token**。
+**显式固定**（不再依赖库默认漂移，见 §2b）；**ctx=8192 即取窗口全长的前 8192 token**。
+
+### 2b. rank 来源核实 + tokenizer/EOS 显式固定
+
+**`expected_acceptance_rank` 的来源（已核实到 builder 源码）**：它不是实测接受率，而是一条**先验**：
+1. `scripts/build_prompt_families.py` 按 **`distinct_token_ratio`** 分位把候选切成
+   `S1_low_entropy / S3_prose / S4_mixed / S2_high_markup` 四层（`assign(by_distinct, ...)`）；
+2. builder 里**硬编码** `rank = {S1:1, S3:2, S4:3, S2:4}`，并写成 manifest 的 `expected_acceptance_rank`；
+3. manifest 自己写着 `preregistered_hypothesis: "接受率排序 S1 > S3 > S4 > S2（pilot 证伪）"`。
+⇒ 所以 F06(2) 与 F13(4) 的差距是**先验排序上的差距**，**不是**"F06 的接受率实测高于 F13"。
+若 pilot 证伪该假设，按 G3 的 pilot-driven amendment 流程重新分层。
+
+**显式固定的输入与 EOS 配置**（避免"默认值变了而无人察觉"）：
+
+| 项 | 值 | 说明 |
+| --- | --- | --- |
+| tokenizer id | `Qwen/Qwen2.5-1.5B-Instruct` | 与 manifest 的 `tokenizer` 字段一致（已断言） |
+| `add_special_tokens` | **显式 `True`** | builder 用库默认；这里把它写进代码（`family_input.TOKENIZER_ADD_SPECIAL_TOKENS`），并作为 hash 校验的一部分 |
+| tokenizer `revision` | **未钉（`None`）** | 本地缓存未记录 commit hash ⇒ **明确记为"revision 未钉"**，不假装已钉；若日后要求可复现性，应钉 revision 并重跑 hash 校验 |
+| EOS | `tokenizer.eos_token_id`，期望 **151645** | 运行时核对 `matches_expected`；EOS 规则见 §1 |
+| 语料条目名 | manifest 写 `…-raw-v1/wiki.train.raw`，zip 真实条目是 `…-raw/wiki.train.raw` | **字符串不一致但同一语料**；按 basename 解析并**在记录里写明差异**（不计入 hash 校验） |
 
 ## 3. 16 次运行清单
 
@@ -97,7 +122,31 @@ CPU 自测：`python -m specdec.engine.verify_family_independence_cpu` → **PAS
 | 缓存结构检查 | ⚠️ 只用 `cache_length` 做 AR 不变量与 `round_invariants`（`tgt_len == drf_len == pre + (m+1 或 Kp)`）；**未调用** `spec_cache.check_consistent`（跨层 token 维一致） | **缺**（G4） |
 | 输入身份 | ⚠️ 只有 `input.ids_hash`（且**只能**用写死的 `test.raw` 那一段） | **缺**（G1/G5） |
 
-### 缺项与**最小**修改方案
+### 缺项 → **已实现**（全部显式启用；默认行为保持不变）
+
+> 状态：**已实现并已 CPU 自测**（本轮）。**未启动 GPU**，因此"实测可跑通"仍未验证。
+
+| 编号 | 状态 | 开关 | 默认行为 |
+| --- | --- | --- | --- |
+| **G1** manifest 输入 | **已实现** | `SMOKE_FAMILY=F06/F13`（+ `SMOKE_MANIFEST` 可选） | **未设 ⇒ mode=legacy**，走原写死的 `test.raw` 前缀，逐字段不变；hash 不符**拒绝运行** |
+| **G2** 分歧后继续 | **已实现** | `REPEAT_ON_DIVERGENCE=record` | **未设 ⇒ stop**（原行为：分歧即 `exit 1`）；`record` 时记录并继续 |
+| **G3** 重复一致性 | **已实现** | 跟随 `families16` 计划自动比较 | 非该计划时不做比较（原行为） |
+| **G4** 跨层 cache 结构检查 | **已实现** | `REPEAT_STRUCT_CHECK=1` → 传 `SMOKE_STRUCT_CHECK=1` | **未设 ⇒ 不检查**，`cache_structure_ok=None` ⇒ 状态为 `not_checked`（**不得当通过**） |
+| **G5** 溯源与失败分类 | **已实现** | 随 G1 自动写 `input.family`；`failure_class` 始终写出 | 追加字段，不改计算 |
+| **新** 五类状态分开 | **已实现** | 始终写出，**无开关** | 只追加记录字段，不改计算；无任何"总体 PASS"字段 |
+| **新** 缺失运行汇总 | **已实现** | `SUMMARY_INDEX=<index.json> python -m specdec.engine.family16_summary` | 只读；缺格 ⇒ `diagnostic_completeness != complete` 且退出码 3 |
+
+**实现位置**
+- `specdec/engine/family_input.py`（G1 + 16 格清单单一定义 + EOS/tokenizer 显式配置）
+- `specdec/engine/status_fields.py`（**五类状态分开**；`formal_gate_status` 结构上只能是 `not_established`/`fail`）
+- `specdec/engine/family16_summary.py`（G3/汇总；**不产生** `passed`/`success` 字段；退出码 0/3 语义见下）
+- `g5_8k_smoke_cudnn.py`（G1 接输入、G4 结构检查、G5/状态字段；均显式启用）
+- `scripts/run_g5_8k_repeat.ps1`（`families16` 计划、G2、G3、索引 JSON 输出）
+
+**退出码语义（汇总器）**：`0` = 16 格齐全且结构与重复自洽（**仍不是正式正确性通过**）；
+`3` = 报告已写出但诊断不齐全/不可宣告。**刻意不用 0 表示"正式通过"**。
+
+### 原始缺项与最小修改方案（保留，便于追溯）
 
 | 编号 | 缺项 | 最小修改（**本轮不实施**） |
 | --- | --- | --- |
@@ -129,18 +178,40 @@ CPU 自测：`python -m specdec.engine.verify_family_independence_cpu` → **PAS
 
 单次运行（与现有工具同一入口，仅增加 family 输入 —— 依赖 G1）：
 
+单次（如需手工跑某一格；`SMOKE_FAMILY` 一旦设置即走 manifest，hash 不符直接拒绝）：
+
 ```bat
-REM family=F06 / base_bf16 / AR（重复 r1）
-set "SMOKE_MODE=ar" & set "SMOKE_KV=base_bf16" & set "SMOKE_CTX=8192" & set "SMOKE_CHUNK=2048" ^
- & set "SMOKE_K=4" & set "SMOKE_MAXNEW=64" & set "SMOKE_FAMILY=F06" & set "SMOKE_ARM=cudnn_prefill" ^
- & python -m specdec.engine.g5_8k_smoke_cudnn
+REM F06 / base_bf16 / AR base（生成 64，启用结构检查）
+cmd /c "cd /d D:\RealDSH\specdec && set \"SMOKE_MODE=ar\" && set \"SMOKE_KV=base_bf16\" && ^
+ set \"SMOKE_MAXNEW=64\" && set \"SMOKE_FAMILY=F06\" && set \"SMOKE_STRUCT_CHECK=1\" && ^
+ set \"REPEAT_ON_DIVERGENCE=record\" && scripts\run_g5_attn_forensics.cmd smoke"
 ```
 
 编排（16 次，串行、独立进程；依赖 G2）：
 
+**准确命令（16 次；`REPEAT_MAXNEW=64` 是该计划的强制前置，缺省直接 `exit 2` 拒绝）**：
+
 ```powershell
-$env:REPEAT_PLAN='families16'; $env:REPEAT_ON_DIVERGENCE='record'; $env:REPEAT_TAG='fam16_<UTC>'
+$env:REPEAT_PLAN          = 'families16'
+$env:REPEAT_MAXNEW        = '64'      # 强制：不设就拒绝运行（避免误用默认 16 把实验做短）
+$env:REPEAT_ON_DIVERGENCE = 'record'  # AR/Spec 分歧记录并继续（默认 stop = 原行为）
+$env:REPEAT_STRUCT_CHECK  = '1'       # G4 跨层 cache 结构检查
+$env:REPEAT_TAG           = 'fam16_' + (Get-Date).ToUniversalTime().ToString('yyyyMMddTHHmmssZ')
 powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_g5_8k_repeat.ps1
+```
+
+**先做零成本预演（不跑 GPU，只采样环境并写出索引）**：
+
+```powershell
+$env:REPEAT_DRYRUN='1'; $env:REPEAT_PLAN='families16'; $env:REPEAT_MAXNEW='64'; $env:REPEAT_TAG='dryrun_fam16'
+powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_g5_8k_repeat.ps1
+```
+
+**跑完（或中途停止）后汇总**（缺格/重复不一致会如实反映，退出码 3）：
+
+```powershell
+$env:SUMMARY_INDEX='output\g5\attn\fam16_<UTC>.index.json'
+python -m specdec.engine.family16_summary
 ```
 
 **纪律**：不并行加载模型；不开自动重试循环；不改 chunk/k/dtype/backend；不提高内存护栏。
@@ -154,8 +225,13 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_g5_8k_repeat.ps1
 | v_fp8 / AR | **5203.401 MiB** | **5588.0 MiB** | |
 | v_fp8 / Spec | **6847.63 MiB** | **7178.0 MiB** | |
 
-- 全部 **< 8188 MiB** 物理容量；但 Spec 档 `peak_reserved` 已达 7332 MiB（余量约 856 MiB），
-  ⇒ **不得**并行、不得在此时叠加会额外占显存的动作。
+- 记录事实：四格 `pt_peak_reserved` 分别 5722.0 / 7332.0 / 5588.0 / 7178.0 MiB，均低于 8188 MiB 的
+  物理容量（`pt_reserved_within_physical_line`）。
+- ⚠️ **口径更正**：**不得用 `reserved` 反推"物理显存还剩多少"**。`reserved` 是 PyTorch 分配器的
+  保留量，`reserved ≤ 物理容量` 只是**记账事实**，既不等于整卡占用，也不能推出安全余量
+  （当时还有 20+ 个 C+G 消费者；同刻的 `cuda_free` / `smi_mem_used` 才是设备侧观测量）。
+  ⇒ 结论只保留："不得并行、不得叠加额外占显存的动作"，理由是 **Spec 档本身已到 GB 级高位**
+  且同刻设备侧占用可观测，**不是**由 `reserved` 算出的"余量"。
 - commit 可用量近期实测 ≈ **29–34 GiB** ≥ 16 GiB 线；`overridden` 应为 `False`。
 - **墙钟**：串行 16 次 × 约 **40–50 s**（含加载）≈ **11–14 分钟**（无重试前提下）。依据：`qk32c` 的
   run_id 时间戳间隔（base AR `023252` → base Spec `023322` → v_fp8 AR `023404` → v_fp8 Spec `023439` …）。
@@ -183,7 +259,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts\run_g5_8k_repeat.ps1
 | --- | --- | --- |
 | 1 | 是否批准评估**路线 B**（分层正确性与有限精度行为报告），并接受"不再无条件声称生产 BF16 逐 token 复现指定 AR"的声明限制 | 保持现行冻结判据；**不放行**；本轮不跑 |
 | 2 | 是否授权**阶段 1**这 16 次独立 smoke（在 manifest 与运行规则审阅之后） | **不跑 GPU** |
-| 3 | 是否接受 §2 的**family 选择**（manifest 无代码档 ⇒ 改取 rank 差异最大且跨 block 的 F06/F13） | 输入未定 ⇒ 清单不可执行 |
+| 3 | 是否接受 §2 的**family 选择**（manifest 无代码档 ⇒ 改取**先验 rank** 差异最大且跨 block 的 F06/F13） | 输入未定 |
 | 4 | 是否允许为支持 manifest family 而修改 runner（G1/G2）——这是**工具改动**，需先批准 | 现有工具**无法**按第 3 节清单运行 |
 | 5 | 阶段 1 的重复一致性若不一致，按"**硬失败**"还是按"**待查并停止推进**"记录 | 建议后者（与建议书 §6 一致）；需确认 |
 | 6 | `max_new=64` 与 EOS 政策在本阶段是否即为最终口径 | 若正式实验用更长输出，本最小测试**不替代**对应长度回归 |
