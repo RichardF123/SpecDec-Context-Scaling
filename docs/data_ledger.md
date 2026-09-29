@@ -2415,6 +2415,53 @@ Spec **`cuda_free`=0.0 MiB、smi used 7848/7757 MiB（总 8188）** ⇒ 设备�
 **进入正式实验仍缺**：① 正确性口径批准及必要验证；② 最终配置回归；③ 小规模 12 条件测量 pilot。
 **本轮未自动执行**其中任何一项。
 
+### 4.38 F06/base_bf16 首次分歧（index 25）因果定位（2026-09-29）
+
+**版本矛盾先解决**：16 份记录 `commit=bfc75ff…`、`dirty_worktree=True`（09:00:27Z–09:11:06Z）。
+`git_meta` 以 `git status --porcelain` 非空判 dirty ⇒ 未跟踪/未提交都计入。
+**可证明**：被执行的 `g5_8k_smoke_cudnn.py` 在 `bfc75ff`↔最终 commit 间 **diff 为空**；
+`bfc75ff→c409a95` 的 6 个改动里引擎侧**只有 `status_fields.py`**，其调用点**仅 2 处且都在生成结束之后**。
+**不可由产物证明**：记录只有布尔值 ⇒ 无法反推具体脏文件；按操作记录为**文档**更正
+（`verification_readiness_…md`），**标注为依据操作记录、非产物可证**。**无证据显示运行时差异涉及执行代码**，
+但因记录粒度所限**非完全可证**。
+
+**精确复现**：index 25、AR=**715**、Spec=**576**、25-token 共同前缀一致；**max_new=64 语义完整保留**，
+仅用观察钩子暂停。
+
+**决策来源（关键）**：SpecDec **round 11 的 block 行 `rows[1]`**（`pre=8215, Kp=4, m=2`，
+`cands=[27685,659,715,4882]`，`g=[27685,659,576,576]`），**输入位置 8216 → 预测 8217 = index 25**；
+**不是** `saved_next`。AR 侧为 **s=1 单步**（cache 8216，喂 **659 @8216**）。
+块重放与真实行 `elementwise_equal=True, max|Δ|=0`；快照完整性 56 张量全等。
+
+**位置/索引/mask/cache 无错误证据**：AR `s=1,T=8217`（**不应用 mask**，可见 keys ≤8216）；
+SpecDec `s=4,T=8219,triu(diag=8216)`（row1 可见 ≤8216）；逐层 cache 长度一致。
+
+**同 token 同位置 logits**：715 与 4710 **逐位相同**（17.125）；**576 相差正好 0.125**（AR 17.0 / Spec 17.125）；
+4882 差 0.0625。AR 顶部并列 `{715,4710}` ⇒ argmax **715**；SpecDec 三并列 `{576,715,4710}` ⇒ argmax **576**。
+
+**判决实验（同一份 cache、同一预测位置）**：SpecDec 自己的 cache(8215) 上，
+块(s=4) → argmax **576**、三并列、margin 0；单步(s=1) → argmax **4710**、无并列、margin 0.125；
+715/576 均 +0.125，4710 不变 ⇒ `elementwise_equal=False, max|Δ|=0.1875`。
+**判定 `SAME_HISTORY_STILL_DIFFERS__SUPPORTS_CURRENT_COMPUTE_PATH`** ⇒
+**仅"当前这一步的计算形状不同"就足以解释该翻转**，不需要依赖两侧 cache 历史不同。
+
+**已证明**：① 精确复现；② 决策来自 block 行 `rows[1]`、位置自洽；③ 无位置/mask/结构错误证据；
+④ 实质差异仅 576 的 0.125；⑤ 同 cache 上形状差异单独即可翻转选词。
+**未证明/未排除**：① **未做逐层定位**（0.125 首现于哪个算子未知）；② 两侧 cache 历史**确实也不同**
+（共同前缀 8215 上 `all_equal=False, max|Δ|=0.25`，28 个 k 张量仅 1 个逐位相同）⇒ **可能共同作用**，
+本轮只证明"形状单独够用"；③ **未**称其为 BF16 固有、**未**归因代码 bug、**未**提出修复；
+④ **不**把 bf16 cache 转 fp32 当高精度真值；**不**填入 block-vs-serial 语义的
+`classify_bf16_compare.own_max_abs`。
+
+**推荐唯一下一步**：同 cache/同位置/同 token 下，对 s=4 块与 s=1 单步做**逐层张量对照**，
+定位 0.125 首现算子（RMSNorm / Q/K/V / RoPE / attention 归约 / AV / o_proj / MLP / 残差 / lm_head）。
+若首现于**注意力归约** ⇒ 直接证实"当前计算路径的形状敏感性"；若首现于**非注意力算子** ⇒ 存在更上游输入差异，
+需回到 mask/位置或 cache 写入路径。**本轮不做修复、不做精度改动、不启动完整回归、不做性能结论。**
+
+**产物**：`f06i25b_20260929T130000Z_F06_{ar,spec}_*.json/.cache.pt/.rows.pt`、`…_analysis_cpu.json`、
+`…_samehistory_*.json/.pt`；工具 `g5_f06_index25_forensics.py`、`analyze_f06_index25_cpu.py`、
+`replay_f06_i25_samehistory.py`。
+
 ## 5. 复现设置（每次记录必须带上）
 - seed=42（测试）；性能脚本 seed=0，3 reps 取最优 + warmup；
 - prompt 固定（bench_basic.PROMPT，38 tok）；decode 数 64；
