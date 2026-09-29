@@ -236,60 +236,160 @@ def evaluate(*, registry: CheckRegistry, mismatch_rounds: int, weights_ok: bool,
                 rule="只有 passed=True 才允许 exit 0；执行结束(stage=run_ended) ≠ 验证通过")
 
 
-def prefill_finiteness(checks: list, not_applicable: list | None = None) -> dict:
-    """按**实际驻留并执行过** prefill 的模型，汇总 `prefill logits` 的有限性。
+def required_prefill_models(mode: str) -> list:
+    """本模式下**必需**执行 prefill 的模型 —— 直接从 `expected_map` 派生，不另立判据。
 
-    ⚠️ 修正的缺陷（本函数存在的理由）
-        旧汇总写成
-            `all(reg.calls.get(("prefill", m), {}).get("ok", False) for m in ("target","draft"))`
-        **AR 模式不加载 draft** ⇒ `("prefill","draft")` 根本不存在 ⇒ `.get(...,{})` 取到 `False`
-        ⇒ **AR 运行恒定报 `prefill_logits_finite=False`**，而同一份记录里
-        `checks.passed=True`、`uncovered=[]`、`failures=[]`、且 `finiteness:prefill/draft`
-        明确列在 `not_applicable` 里 —— 三者自相矛盾。
-        **未驻留的模型是 not_applicable，不是失败。**
-
-    语义：对每个**执行过** prefill 的模型要求 `ok is True`；未执行（未驻留）的记为
-    `not_applicable` 并**排除**在合取之外；若一个都没执行则返回 False（不能凭"没跑"当通过）。
+    `mode="ar"` ⇒ `["target"]`；`mode="spec"` ⇒ `["draft", "target"]`。
+    这样"必需集合"与 `evaluate` 用的是**同一张表**，不会出现第二套互相矛盾的判据。
     """
-    by_model: dict = {}
-    na: list = []
+    exp = expected_map(mismatch_rounds=0, mode=mode)
+    return sorted(m for (p, m), meta in exp.items() if p == "prefill" and meta.get("required"))
+
+
+def na_prefill_models(mode: str) -> list:
+    """本模式下**明确不适用**的 prefill 模型（来自 `expected_map` 的显式声明）。
+
+    ⚠️ 这是**声明**，不是从"记录缺失"推断出来的。缺失记录一律按失败处理。
+    """
+    exp = expected_map(mismatch_rounds=0, mode=mode)
+    return sorted(m for (p, m), meta in exp.items() if p == "prefill" and not meta.get("required"))
+
+
+def contract_note() -> dict:
+    """`prefill_finiteness` 契约 v2 的机器可读摘要（写进结果 JSON，便于事后核对口径）。"""
+    return dict(
+        contract_version=2,
+        gate_field="all_required_ok",
+        required_by_mode={"ar": required_prefill_models("ar"),
+                          "spec": required_prefill_models("spec")},
+        na_by_mode={"ar": na_prefill_models("ar"), "spec": na_prefill_models("spec")},
+        rules=[
+            "必需模型必须有记录、executed=True 且 ok is True，否则汇总失败",
+            "只有显式声明不适用（记录 required=False 或出现在 not_applicable）才可排除",
+            "不得从'记录缺失'推断 not_applicable",
+            "必需集合为空 ⇒ 不通过",
+            "all_executed_ok 仅字面含义，不得当作放行判据",
+        ],
+        derivation="required/na 均来自 smoke_checks.expected_map（与 evaluate 同一份判据）",
+    )
+
+
+def prefill_finiteness(checks: list, *, required_models, not_applicable=None) -> dict:
+    """按**模式必需模型**汇总 `prefill logits` 有限性。契约版本 2。
+
+    合同（逐条对应本轮要求）
+      1) 必需集合由调用方**显式**给出（通常用 `required_prefill_models(mode)`）：AR={target}，
+         Spec={target,draft}。
+      2) 每个必需模型必须有记录、`executed is True`、`ok is True`，否则汇总失败。
+      3) **只有显式声明不适用的模型**才可排除（记录里 `required=False`，或出现在 `not_applicable`
+         列表里）；**不得**因为"记录缺失"就推断为 N/A。
+      4) 没有任何有效检查（必需集合为空）⇒ 不通过。
+      5) `all_executed_ok` 保留**字面**含义（执行过的模型是否都 ok），**不是**放行判据；
+         调用方一律读 `all_required_ok`。
+
+    修正的两处缺陷（均已在 CPU 上复现）
+      * **漏检**：旧实现只检查"执行过"的模型 ⇒ Spec 下 `draft` 必需但未执行时，
+        `all_executed_ok` 仍返回 True（制造了一个不会被抓住的通过）。
+      * **把漏执行伪装成不适用**：`prefill_finiteness_live` 旧版把"registry 里没有记录"
+        的模型直接写进 `not_applicable` ⇒ "必需检查漏执行"被降级成"模型不适用"。
+    """
+    req = sorted(set(required_models or ()))
+    na_names = set(not_applicable or ())
+    recs: dict = {}
     for e in (checks or []):
         name = e.get("name", "")
         if name.startswith("finiteness:prefill/"):
-            m = name.split("/", 1)[1]
-            by_model[m] = dict(required=bool(e.get("required")), executed=bool(e.get("executed")),
-                               ok=e.get("ok"), detail=e.get("detail", ""))
-    for name in (not_applicable or []):
+            recs[name.split("/", 1)[1]] = e
+
+    by_model: dict = {}
+    missing: list = []
+    not_executed: list = []
+    bad_ok: list = []
+    conflicts: list = []
+
+    for m in req:
+        e = recs.get(m)
+        in_na = f"finiteness:prefill/{m}" in na_names
+        if e is None:
+            missing.append(m)
+            by_model[m] = dict(required=True, present=False, executed=False, ok=None,
+                               passes=False,
+                               detail="**必需模型整条记录缺失** ⇒ 判失败（不得当作 N/A）")
+        else:
+            executed = bool(e.get("executed"))
+            ok = e.get("ok")
+            by_model[m] = dict(required=True, present=True, executed=executed, ok=ok,
+                               recorded_required=bool(e.get("required")),
+                               passes=bool(executed and ok is True),
+                               detail=e.get("detail", ""))
+            if not executed:
+                not_executed.append(m)
+            elif ok is not True:
+                bad_ok.append(m)
+            if not e.get("required"):
+                conflicts.append(dict(model=m, kind="required_model_recorded_as_not_required"))
+        if in_na:
+            conflicts.append(dict(model=m, kind="required_but_listed_not_applicable"))
+
+    # 可排除的模型：**必须**有显式声明（记录 required=False，或出现在 na 列表），且不在必需集合
+    excluded: list = []
+    for m, e in recs.items():
+        if m not in req and not e.get("required"):
+            excluded.append(m)
+    for name in na_names:
         if name.startswith("finiteness:prefill/"):
             m = name.split("/", 1)[1]
-            if m not in by_model:
-                na.append(m)
-                by_model[m] = dict(required=False, executed=False, ok=None,
-                                   detail="该模型未驻留（not_applicable）⇒ **不计入失败**")
-    executed = sorted(m for m, v in by_model.items() if v["executed"])
-    all_ok = bool(executed) and all(by_model[m]["ok"] is True for m in executed)
-    return dict(by_model=by_model,
-                executed_models=executed,
-                not_applicable_models=sorted(na),
-                all_executed_ok=all_ok,
-                semantics="只对**实际执行过 prefill** 的模型求合取；未驻留模型记 not_applicable",
-                corrected=True)
+            if m not in req:
+                excluded.append(m)
+    excluded = sorted(set(excluded))
+
+    executed_all = sorted(m for m, v in by_model.items() if v["executed"] and m in req)
+    all_executed_ok = bool(executed_all) and all(by_model[m]["ok"] is True for m in executed_all)
+    all_required_ok = bool(req) and not (missing or not_executed or bad_ok or conflicts)
+    return dict(
+        contract_version=2,
+        required_models=req,
+        by_model=by_model,
+        excluded_models=excluded,
+        missing_records=sorted(missing),
+        not_executed_required=sorted(not_executed),
+        bad_ok_required=sorted(bad_ok),
+        conflicts=conflicts,
+        executed_models=executed_all,
+        all_required_ok=all_required_ok,
+        all_executed_ok=all_executed_ok,
+        all_executed_ok_warning=("字面含义：**已执行**的必需模型是否都 ok。"
+                                 "**不得**用它判断必需检查完整性 —— 必需模型没执行时它仍可能为 True。"
+                                 "调用方一律读 `all_required_ok`。"),
+        gate_field="all_required_ok",
+        semantics=("必需模型必须有记录、executed=True 且 ok is True；缺失记录 / 未执行 / ok!=True / "
+                   "required 与 N/A 冲突 一律判失败；未执行**不**自动推断为 N/A；"
+                   "必需集合为空 ⇒ 不通过。"),
+        derivation="必需/不适用集合来自 smoke_checks.expected_map（与 evaluate 同一份判据）",
+    )
 
 
-def prefill_finiteness_live(registry: "CheckRegistry", models) -> dict:
-    """`prefill_finiteness` 的**运行中**入口：直接读 registry，未调用过的模型记 not_applicable。
+def prefill_finiteness_live(registry: "CheckRegistry", mode: str, *,
+                            required_models=None, not_applicable=None) -> dict:
+    """`prefill_finiteness` 的**运行中**入口。
 
-    `models` 必须传**实际驻留**的模型列表（AR 模式是 `["target"]`），
-    这样 draft 才不会被当成"该跑没跑"。
+    * 必需集合默认由 `mode` 派生（AR={target}，Spec={target,draft}）；
+    * registry 里**没有**记录的必需模型 ⇒ **保持缺失**，不做任何 N/A 转换（这是缺陷 2 的修法）；
+    * 不适用集合来自 `expected_map` 的**显式声明**。
     """
-    checks, na = [], []
-    for m in models:
+    req = (sorted(required_models) if required_models is not None
+           else required_prefill_models(mode))
+    na = (list(not_applicable) if not_applicable is not None
+          else [f"finiteness:prefill/{m}" for m in na_prefill_models(mode)])
+    checks = []
+    for m in req:
         slot = registry.calls.get(("prefill", m))
-        if slot is not None:
-            checks.append(dict(name=f"finiteness:prefill/{m}", required=True, executed=True,
-                               ok=bool(slot.get("ok")), detail=f"调用 {slot.get('n')} 次"))
-        else:
-            na.append(f"finiteness:prefill/{m}")
-    return prefill_finiteness(checks, na)
+        if slot is None:
+            continue                      # ★ 缺失就是缺失，不转成 N/A
+        checks.append(dict(name=f"finiteness:prefill/{m}", required=True, executed=True,
+                           ok=bool(slot.get("ok")), detail=f"调用 {slot.get('n')} 次"))
+    out = prefill_finiteness(checks, required_models=req, not_applicable=na)
+    out.update(entry="live", mode=mode)
+    return out
 
 

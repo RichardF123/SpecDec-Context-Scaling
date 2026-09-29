@@ -229,7 +229,7 @@ def main() -> int:
         hooks.remove()
         hooks = None
 
-        pf_f = prefill_finiteness_live(reg, ["target"] if MODE == "ar" else ["target", "draft"])
+        pf_f = prefill_finiteness_live(reg, MODE)          # 必需集合由 mode 派生，缺失记录判失败
         rec["prefill_logits_finite"] = pf_f
         own_gen = gen_head if MODE == "ar" else list(rec.get("spec_emitted") or [])
         rec["own_emitted_matches_reference"] = bool(

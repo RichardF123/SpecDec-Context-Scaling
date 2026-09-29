@@ -2178,6 +2178,70 @@ tag `qk32b_20260928T024500Z` `control_base_bf16_ar_20260928T023204Z.json`
 
 **原始结果**：`output/g5/attn/reshistc_20260928T154500Z_base_bf16_{ar,spec,compare}_*.json` + `.cache.pt` / `.rows.pt`。
 
+### 4.34 有限性汇总契约 v2 + 历史记录离线复核 + 生产正确性方案审查（2026-09-28）
+
+**(1) 契约 v2：修掉两处汇总缺陷（CPU 先复现再修）**
+- **B1 漏检**：Spec 下 `draft` **必需但未执行**时 `all_executed_ok` 仍为 **True**
+  —— v1 只对"**执行过**"的模型求合取，必需没跑的模型被静默排除。
+- **B2 伪装**：`prefill_finiteness_live` 把 registry 里**没有记录**的模型直接标成 `not_applicable`
+  —— **从缺失推断 N/A**，把"漏执行"降级成"不适用"。
+- **契约 v2**：必需集合按**模式显式**给出且由 `expected_map` 派生（与 `evaluate` 同一份判据，不建第二套）：
+  **AR={target}，Spec={target,draft}**。必需模型必须**有记录 + executed=True + ok is True**；
+  **只有显式声明**不适用的才可排除；必需集合为空 ⇒ 不通过；`all_executed_ok` 仅字面含义并**明文标注不得当判据**，
+  放行一律读 **`all_required_ok`**（`gate_field`）；新增 `contract_note()` 写入结果 JSON。
+- **CPU 回归 `prefill_finite_selftest_cpu.py`：37 PASS / 0 FAIL**，覆盖 9 类反例（见报告 §9.21.1）。
+
+**(2) 已有记录离线复核（不重跑 GPU、原 JSON 不覆盖）**
+- 工具 `g5_8k_prefill_finite_revise.py`（`REVISE_ALL=1`），产物
+  `prefill_finite_revision_v2_20260929T041952Z.json`，每项带 `basis`。
+- 候选 38 份 → **可判定 27**（ar 13 / spec 14）；**11 份因未标注 `mode` 跳过**（不做判定，避免假阳性）。
+- **变化 18**；旧值违反"整体通过 ⇒ prefill 必须通过" **12**；修正后违反 **0**；
+  检出**真实必需缺口 1**（`smoke8k_cudnn_prefill_20260927T131837Z`：spec、draft 未执行、该 run 本身 `passed=False`）；
+  5 份更老 schema 根本没这个字段。迁移：`False→True` 13、`None→True` 4、`None→False` 1、`True→True` 9。
+- ⚠️ **历史数据受影响**：不止上一轮 tag —— **原始 8K 源 run 也波及**：
+  `smoke8k_cudnn_prefill_20260927T135218Z`（base **AR**）与 `…135336Z`（v-fp8 **AR**）的
+  `run.prefill_logits_finite` 由 **False 更正为 True**；两个 spec run（`…135254Z`/`…135413Z`）本来就正确。
+  **原始 JSON 未改动**，更正只在修订分析文件。
+- **口径澄清**：不能用 `new == checks.passed` 判一致 —— `passed` 是**整体**门，`all_required_ok` 只管 prefill；
+  "prefill 有限但别的检查失败"正常。唯一有意义的单向不变式：**整体通过 ⇒ prefill 必须通过**；
+  按此口径 4 条原先被判"不一致"的记录全部得到解释，violation 归零。
+
+**(3) 收窄后的研究结论**
+> **在 base_bf16 / index 52 的受控单步重放中，真实缓存历史的数值差异足以改变该位置的 argmax。**
+- 限定：局部归因，**不**外推 v_fp8/其它位置；**不**写"缓存被损坏"；**不**写"缓存历史是唯一原因"；
+  **不**写"所有分歧机制相同"（index 52 与 31 只有**形态**一致）；
+  **不**把"不需要当前这一步形状不同"读成"形状效应无关"（历史差异仍可能来自此前不同形状的写入）；
+  **不**写"修好 tie-break"（`argmax` 规则未被证明错误，两条路径的**分数与并列集合本身就不同**，
+  统一规则不保证恢复一致）；**不**把局部复现当完整 64-token PASS；
+  **不**把提高缓存存储 dtype 等同于重新计算更准确的缓存。
+
+**(4) 生产正确性决策表（只做方案审查，本轮不实现）** —— 详见报告 §9.21.4，摘要：
+- 三类正确性：**算法结构**（FP32 B6 exact 20/20、216/348；位置语义 229/0；哨兵 16/16；重放 max|Δ|=0；快照完整）
+  与 **FP32 实现**（FP32 下 SpecDec==AR 精确）证据较强，但**门未全部跑**（参照是 fp32 受控近似参考，非独立实现）；
+  **生产 BF16 一致性门未通过**，且本轮证据**不足以**判 `BF16_NEAR_TIE`（缺 `prev/next_max_abs` 与
+  **`fp32_margin`**）⇒ 按 `results_schema.classify_bf16_compare` 现行契约只能是 **`NEEDS_INSPECTION`**。
+- 方案清单 S1（QK fp32 变默认）／S2（小 margin 单步重算）／S3（LM head 精度）／S4（缓存存储 dtype）／S5（改协议），
+  每项给出"改变什么计算 / 参考输出与 cache 语义 / 性能显存 / 最小检验 / **停止条件**"。
+  ⚠️ **S2 的充分性已被本轮证据否定**：index 52 的真实 AR 决策行本身就是单步，
+  与 SpecDec 的单步行 argmax 不同（279 vs 64871）⇒ **缓存历史已有差异时，单步重算不保证恢复 AR**。
+  ⚠️ **S4 存储 dtype ≠ 重新计算**：无法消除此前已在 bf16 下写入 cache 的舍入误差。
+  ⚠️ **S5 属"需团队批准的协议变更"**，不自动生效、不抹去原门失败；
+  `proposal_new_acceptance_criteria_2026-09-26.md` 仍**未生效**，且它针对 attention backend，**不**直接适用于 exact-id 门。
+- **唯一推荐的下一步候选（不开启新 GPU 测试）**：补齐 `classify_bf16_compare` 缺失输入
+  （FP32 下的 `fp32_margin` + 相邻位置 `prev/next_max_abs`），把该分歧按**现有契约**正式分类。
+  理由：不新增精度开关、不改协议、不跑正式矩阵；它是 S1–S5 任何路线的共同前置；分类给出后即**收敛**，
+  不再需要继续复现同一分歧。
+
+**(5) 与并行复盘文档的关系**：`docs/retrospective_2026-09-29_correctness_cache_history.md`
+（**并行分析 agent 撰写，记录时未纳入版本控制**）的数值与结论与本节**一致**
+（20.750/20.750 vs 20.750/20.875、并列集合、margin 0 vs 0.125、cache max|Δ|=0.375、
+行 max|Δ|=0.25、tag `reshistc_20260928T154500Z`、commit `ec42713`），
+其 §5 的五个"直觉修法为何不成立"与本节 (4) 的 S1–S5 逐条对应，其 §6 记录的正是本轮修的两处缺陷。
+两文无冲突；该文件**非本轮产物、未由本轮提交**。
+
+**(6) 纪律**：本轮**未**修改模型算法、默认 backend/精度、验收门槛或内存护栏；**未**开启新 GPU 测试；
+**未**宣布正式实验获准启动；旧数据一律保留未覆盖。
+
 ## 5. 复现设置（每次记录必须带上）
 - seed=42（测试）；性能脚本 seed=0，3 reps 取最优 + warmup；
 - prompt 固定（bench_basic.PROMPT，38 tok）；decode 数 64；

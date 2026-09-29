@@ -399,13 +399,15 @@ def main() -> int:
         # ⚠️ 修正：旧写法把"draft 未驻留 ⇒ 该检查不存在"当成失败 ⇒ **AR 恒报 False**
         # （与同记录的 checks.passed=True 自相矛盾）。现在只对**实际驻留并执行过** prefill
         # 的模型求合取，未驻留记 not_applicable。**旧 JSON 不改写**（见修订分析产物）。
-        pf_finite = prefill_finiteness_live(reg, rec["resident_models"])
+        # 必需集合由 mode 显式派生（AR={target}，Spec={target,draft}）；缺失记录一律判失败
+        pf_finite = prefill_finiteness_live(reg, MODE)
         rec["run"] = dict(gen=gen, gen_len=gen_len, max_new=MAXNEW, eos_id=eos_id,
                           stop_reason=stop_reason,
                           gen_ids_in_vocab=bool(all(0 <= g < vocab for g in gen)),
                           # 历史字段口径澄清：旧的 `logits_all_finite` **只**覆盖两模型 prefill 的 logits，
                           # 名称夸大覆盖范围 ⇒ 新运行改用下面的显式命名（**旧 JSON 不改写**）
-                          prefill_logits_finite=pf_finite["all_executed_ok"],
+                          # ★ 放行判据用 `all_required_ok`：`all_executed_ok` 在"必需模型没执行"时仍可能为 True
+            prefill_logits_finite=pf_finite["all_required_ok"],
                           prefill_logits_finite_by_model=pf_finite,
                           prefill_logits_finite_semantics=pf_finite["semantics"],
                           prefill_s=acc.get("t"),
