@@ -233,6 +233,22 @@ def _run_() -> int:
               any(m["family"] == "F06" and m["kv"] == "base_bf16" and m["mode"] == "ar"
                   for m in out3["repeatability_mismatches"]))
 
+    print("== 8b. 工具词汇表：真实终止 stage 必须被认作 complete ==")
+    # 本轮 16 次实跑暴露的缺陷：smoke 工具的终止 stage 是 `run_ended`，不是 `complete`，
+    # 首版只认 "complete" ⇒ 16 个**全部通过**的运行被误判 incomplete。
+    for st in ("complete", "run_ended"):
+        r = SF.execution_status(_run(stage=st))
+        check(f"★ stage={st!r} + checks.passed ⇒ complete", r["status"] == SF.EXEC_COMPLETE, r)
+    for st in ("run_ended_checks_failed", "aborted_non_finite", "aborted_weight_mismatch"):
+        check(f"stage={st!r} ⇒ algorithm_failed 且停止",
+              SF.execution_status(_run(stage=st, checks_passed=False))["status"]
+              == SF.EXEC_ALGORITHM_FAILED)
+    check("★ 非终止 stage（如 loaded）⇒ incomplete 且停止推进",
+          SF.execution_status(_run(stage="loaded"))["status"] == SF.EXEC_INCOMPLETE
+          and SF.execution_status(_run(stage="loaded"))["stops_advance"] is True)
+    check("对照：stage=run_ended 时 failure_class=none",
+          SF.failure_class(_run(stage="run_ended")) == "none")
+
     print("== 9. 环境拒绝与算法失败分开分类，但都停止推进 ==")
     envrec = dict(_run(), stage="refused", skipped="commit 不足")
     check("★ 环境拒绝 ⇒ env_refused（与算法失败不同类）",

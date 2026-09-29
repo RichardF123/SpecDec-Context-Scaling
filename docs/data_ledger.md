@@ -2363,6 +2363,58 @@ hash 篡改测试因传 `tok=None` 先抛 `TypeError` ⇒ 实际没测到 hash �
 **(5) 本轮未做**：未启动 GPU；**未**启用 QK32；**未**改引擎精度、默认 backend、护栏或验收门槛；
 **未**保存全 logits；现有 FAIL/CHECK 与正式正确性门槛全部保留；两份外部文档**原样入库**（保留待批准状态）。
 
+### 4.37 16 次独立 GPU 诊断结果（tag `fam16_20260929T060000Z`，commit `bfc75ff`，2026-09-29）
+
+**授权范围**：仅本轮诊断；不改正式正确性门槛、不启动全量正式实验。
+
+**配置**：target 1.5B / draft 0.5B、BF16、`cudnn_prefill`（仅 prefill 融合）、
+target KV ∈{base_bf16, v_fp8}、draft 恒 base_bf16、ctx 8192 / chunk 2048 / k 4 / max_new 64、
+greedy、EOS 151645、AR target-only；`diag_precision={qk_fp32:false, prob_fp32:false}` **16/16 确认关闭**；
+输入 = manifest family（`source_kind=manifest` 16/16），hash 核验 F06 `71e630c6cd702180`、F13 `9a278731d744a859`；
+P-state `qualified=True` 16/16；commit 可用 29.97–30.39 GiB ≥ 16 GiB，**未降门槛**。
+串行、独立进程、每次重新 prefill 不共享 cache、无重试、未换输入、未缩短输出、未挑样本。
+
+**完成度**：**16/16** 完成，`missing_cells=0`、`extra_cells=0`、拒绝/失败 **0**；
+长度 16/16 = 64，`stop_reason` 16/16 = `max_new_reached`；finite 16/16 通过；
+结构检查 16/16 `ok`（AR 每次 2 项；SpecDec 每次 44–54 项）；
+`diagnostic_completeness=complete_diagnostics_only`、`claimable=True`、退出码 0；
+`formal_gate_status=**not_established**`。
+
+**八组重复：8/8 identical**（64/64，逐 token 相同；峰值显存亦逐位相同）⇒ 无重复性异常。
+
+**八组 AR/Spec 配对：8/8 different**（r1 与 r2 给出的前缀与分歧 token **完全相同** ⇒ 确定性）
+
+| family | KV | 共同前缀 | 首个分歧 idx | AR | SpecDec |
+| --- | --- | --- | --- | --- | --- |
+| F06 | base_bf16 | **25** | 25 | **715** | **576** |
+| F06 | v_fp8 | **25** | 25 | **576** | **4710** |
+| F13 | base_bf16 | **47** | 47 | **13282** | **25806** |
+| F13 | v_fp8 | **23** | 23 | **28693** | **25179** |
+
+⇒ 分歧在**两条全新 family × 两档 KV**上稳定复现，**不是原调试输入的特例**；
+**不自动归因浮点误差、不自动豁免**（现有证据按冻结分类器只能停在 `NEEDS_INSPECTION`）。
+另注：AR 侧同样受 KV 档影响（F06 的 AR 在 base/v_fp8 下 token 分别为 715 / 576）⇒
+"AR↔SpecDec 不一致"并非唯一差异来源。
+
+**显存（两种口径，不得混用）**：peak_allocated = AR 5261.7/5203.5、Spec 6906.4/6847.7 MiB；
+peak_reserved = AR 5722.0/5588.0、Spec **7332.0/7180.0** MiB；
+**设备侧同刻**：AR `cuda_free` 1343/1477 MiB、smi used 6302/6163 MiB；
+Spec **`cuda_free`=0.0 MiB、smi used 7848/7757 MiB（总 8188）** ⇒ 设备侧确实到顶。
+**不得由 `reserved` 推物理余量**；本轮**不做**加速/减速声明。
+
+**五类状态**：运行 16/16 complete；结构 16/16 ok；可重复性 8/8 identical；
+输出一致性 8/8 different；正式验收 **not_established**。
+**诊断完成 ≠ 正式 correctness PASS。**
+
+**本轮修正的一处自身缺陷**：16 次全 PASS 但汇总报 `execution_status=incomplete ×16` ——
+`g5_8k_smoke_cudnn.py` 的终止 stage 是 `run_ended`，而 `status_fields` 首版只认 `"complete"`。
+已改为显式终止取值表 + 非终止 stage 记 `incomplete`，并加 CPU 回归；
+`verify_readiness_selftest_cpu` 现 **54 PASS / 0 FAIL**，汇总修正为 `claimable=True`。
+**该缺陷只在真跑后暴露（工具 vs 实跑的词汇表边界）。**
+
+**进入正式实验仍缺**：① 正确性口径批准及必要验证；② 最终配置回归；③ 小规模 12 条件测量 pilot。
+**本轮未自动执行**其中任何一项。
+
 ## 5. 复现设置（每次记录必须带上）
 - seed=42（测试）；性能脚本 seed=0，3 reps 取最优 + warmup；
 - prompt 固定（bench_basic.PROMPT，38 tok）；decode 数 64；

@@ -136,6 +136,20 @@ def _family_used_in_existing_runs() -> list:
     return used
 
 
+def _this_round_run_ids() -> set:
+    """从 fam16 授权诊断的索引里取本轮 run_id（用于把"本轮/本轮之前"分开）。"""
+    ids = set()
+    for idx in sorted((ROOT / "output" / "g5" / "attn").glob("fam16_*.index.json")):
+        try:
+            j = json.loads(idx.read_text(encoding="utf-8-sig"))
+        except Exception:                                        # noqa: BLE001
+            continue
+        for c in j.get("cells", []):
+            if c.get("run_id"):
+                ids.add(c["run_id"])
+    return ids
+
+
 def main() -> int:
     npass = nfail = 0
 
@@ -219,11 +233,23 @@ def main() -> int:
     check("调试输入来自 test.raw 且与 family 的 source **是不同文件**",
           "test" in dbg_entry and all("test" not in s for s in man_sources),
           dict(debug_entry=dbg_entry, family_sources=sorted(man_sources)))
-    print("== 5b. **经验证据**：现有 run 记录有没有用过 family ==")
+    print("== 5b. **经验证据**：run 记录里的 family 使用情况（分「本轮之前 / 本轮」） ==")
     used = _family_used_in_existing_runs()
-    check("★ 现有 run 记录中**没有任何一条**使用过 manifest family"
-          "（经验证据：直接看跑出来的记录，比源码扫描强；本轮也未跑任何 family 运行）",
-          not used, used[:5])
+    # 本轮（fam16 授权诊断）确实跑了 16 格 family 运行 ⇒ 不能再说"没有任何一条用过"。
+    # 正确口径：**本轮之前**一条都没有；**本轮**恰好 16 格。
+    this_round_ids = _this_round_run_ids()
+    this_round = [u for u in used
+                  if u["file"] in {f"smoke8k_cudnn_prefill_{r}.json" for r in this_round_ids}]
+    prior = [u for u in used if u["file"] not in
+             {f"smoke8k_cudnn_prefill_{r}.json" for r in this_round_ids}]
+    check("★ **本轮之前**的 run 记录中没有任何一条使用过 manifest family"
+          "（经验证据：直接看产出，不依赖 import）", not prior, prior[:5])
+    if this_round_ids:
+        check(f"本轮（fam16 授权诊断）恰好 {len(this_round_ids)} 格用了 family（实测 %d）"
+              % len(this_round), len(this_round) == len(this_round_ids),
+              dict(expected=len(this_round_ids), got=len(this_round)))
+    else:
+        check("尚无 fam16 索引（本轮未跑）⇒ 只断言「本轮之前为空」", not prior)
 
     out = dict(
         tool="verify_family_independence_cpu",

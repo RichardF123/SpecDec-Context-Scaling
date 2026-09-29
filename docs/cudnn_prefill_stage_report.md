@@ -1503,5 +1503,120 @@ cuDNN prefill 的显存收益不自动等于生产验收）。
 **与本轮的关系**：本轮**未**批准、**未**采纳、**未**实施其中任何路线；**未**修改协议、生产代码或历史数据；
 **未**启动任何新 GPU 测试。该文件亦**未由本轮提交**（非本轮产物）。
 
+## 9.22 16 次独立 GPU 诊断（F06/F13 × 2 KV × AR/Spec × 2 重复，2026-09-29）
 
+**授权范围**：仅执行本轮诊断；**不**修改正式正确性门槛、**不**启动全量正式实验。
+tag `fam16_20260929T060000Z`；基线 commit **`bfc75ff`**（工作区 clean，未触碰他人改动）。
+
+### 9.22.1 冻结配置（运行前核对，运行记录逐项一致）
+
+| 维度 | 值 |
+| --- | --- |
+| 模型 | target `Qwen/Qwen2.5-1.5B-Instruct`，draft `Qwen/Qwen2.5-0.5B-Instruct`；**BF16** 计算 |
+| backend | `cudnn_prefill`（**仅 prefill 融合**，其余阶段 eager；`assert_strategy_used()` ok） |
+| target KV | `base_bf16`（引擎名 `fp16`）/ `v_fp8`；draft KV 恒 `base_bf16` |
+| ctx / chunk / k / max_new | 8192 / 2048 / 4 / **64** |
+| 解码 | greedy；按已登记 EOS 规则停止（`eos_token_id`=151645） |
+| AR | target-only（不加载 draft） |
+| 精度开关 | `diag_precision = {qk_fp32: false, prob_fp32: false}` —— **16/16 全部确认关闭** |
+| 输入 | manifest family（`source_kind=manifest`，16/16），hash **已核验**：F06 `71e630c6cd702180`、F13 `9a278731d744a859` |
+| 环境门 / 护栏 | P-state `qualified=True` 16/16；commit 可用 29.97–30.39 GiB ≥ 16 GiB 线，**未降门槛**、未覆盖 |
+
+运行方式：串行、每格**独立进程**、每次重新加载并 prefill、**不共享 cache**、无自动重试、未替换输入、
+未缩短输出、未挑选样本。结构检查已启用（`REPEAT_STRUCT_CHECK=1`），`REPEAT_ON_DIVERGENCE=record`。
+
+### 9.22.2 完成度：16/16，无缺失格、无硬失败
+
+| 项 | 值 |
+| --- | --- |
+| 完成数 | **16 / 16**（`cells_with_records=16`，`missing_cells=0`，`extra_cells=0`） |
+| 拒绝 / 失败 / 缺失 | **0 / 0 / 0** |
+| 生成长度 | 16/16 = **64**，`stop_reason` 16/16 = `max_new_reached`（**无 EOS 提前停止、无 `other_short`**） |
+| finite | 16/16 通过（`checks.passed=True`，含 prefill/propose/verify/repair 决策用 logits） |
+| 结构检查 | **16/16 `ok`**；AR 每次 2 项（prefill 后、decode 后），SpecDec 每次 44–54 项（逐轮 verify 前 + block 后） |
+| 汇总 | `diagnostic_completeness=complete_diagnostics_only`，`claimable=True`，退出码 0 |
+| 正式判据 | `formal_gate_status = **not_established**`（**永不 pass**） |
+
+### 9.22.3 八组独立重复：**8/8 完全一致**
+
+| family | KV | mode | 重复一致性 |
+| --- | --- | --- | --- |
+| F06 | base_bf16 | AR / Spec | **identical**（64/64） |
+| F06 | v_fp8 | AR / Spec | **identical**（64/64） |
+| F13 | base_bf16 | AR / Spec | **identical**（64/64） |
+| F13 | v_fp8 | AR / Spec | **identical**（64/64） |
+
+⇒ 两组独立进程在同配置下产出**逐 token 相同**的序列；峰值显存也逐位相同。**无重复性异常。**
+
+### 9.22.4 八组 AR/Spec 配对：**8/8 全部不同**（分歧可稳定复现）
+
+| family | KV | rep | 结果 | 共同前缀 | 首个分歧 index | AR token | SpecDec token | 长度 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| F06 | base_bf16 | r1 / r2 | **different** | **25** | 25 | **715** | **576** | 64/64 |
+| F06 | v_fp8 | r1 / r2 | **different** | **25** | 25 | **576** | **4710** | 64/64 |
+| F13 | base_bf16 | r1 / r2 | **different** | **47** | 47 | **13282** | **25806** | 64/64 |
+| F13 | v_fp8 | r1 / r2 | **different** | **23** | 23 | **28693** | **25179** | 64/64 |
+
+- 每个组合的 r1 与 r2 **给出完全相同的共同前缀与分歧 token** ⇒ 分歧是**确定性的、可重复的**，
+  不是随机抖动。
+- 相对此前调试输入（共同前缀 31），新 family 上共同前缀为 **23 / 25 / 47** ⇒ **分歧并非该条输入的特例**。
+- ⚠️ **不自动归因于浮点误差，也不自动豁免**：本轮只记录"不同"这一事实；
+  是否属 `BF16_NEAR_TIE` 需按冻结的 `classify_bf16_compare` 四条件判定（缺 `fp32_margin` 等输入，
+  现有证据只能停在 `NEEDS_INSPECTION`）。
+- 注意 AR 侧同样受 KV 档影响（如 F06 的 AR 在 base/v_fp8 下分歧 token 分别为 715 / 576），
+  即**"AR 与 SpecDec 不一致"并非唯一差异来源**。
+
+### 9.22.5 显存：两种口径分开记录（**不得混用**）
+
+| 口径 | AR（base / v_fp8） | SpecDec（base / v_fp8） |
+| --- | --- | --- |
+| PyTorch `peak_allocated` | 5261.7 / 5203.5 MiB | 6906.4 / 6847.7 MiB |
+| PyTorch `peak_reserved` | 5722.0 / 5588.0 MiB | **7332.0 / 7180.0 MiB** |
+| 设备侧 `cuda_free`（同刻） | 1343.0 / 1477.0 MiB | **0.0 / 0.0 MiB** |
+| 设备侧 `nvidia-smi used`（同刻） | 6302 / 6163 MiB | **7848 / 7757 MiB**（总 8188 MiB） |
+
+- 同一 family 的两种重复、以及两个 family 之间，**峰值逐位相同**（确定性）。
+- ⚠️ **不得用 `reserved` 反推物理余量**：`reserved ≤ 8188 MiB` 只是 PyTorch 记账事实。
+  真正要看的设备侧观测是：**SpecDec 档在峰值时 `cuda_free=0.0`、`smi used 达 7757–7854 MiB / 8188 MiB`**
+  —— 说明**设备侧压力确实到顶**（另有 20+ 个 C+G 消费者驻留）。这**不**证明分页，也**不**等于整卡被本进程独占。
+- **本轮不做任何加速/减速声明**；计时数据只作诊断观察。
+
+### 9.22.6 五类状态汇总（互不替代）
+
+| 类别 | 结果 |
+| --- | --- |
+| **运行**（execution） | **16/16 `complete`**；0 拒绝、0 崩溃、0 NaN/Inf、0 必需检查缺失、0 异常短输出 |
+| **结构**（structural） | **16/16 `ok`**（逐轮不变量 + 跨层 cache 结构检查均通过） |
+| **可重复性**（repeatability） | **8/8 `identical`**；0 异常 |
+| **输出一致性**（ar_spec_equality） | **8/8 `different`**（共同前缀 23–47，首个分歧两侧 token 已记录） |
+| **正式验收**（formal_gate_status） | **`not_established`** —— 单 family/单模式诊断**结构上无法**评估 B6 冻结门；**未通过、也未尝试通过** |
+
+⇒ **本轮诊断完成，但"诊断完成"不等于任何正式 correctness 结论。**
+
+### 9.22.7 本轮修正的一处**自身缺陷**（实跑当场暴露）
+
+16 次全部 PASS，汇总却报 `execution_status=incomplete ×16`。根因：`g5_8k_smoke_cudnn.py` 的终止
+stage 是 **`run_ended`**（通过）/ `run_ended_checks_failed`（失败），而 `status_fields.execution_status`
+首版只认 `"complete"` ⇒ **把全部通过的运行误判为 incomplete**。
+修法：显式列出各工具真实终止取值（`STAGES_TERMINAL_OK/FAIL`），并把非终止 stage 归为 `incomplete`；
+新增 CPU 回归（`stage=run_ended` ⇒ complete、`run_ended_checks_failed` ⇒ algorithm_failed、
+`loaded` ⇒ incomplete）。修后 `verify_readiness_selftest_cpu` **54 PASS / 0 FAIL**，
+汇总修正为 `complete_diagnostics_only` + `claimable=True`。
+**该缺陷在"工具 vs 实跑"的词汇表边界上，只在真跑之后才暴露。**
+
+### 9.22.8 原始产物
+
+- 索引：`output/g5/attn/fam16_20260929T060000Z.index.json`
+- 汇总：`output/g5/attn/fam16_20260929T060000Z.index.summary.json`
+- master TSV：`output/g5/attn/fam16_20260929T060000Z.master.tsv`
+- 16 份 run JSON + 日志：`smoke8k_cudnn_prefill_<RUN_ID>.json`、`fam16_20260929T060000Z_<label>.log`
+  （run_id 见 master TSV；本轮**未保存全 logits**）
+- 输入：`docs/prompt_families_manifest.json`（`v1-draft`），F06/F13；hash 已核验（见 9.22.1）
+
+### 9.22.9 进入正式实验仍缺的三项（**本轮不自动执行**）
+
+1. **正确性口径的批准及必要验证**：现行冻结判据是 B6 exact-id（FP32 主门 + BF16 四条件分类）。
+   本轮 8/8 分歧**未**满足任何豁免条件，也**未**据此降低标准；口径是否变更属**需小组批准的协议变更**。
+2. **最终配置回归**：backend/KV/chunk 等一旦定稿，需按定稿配置重跑覆盖回归。
+3. **小规模 12 条件测量 pilot**（先于任何 ≥16 family × 12 条件的矩阵）。
 

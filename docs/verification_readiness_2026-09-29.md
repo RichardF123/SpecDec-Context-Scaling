@@ -146,11 +146,11 @@ CPU 自测：`python -m specdec.engine.verify_family_independence_cpu` → **PAS
 **退出码语义（汇总器）**：`0` = 16 格齐全且结构与重复自洽（**仍不是正式正确性通过**）；
 `3` = 报告已写出但诊断不齐全/不可宣告。**刻意不用 0 表示"正式通过"**。
 
-### 原始缺项与最小修改方案（保留，便于追溯）
+### 原始缺项与最小修改方案（**历史记录，已被上表取代；保留以便追溯**）
 
-| 编号 | 缺项 | 最小修改（**本轮不实施**） |
+| 编号 | 缺项（**当时状态**） | 最小修改（**当时计划；现已按上表实施**） |
 | --- | --- | --- |
-| **G1** | 工具**无法输入 manifest family**：`P5V.load_ids()` 把 `test.raw` 前缀写死，`g5_8k_smoke_cudnn.py` 直接调它 ⇒ 第 3 节的清单**当前无法执行** | 新增**只读**的输入解析：`SMOKE_FAMILY=F06`（+ `SMOKE_MANIFEST`）时，按第 2 节的取用规则重建 ids，并在 `input` 里写 `source/block/window_token_start/token_sha1/ids_hash`；未设该变量时**行为与现在逐位一致**（回归保护） |
+| **G1** | （**当时**）工具**无法输入 manifest family**：`P5V.load_ids()` 把 `test.raw` 前缀写死 ⇒ 清单当时不可执行。**现已实现**（`SMOKE_FAMILY`，默认关闭） | 新增**只读**的输入解析：`SMOKE_FAMILY=F06`（+ `SMOKE_MANIFEST`）时，按第 2 节的取用规则重建 ids，并在 `input` 里写 `source/block/window_token_start/token_sha1/ids_hash`；未设该变量时**行为与现在逐位一致**（回归保护） |
 | **G2** | 编排器**遇到 AR/Spec 分歧就停**，会让 16 次清单在第 2 步中断 | 加一个显式开关（如 `REPEAT_ON_DIVERGENCE=record`）：分歧时**记录并继续**，仅在**硬失败**时停（硬失败定义见 §5）。默认仍为 `stop`，避免改变历史语义 |
 | **G3** | 无重复一致性字段 | 复用**已有的纯函数** `g5_8k_qk32_analysis.first_divergence(a,b)`（已单测）比较 r1/r2 的 `run.gen`，写入 `repeat_consistency = {identical, first_diff_index, a_token, b_token}`；两次不同 ⇒ 标 **待查** 并停止推进（按建议书 §6 阶段 1） |
 | **G4** | 未做跨层 cache 结构检查 | 在 prefill 之后与 decode 结束各调一次 `spec_cache.check_consistent(cache)`（引擎自带、纯读取），把异常／`None` 结果记入 `cache_structure_ok`；不新增自造口径 |
@@ -267,7 +267,9 @@ python -m specdec.engine.family16_summary
 
 ## 10. 本轮**未**做的事（边界声明）
 
-- **未**启动任何 GPU 运行；**未**跑 16 次清单（清单本身尚不可执行，见 G1/G2）；
+- （**写于工具实现之前**）**未**启动任何 GPU 运行；**未**跑 16 次清单（当时清单尚不可执行，见 G1/G2）。
+  ⚠️ **该句已过期**：G1–G5 已于 commit `bfc75ff` 实现并通过 CPU 自测，清单**已可执行**；
+  本条保留为历史记录，不再代表当前状态。
 - **未**修改任何工具代码、manifest、默认 backend/精度、验收门槛或内存护栏；
 - **未**采用、**未**批准决策建议书的任何路线；协议变更事项**未**生效；
 - **未**把任何旧 FAIL / CHECK 改写，也**未**新增判据；

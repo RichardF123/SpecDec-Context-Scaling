@@ -27,6 +27,14 @@ EXEC_COMPLETE = "complete"                    # 本工具意义上"跑完且证�
 
 STOP_REASONS_OK = ("max_new_reached", "eos")
 
+# ⚠️ **工具词汇表**：`g5_8k_smoke_cudnn.py` 的终止 stage 是 `run_ended`（通过）与
+#    `run_ended_checks_failed`（检查失败），**不是** `complete`。首版只认 `"complete"`，
+#    于是 16 个**全部通过**的运行被误判为 `incomplete`（本轮 16 次实跑当场暴露）。
+#    ⇒ 这里显式列出各工具的真实终止取值，并由 CPU 回归钉住。
+STAGES_TERMINAL_OK = ("complete", "run_ended")
+STAGES_TERMINAL_FAIL = ("run_ended_checks_failed", "aborted_non_finite",
+                        "aborted_weight_mismatch", "checks_failed", "not_reproduced")
+
 DIAGNOSTIC_ONLY_NOTE = (
     "这些是**诊断**字段。`execution_status=complete` 只表示「这一次按计划跑完且证据自洽」，"
     "**不构成**任何正式正确性结论；正式判据见 formal_gate_status。"
@@ -87,9 +95,13 @@ def execution_status(rec: dict | None) -> dict:
     if fc in ("finite", "coverage", "structure", "length_or_stop", "coverage_or_checks"):
         return dict(status=EXEC_ALGORITHM_FAILED, reason=f"failure_class={fc}",
                     stops_advance=True, failure_class=fc)
-    if stage != "complete":
-        return dict(status=EXEC_INCOMPLETE, reason=f"stage={stage!r}", stops_advance=True,
-                    failure_class=fc or "unknown")
+    if stage in STAGES_TERMINAL_FAIL:
+        return dict(status=EXEC_ALGORITHM_FAILED, reason=f"stage={stage!r}",
+                    stops_advance=True, failure_class=fc or "coverage_or_checks")
+    if stage not in STAGES_TERMINAL_OK:
+        # 例如 "loaded" / "target_prefill_done"：说明进程在**跑到终止之前**就没继续写记录。
+        return dict(status=EXEC_INCOMPLETE, reason=f"stage={stage!r}（非终止状态）",
+                    stops_advance=True, failure_class=fc or "unknown")
     if not chk.get("passed", False):
         return dict(status=EXEC_ALGORITHM_FAILED, reason="checks.passed=False",
                     stops_advance=True, failure_class="coverage_or_checks")
@@ -97,7 +109,8 @@ def execution_status(rec: dict | None) -> dict:
         return dict(status=EXEC_ALGORITHM_FAILED,
                     reason=f"stop_reason={run.get('stop_reason')!r}", stops_advance=True,
                     failure_class="length_or_stop")
-    return dict(status=EXEC_COMPLETE, reason="stage=complete 且 checks.passed=True",
+    return dict(status=EXEC_COMPLETE,
+                reason=f"stage={stage!r} 且 checks.passed=True",
                 stops_advance=False, failure_class="none")
 
 
