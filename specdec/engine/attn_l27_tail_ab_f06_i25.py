@@ -55,11 +55,16 @@ def _fields(row, tok, k=5):
     r = row.detach().float().reshape(-1).cpu()
     f = DF.row_fields(r, watch=list(WATCH), k=k)
     tk = torch.topk(r, k)
-    return dict(argmax_id=f["argmax_id"], max_score=f["max_score"], n_max_tied=f["n_max_tied"],
+    am = f["argmax_id"]
+    return dict(argmax_id=am, max_score=f["max_score"], n_max_tied=f["n_max_tied"],
                 tied_max_tokens=f["tied_max_tokens"],
+                # ⚠️ argmax 的文本**按 id 单独查表**：不得用 topk 首位的文本（并列时顺序不具语义）
+                argmax_text=tok.decode([am]),
                 margin_top1_top2=float(tk.values[0] - tk.values[1]),
                 top5=[dict(token=int(i), text=tok.decode([int(i)]), logit=float(v))
                       for i, v in zip(tk.indices, tk.values)],
+                top5_note="topk 只是参考列表；**并列时其顺序不等于解码 argmax**，"
+                          "文本必须按 argmax id 单独查表",
                 watch={str(t): float(r[t]) for t in WATCH},
                 n_finite=int(torch.isfinite(r).sum()), vocab=int(r.numel()))
 
@@ -263,7 +268,7 @@ def main() -> int:
                   f"mean={v['abs_err_mean']:.6g} shape={v['shape']}")
         print("== 最终 ==")
         for nm, f_ in (("A", fA), ("B", fB)):
-            print(f"  {nm}: argmax={f_['argmax_id']} ({f_['top5'][0]['text']!r}) "
+            print(f"  {nm}: argmax={f_['argmax_id']} ({f_['argmax_text']!r}，按 id 查表) "
                   f"score={f_['max_score']} margin={f_['margin_top1_top2']:.6g} "
                   f"tied={f_['n_max_tied']}{f_['tied_max_tokens']} "
                   f"576/715/4710={f_['watch']['576']}/{f_['watch']['715']}/{f_['watch']['4710']}")

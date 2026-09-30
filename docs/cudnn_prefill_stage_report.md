@@ -2796,3 +2796,89 @@ K/V **纯切片**到前 8217 项（`torch.equal` 断言）；T=8217 时 0..8216 
 `attn_l27_tail_ab_selftest_cpu.py`（**PASS 22 / FAIL 0**）。
 **保留的失败记录**：`…_attntailab_20260930T175218Z.json`（`R_tap_block` 的 `(1,4,1536)` 被当成 `(1536,)`）。
 
+---
+
+## 9.34 AR/Spec 配置审计 + 初始状态 / 后续计算路径的最小直接对照（F06/index25，2026-09-30）
+
+全程报告 `docs/ar_spec_config_audit_2026-09-30.md`。
+
+### 9.34.1 配置审计结论：**路径相关字段未发现不一致**
+
+AR 与 Spec **都是分块 prefill**（chunk **2048**）、都在 `phase='prefill'` 走**融合 cuDNN**、`base_bf16`、
+精度开关全关。**产物证明**：AR `fused_by_phase={'prefill':112}`（28 层×4 chunk）；
+Spec `fused_by_phase={'prefill':208}`（target 28×4 + draft 24×4）；**两者 `s_max['prefill']=2048`**
+（若为单次 8192 前向这里会是 8192）。代码证明：`smoke_hooks.py:101/155` 在 `attention_phase("prefill")`
+内用 `P5V.timed_chunked_prefill` 替换 `spec_dec._prefill`。decode 侧 AR=`decode`(s=1)、
+Spec=`verify`(s=4)/`repair`(s=1)，均 eager。
+
+★ **风险项（非本次对照的不一致）**：`spec_dec._prefill` 的**默认实现是单次前向**且默认 phase 为 `"other"`
+⇒ 落到 **eager**；8K 下约需 3 GiB 的 scores/fp32-softmax。**不装 hooks 而直接调
+`spec_decode_greedy` 的 8 个入口**（`g4_b6_*`、`g4_b5_smoke`、`g4_part4_mismatch_diag`、
+`g4_specdec_index_tests`、`g5_attn_cudnn_validate`、`attn_phase_selftest_cpu`）的 prefill 与 AR **不同**。
+**未验证**它们在 8K 的实际行为。
+
+### 9.34.2 规范初始状态与两个复现门（**全部通过**）
+
+| 项 | 结果 |
+| --- | --- |
+| 分块 prefill 后 cache | **8192**，28 层 `(1,2,8192,128)` bf16，finite |
+| 末位 argmax（首 token） | **659**（与记录一致） |
+| 两次**独立**建立 | logits **逐位相同**；28 层 K/V 摘要 **56/56 全同** |
+| S/B 起点 | 同一份 P0 的两次深拷贝，逐层数据指针不同（无共享可变存储）✓ |
+| **S 臂复现门** | 输入位置 **8216** → argmax **715**（== 真实 AR）✓ |
+| **B 臂复现门** | 第 11 轮 `rows[1]` → **576**（== 真实 Spec），且 **12 轮 `g` 全部逐元素等于记录值** ✓ |
+
+### 9.34.3 C-S vs C-B（同一初始状态、同一 token 串）：首次差异边界
+
+共同可比预测位置 **26** 个（8192 来自 prefill 末位；8193..8217 来自后续调用）。
+
+| 指标 | 位置 |
+| --- | --- |
+| **首次非零 logits 差异** | **8193**（第一个 verify 行 vs 第一个串行步；max\|Δ\|=0.1875，133438 个坐标不同） |
+| **首次 argmax 分歧** | **8217**（**S=715，B=576**） |
+| 逐位相同的位置 | 仅 **8192**（两臂共用同一份 prefill logits） |
+
+8193..8216 的 logits **每个位置都不同**（12 万～14.6 万坐标，max\|Δ\| 0.125～0.289），
+但 **argmax 一直相同**；8216 处 max\|Δ\| 最大（0.289062）。
+8217 的并列结构：**S：{715,4710} 并列 margin 0.0**；**B：{576,715,4710} 三方并列 margin 0.0**
+⇒ 均由「argmax 取最小下标」决定，差异来自**并列结构不同**。
+⇒ 自 8193 起两臂**只能称「相同 token 前缀、数值历史不同」**，**不可**再称「当前算子输入完全相同」。
+
+### 9.34.4 E 轴（eager prefill）：**未复现 ⇒ 按预登记规则停止，不给根因判断**
+
+| 项 | 结果 |
+| --- | --- |
+| eager **分块** prefill @8K | **可运行，未 OOM**（修正旧说法：历史上「8K eager 必 OOM」对应的是**单次** 8192 前向） |
+| E 轴初始状态确定性 | 两次建立逐位相同 ✓ |
+| **E/C 初始状态差异** | 跨进程可比的 sum：**54/56** 个层-K/V 不同（如 `L10_k` -126660.42 vs -134893.02）⇒ backend **改变初始 KV** |
+| E-S vs C-S（同老师强制 token） | 25 个位置中 **2 处**不同：**8202**（C=594，E=**364**）、**8217**（C=715，E=**576**） |
+| 处置 | **S 臂未复现 715 ⇒ 停止因果分析；E-B 未执行**（不补跑、不换参数） |
+
+### 9.34.5 结论
+
+- **支持 H3**：同一 cuDNN 配置、同一初始状态、同一 token 序列下，**「单步 vs 四行分块」足以复现
+  index 25 的 AR/Spec 分歧**（715 vs 576）；**首次非零 logits 差异在 8193**，**token 级首次分歧在 8217**。
+- **削弱 H1**：路径相关配置字段逐项对照**未发现不一致**（除 §9.34.1 的入口依赖风险）。
+- **H2 细分**：同一 backend 内初始状态**完全确定可复现**；**跨 backend 不同**（54/56 层不同）。
+- E 轴结论为**复现不足**：可如实记录「prefill backend 在本位置**不是结果中性的**」，
+  **不**判 cuDNN 实现有错，**不**称 eager 会让 AR 与 Spec 一致（E 轨迹在 8202 已偏离）。
+- **正式正确性状态保持不变（未通过）**；未做速度声明、未改门槛。
+
+### 9.34.6 下一步（唯一优先候选）
+
+把 prefill 路径**统一到唯一实现**并加**入口自检**：让 `spec_dec._prefill` 默认即分块 + 显式
+`phase='prefill'`，并在 `cudnn_prefill` 策略下检测到 prefill 出现 `eager` 或 `s_max['prefill'] > CHUNK`
+时**报错停止**（而非静默走单次 eager）。**不改任何数值算法、不放宽任何门槛**；
+判据：① 全入口 8K 下 `s_max['prefill']==CHUNK` 且 `fused_by_phase==['prefill']`；
+② 同一 prompt 两次独立运行的初始 KV **逐元素相同**；③ 旧记录语义不变（重跑标为新配置）。
+
+### 9.34.7 本轮产物
+
+- 工具 `specdec/engine/prefill_sb_replay_f06.py`（`PREFSB_ARM=eager|cudnn_prefill` 同代码路径）；
+- C 轴：`…_prefillsb_20260930T181447Z.json/.pt`（**complete**，稳定 sha256 指纹）、
+  `…_prefillsb_20260930T181032Z.json/.pt`（首跑，保留）；
+- E 轴：`…_prefillsb_20260930T181158Z.json`（**checks_failed**，保留）；
+- **文档口径修正**：token **576 = `' The'`**（非换行符；715=`' \n'`、4710=`' \n\n'`）；
+  **不得把 topk 并列展示顺序当 argmax 规则**（本例 topk 首位是 4710，argmax 是 576）；
+  工具已改为**按 argmax id 单独查表**并把注意事项写入产物字段。
+
