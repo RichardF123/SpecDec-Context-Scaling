@@ -72,8 +72,9 @@ SwiGLU / KV-cache 解码 / 贪心生成），目前沿 **KV-cache → V-only FP8
 
 **技术栈**：Python + PyTorch 2.6（cu124）；自写引擎 `specdec/engine/model_self.py`（OURS）；
 HuggingFace 用于权重加载、tokenizer 与参考实现（LIB）；自写缓存、V-only FP8 量化及 greedy 投机循环。
-新增的可选 prefill 融合路径通过 PyTorch 调用 cuDNN attention（LIB），不是团队自研 CUDA/FlashAttention 算子。
-int8/int4 权重量化与自研 CUDA 不属于当前推进范围；测量遵循 G5 协议并落盘保存真实数据。
+新增的可选 prefill 融合路径通过 PyTorch 调用 cuDNN attention（LIB）。
+非 GEMM 算子（RMSNorm、RoPE、SwiGLU、causal GQA）另有 CUDA / Triton 实现，用法和一条不加载权重的样例在 [`specdec/kernels/README.md`](specdec/kernels/README.md)。
+int8/int4 权重量化仍不在当前推进范围；测量遵循 G5 协议并落盘保存真实数据。
 
 **为什么这么做**：调 API/库只能看整机表现，研究问题（缓存、量化、投机解码的收益）
 需要引擎内部控制权（缓存布局、解码循环、计时插桩）——这是自建引擎的必要性而非炫技；
@@ -155,7 +156,7 @@ specdec/
   config.py       RunConfig + config_hash / run_id（复现哈希链）
   results.py      只追加 results.jsonl 台账
   engine/         model_self.py（OURS 自写）+ 对齐/测试/基准工具
-  kernels/        （L3 轨，可选）
+  kernels/        CUDA / Triton：RMSNorm、RoPE、SwiGLU、causal GQA（见 kernels/README.md）
   quant/          Phase 4：int8/int4（OURS）
   kv_quant/       Phase 4b：KV 量化（OURS）
   spec_dec/       Phase 5：投机解码（OURS）
