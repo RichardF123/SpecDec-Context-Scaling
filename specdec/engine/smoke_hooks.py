@@ -75,10 +75,13 @@ class DecisionHooks:
 
     def __init__(self, *, tgt, drf, registry: CheckRegistry, prefill_impl,
                  on_prefill=None, on_round_start=None, run_owner=None,
-                 on_verify_pre=None, on_verify_post=None):
+                 on_verify_pre=None, on_verify_post=None, on_prefill_post=None):
         self.tgt, self.drf, self.reg = tgt, drf, registry
         self.prefill_impl = prefill_impl
         self.on_prefill = on_prefill
+        # **诊断专用**、默认 None ⇒ 不改变任何默认行为：prefill 完成后回调
+        # `(model_key, logits, cache)`，用于记录 target / draft **各自**的初始状态摘要。
+        self.on_prefill_post = on_prefill_post
         self.on_round_start = on_round_start
         # `on_verify_pre(cache, cands)` 在**调用真 `_verify` 之前**触发 —— 这是唯一能拿到
         # "本轮开始时、未被就地修改过的 target cache"的时机（`_verify` 会就地改写传入的 dict）。
@@ -104,6 +107,8 @@ class DecisionHooks:
         dt = time.perf_counter() - t0
         self.reg.check_finite(lg, phase="prefill", model=key, role="prefill_lg",
                               where="prefill 返回：供 saved_next/首轮 argmax 使用")
+        if self.on_prefill_post is not None:
+            self.on_prefill_post(key, lg, cache)
         if self.on_prefill is not None:
             self.on_prefill(key, dt)
         return lg, cache

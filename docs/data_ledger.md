@@ -2919,6 +2919,60 @@ index 25 的 AR/Spec 分歧）；**削弱 H1**（路径相关字段无不一致�
 `prefill_sb_replay_f06.py` 加入 `OPT_IN_CONSUMERS`，并把 `authorize_tools` 扩展为
 `("g5_f06_index25_forensics", "prefill_sb_replay_f06")`（同属 F06/index25 定点取证，未引入新 family）。
 **在批准前该套件保持 13/3**；这不是引擎/正确性失败。
+> ⚠️ **历史状态说明**：其中「E-B 未执行」一句**已过时** —— E-B 已于同日第二轮执行（见 §4.50）；
+> 本条**按原样保留**（不修改其当时的记录），只加此说明。
+
+### 4.51 真实 eager Spec 路径的 F06 8K 完整生成一致性（2026-09-30 第三轮，**候选配置诊断**）
+
+**未**改默认 backend/精度/门槛/tie-breaking/chunk/k/max_new；**未** teacher forcing、**未**复用旧候选或旧日程。
+配置：F06(8192, manifest+hash 已核) · target 1.5B · draft 0.5B · BF16 · target/draft KV 均 `base_bf16` ·
+**全程 eager（显式阶段标记）** · chunk 2048 · k=4 · max_new=64 · `qk_fp32/prob_fp32=False` · greedy · EOS 151645（未触发）。
+仍走生产 `DecisionHooks` ⇒ Spec 的 **target 与 draft 都是分块（chunk=2048）+ 显式 `phase='prefill'`**，
+**不会**退化成默认 `_prefill` 的单次 8192 前向。
+
+**四次运行（独立进程、串行、各自从加载+prefill 开始）**：AR `…T185121Z`、Spec `…T185535Z`、
+AR `…T185302Z`、Spec `…T185655Z`。四者 `stage=run_ended`、`gen_len=64`、`stop_reason=max_new_reached`、
+**必需检查 passed（AR 10 / Spec 14）**、`未覆盖=[]`、**`fused_by_phase={}`（零融合调用）**。
+阶段计数：AR `eager={'prefill':112,'decode':1764}`；Spec `eager={'prefill':208,'propose':1944,'verify':588,'repair':468}`
+（208 = target 28×4 + draft 24×4 ⇒ 两模型**均分块且均 eager**）。
+
+**初始状态（target/draft 分开）**：target prefill 后 cache **8192**、28 层、全层 bf16/finite/长度硬检查通过；
+**AR 与 Spec 的 target 全层摘要 56/56 一致**；next logits sha `62f21b17cc10e90e`、sum 436652.5625、
+argmax **659**、margin **0.375**（两臂相同）；draft 24 层摘要独立记录且两次重复一致。
+⚠️ 口径：**摘要一致 ≠ 直接逐元素比较**（本轮**未**做 `.pt` 级逐元素比对）；因摘要对完整张量字节计算且
+shape/dtype/长度已硬检查，这是本轮可得的**最强**证据。**AR/Spec target 初始状态相同 ⇒ 可以合法声称「相同起点」**。
+
+**判定**：① **AR rep1 vs rep2**：64 token **逐位相同** ✓；② **Spec rep1 vs rep2**：**逐位相同** ✓；
+③ **AR vs Spec**：**64/64 token 完全一致、无首次分歧**（stop_reason 与长度一致）✓；
+④ 有限性（AR 64 次 / Spec 164 次，未覆盖项为空）、`SMOKE_STRUCT_CHECK=1` 结构检查、commit 护栏 `ok=True` 全过 ✓。
+生成序列（两者相同）：`659,330,576,8017,572,1083,36375,553,279,7055,364,82,7211,1154,879,614,2474,6941,432,825,315,862,6930,74623,27685,659,576,…`（周期至 64）。
+
+⇒ **结论（严格限定）**：**F06、该 eager 配置的完整生成诊断通过**。
+**不**宣称全局修复；**不**删除 cuDNN 失败记录（§9.23–§9.35 的 715/576 分歧仍成立）；**不**自动改正式 backend；
+**不**当作正式验收。
+
+**资源（仅运行观察，无 performance 声明）**：AR peak_alloc 6153 MiB / peak_res 9668 / smi 7840·7813，prefill 4.34·4.24 s；
+Spec peak_alloc 7795 / peak_res 10648 / smi 7785·7831，prefill 26.0·23.0 s（target 7.9+17.9 / 7.8+15.2）。
+⚠️ **风险**：eager 8K 下 `pt_reserved` 计数器高于设备总显存（8188 MiB）且多次 `cuda_free=0.0` ⇒ 显存余量很薄（工程风险，未因此降配）。
+
+**本轮最小工具修改（默认关闭，未改默认行为）**：`smoke_hooks.py` 新增可选 `on_prefill_post`（默认 None）；
+`g5_8k_smoke_cudnn.py` 新增 `SMOKE_PREFILL_DIGEST`（默认关闭）记录 target/draft 各自的全层 KV 硬检查+稳定摘要+next logits，
+并把 `dispatch_only_prefill` 改为**按臂判定**（eager 臂要求融合**严格为 0**，更严格）；
+`sb_align.py` 的 head_dim 改为**推断+跨层一致**（draft=64，原硬编码 128 会误杀），排除项新增行级/去重两套口径。
+自测：`smoke_checks` **27/0**、`smoke_midstep` **28/0**、`sb_align` **38/0**。
+
+**保留的失败记录（未覆盖）**：`…T184854Z`（我的摘要助手 reshape 缺陷）、`…T184947Z`（dispatch 未按臂判定）、
+`…T185154Z` 与 `…T185333Z`（draft head_dim=64 被硬编码 128 误杀）。
+
+**排除项统计口径（去重）**：上一轮 cuDNN 臂排除项 **行级 63 / 按(位置,原因)去重 33 / 位置 21**（`prefix` 60、`limit` 2、缺失 1）。
+
+**缺项**：未做 `.pt` 级逐元素比较；未记录决策 margin（本轮**无分歧点**，故"分歧处 margin"不适用）；
+只覆盖 1 family × 1 KV 档 × max_new=64 × 单 prompt；**V-only FP8 未测**、fam16 其余 15 格未测；
+B6 正式门（20 组合）与主门（FP32 逐 token 相等）**未被替代**；生产默认仍为 `cudnn_prefill`。
+
+**下一步（唯一优先）**：按同一四运行协议把候选配置诊断扩展到**其它已参与调试的条件**与 **V-only FP8**，
+并**另行安排独立验收**；配套工程项＝prefill 统一 + 入口自检（§4.49 末）。**不**自动扩展矩阵、**不**改生产默认、**不**放宽标准。
+
 
 ### 4.50 2×2 补齐（eager S/B）+ 验收门与对齐逻辑修正（F06/index25，2026-09-30 第二轮）
 
@@ -3021,3 +3075,14 @@ index 25 的 AR/Spec 分歧）；**削弱 H1**（路径相关字段无不一致�
 - 2026-09-30（§4.48，**末端传播验证已执行**）：只替换 L27 对齐行 attention core（A=四行 vs B=单行），下游形状统一 `(1,1,1536)`、残差取 **L27 层输入**（并用恒等式 `layer_in+attn_out==` 上轮保存的 attention 之后残差 硬校验，杜绝重复加 attention）、BF16 加法、生产模块、无新精度开关。控制全过（跨运行复现单行 `o_proj`、A 重复跑逐元素一致、输入/权重未改、权重 bitmatch 338）。逐阶段差异**保留并放大**：`o_proj` 23/1536（max 7.8e-3）→ 残差加法后 1/1536 → MLP 后 max 0.03125 → 最终 logits **max 0.0625、34023/151936**；但**判决三坐标逐位相同**，A/B **同为 argmax 576**、margin 0.0、并列 3 [576,715,4710]。⇒ **该位置、该固定下游条件下，行数导致的 core 差异不足以改变最终选择**，这条局部传播诊断**收束**。**不**宣称所有 attention 差异无关、**不**解释 AR=715、**不**定位首次产生处、**不**外推；**正式正确性门槛状态不变**。CPU 自测 **22 PASS / 0 FAIL**；失败记录保留未覆盖。
 - 2026-09-30（§4.49，**配置审计 + 初始状态 × 后续路径最小对照**）：审计确认 AR/Spec **路径相关配置无不一致**（都分块 chunk=2048、都 `phase='prefill'` 融合 cuDNN、`s_max['prefill']=2048`；产物 `fused_by_phase` 112 vs 208 佐证），并报告一个**入口依赖风险**（`spec_dec._prefill` 默认单次 eager；8 个不装 hooks 的入口与 AR 路径不同，8K 行为未验证）。**规范初始状态**两次独立建立逐位相同；**S/B 起点同源深拷贝**。**两个复现门均通过**（S@8216=715 与真实 AR 一致；B 第 11 轮 rows[1]=576 与真实 Spec 一致，12 轮 `g` 全等）。**C-S vs C-B**：仅 8192 逐位相同，**首次非零 logits 差异 @8193**（max 0.1875），8193–8216 每位置都不同但 argmax 全同，**首次 argmax 分歧 @8217（S=715 vs B=576）**；8217 并列结构 S{715,4710} vs B{576,715,4710} ⇒ 差异来自并列结构。**E 轴**：分块 eager @8K **未 OOM**（修正旧说法），E/C 初始 KV **54/56 层 sum 不同**，E-S 与 C-S **2/25 位置不同**（8202、8217）；**E 臂未复现参考值 ⇒ 按预登记停止，E-B 未执行**，结论为**复现不足**（不判 cuDNN 有错）。⇒ **支持 H3、削弱 H1、H2 细分**。**正式正确性状态不变**。口径修正：token 576 文本是 `' The'`；不得把 topk 并列顺序当 argmax 规则。★ **治理守卫被正确触发**：新工具未登记 ⇒ `verify_family_independence_cpu` **16/0 → 13/3**；**不自行放宽**，注册改动待批准。
 - 2026-09-30（§4.50，**2×2 补齐 + 验收门/对齐修正**）：**只修诊断工具与补齐对照**，未改生产实现/精度/门槛、未启动正式实验。① **分组验收门**：cuDNN 保留原始复现门（实测 S@8217=715、B rows[1]=576、12 轮 g 全等**全过**）；**eager 干预组不要求复现旧 cuDNN token/g**（观测结果），但须过有限性/结构/位置/输入来源/**初始状态独立性**/确定性/**全层 KV 硬检查**；删除「改 backend 未复现旧答案 ⇒ 对照无效」的表述。② **对齐语义**：按预测位置配对 + **逐行保留来源**，**前缀不符的行（含被拒候选之后）标为不可比较且不入统计**；**止于预测位置 8217**；新增纯逻辑 `sb_align.py` + CPU 自测 **34/0**。③ **四格全部执行**：cuDNN S/B 首次非零 logits 差异 @8193、**首次 argmax 分歧 @8217（715 vs 576）**（8217：S {715,4710} 并列 margin 0.0；B 三方并列 {576,715,4710} margin 0.0）；**eager S/B 到 8217 不分歧（576/576，均单点 max，margin 0.25/0.125）**。跨 backend：E-S vs C-S 首次非零 @8192（max **2.015625**）、首次 argmax 分歧 @8202、8217 处 715→576；E-B vs C-B 首次非零 @(8193,verify r0 j0)、首次 argmax 分歧 @(8202,verify r4 j0)。④ **可比性账**：排除 60 条前缀不符 + 2 条超上限；8192 的 prefill 行只在 S 臂 ⇒ 显式登记缺失。⑤ **结构账**：S 最终 8217 == 期望 8217 ✓；B 亦 8217 但**数值历史不同** ⇒ 只报长度相同。⑥ 初始状态两次建立逐位相同、**56/56 sha256 摘要一致**、S/B 起点逐元素相同且不共享存储。⑦ **结论限定**：**E 组不分歧**只说明该样本该日程下结果不同，**不**证明 eager 修复真实 Spec、**不**证明 cuDNN 是必要条件；C 组分歧已复现但**未定位单一算子、不称 cuDNN 为根因**。⑧ **治理**：工具经授权登记（范围仅限该工具与 F06，新增「只能消费 F06」检查），`verify_family_independence_cpu` **13/3 → 17/0**。**正式正确性状态不变**。
+- 2026-09-30（§4.51，**真实 eager Spec 完整生成诊断**）：四次独立进程串行运行（AR/Spec × rep1/rep2），
+  F06 8192 + target 1.5B + draft 0.5B + BF16 + base_bf16 + **全程 eager** + chunk 2048 + k 4 + max_new 64。
+  四者均 `run_ended`、`gen_len=64`、`stop=max_new_reached`、检查 passed（10/14）、未覆盖 `[]`、**fused 调用为 0**。
+  **AR rep1==rep2、Spec rep1==rep2、AR==Spec 64/64 token 完全一致、无分歧**；
+  AR/Spec 的 **target 初始状态全层摘要 56/56 一致**（next logits sha 相同、argmax 659、margin 0.375）；
+  draft 24 层摘要独立记录且重复一致。有限性（64/164 次）、结构检查、commit 护栏全过。
+  ⇒ 结论**严格限定**为「**F06、该 eager 配置的完整生成诊断通过**」：不宣称全局修复、不删除 cuDNN 失败记录、
+  不改正式 backend、不当作正式验收。风险：eager 8K 显存余量很薄（`pt_reserved` 计数器高于设备总量、`cuda_free=0.0`）。
+  工具改动默认关闭（`SMOKE_PREFILL_DIGEST`、可选 `on_prefill_post`、dispatch 按臂判定、head_dim 推断）；自测 27/0、28/0、38/0。
+  **缺项**：未做 `.pt` 级逐元素比较；只覆盖 1 family/1 KV 档/64 token；V-only FP8 与 fam16 其余条件未测；
+  正式门（B6 20 组合、FP32 主门）未被替代。

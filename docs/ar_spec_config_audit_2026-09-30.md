@@ -170,9 +170,18 @@
 **可比性纪律（本次修正的重点）**：对照按预测位置配对并**逐行保留来源**
 （`serial:step=k` / `verify:round=r,j=j` / `repair:round=r` / `prefill`）；
 **历史 token 与共同前缀不一致的行一律标为不可比较且不入统计** —— 各臂被排除的行：
-**60 条因前缀不符**（含所有「被拒候选之后」的行，例如 m=0 的轮次其全部 verify 行）、
-**2 条超出上限 8217**（第 11 轮的 j=2/j=3）。cuDNN 组可比配对 **25** 条（旧口径按位置覆盖得到 26 条，
-其中含 8192 的 prefill 行——它只在 S 臂有，已改为**显式登记为缺失**而不是静默填入）。
+
+| 口径 | 条数 |
+| --- | --- |
+| **行级条目**（每条对应**一行**，`pred_pos + source + detail` 唯一 ⇒ **不是重复登记**） | **63** |
+| 按 **(位置, 原因)** 去重 | **33** |
+| 涉及**位置数** | **21** |
+| 分类（行级） | `prefix` 60（被拒候选之后的行）· `limit` 2（超出 8217）· `B 臂无该预测位置的行` 1（8192 的 prefill 行只在 S 臂） |
+
+⇒ 报数时两套口径都给（行级 63 / 去重 33 / 位置 21）；`sb_align.compare_arms` 已自动产出
+`n_incomparable_rows`、`n_incomparable_distinct_pos_reason`、`n_incomparable_distinct_pos`。
+cuDNN 组可比配对 **25** 条（旧口径按位置覆盖得到 26 条，其中含 8192 的 prefill 行——它只在 S 臂有，
+已改为**显式登记为缺失**而不是静默填入）。
 
 **结构账（不再混同终态）**：S 臂最终 cache 长度 == `PROMPT + len(feed_seq)` == **8217** ✓；
 B 臂在**止于 8217** 的规则下经 `trim` 后也为 **8217**，但**两者数值历史不同**
@@ -297,7 +306,7 @@ verify_family_independence_cpu:  16 PASS / 0 FAIL  →  13 PASS / 3 FAIL
 | # | 运行 | arm | 结果 | 说明 |
 | --- | --- | --- | --- | --- |
 | 1 | `…_prefillsb_20260930T181032Z` | cudnn | complete | 首跑；**按位置字典比较**（旧对齐逻辑，已废弃） |
-| 2 | `…_prefillsb_20260930T181158Z` | eager | **checks_failed** | 旧验收门错误地把「干预组答案变化」当失败；**记录保留** |
+| 2 | `…_prefillsb_20260930T181158Z` | eager | **checks_failed** | 旧验收门错误地把「干预组答案变化」当失败；**记录保留**。⚠️ **其中的「E-B 未执行」为历史状态**：E-B 已于第二轮执行（见 §3.1 与本文件 §8 第 5 项） |
 | 3 | `…_prefillsb_20260930T181447Z` | cudnn | complete | 仅换稳定 sha256 指纹后重跑，结论逐位一致 |
 | 4 | `…_prefillsb_cudnn_prefill_20260930T183054Z` | cudnn | **complete** | **本轮最终**：分组验收门 + 来源保留对齐 + 止于 8217 |
 | 5 | `…_prefillsb_eager_20260930T183142Z` | eager | **complete** | **本轮最终**：观测门；E-S/E-B 均完成 |

@@ -39,6 +39,7 @@ from . import family_input as FI
 from . import status_fields
 from .smoke_hooks import DecisionHooks
 from . import spec_cache
+from . import sb_align as A
 
 ROOT = Path(__file__).resolve().parents[2]
 OUTDIR = ROOT / "output" / "g5" / "attn"
@@ -60,6 +61,9 @@ ON_DIVERGENCE = os.environ.get("REPEAT_ON_DIVERGENCE", "stop").strip().lower()
 DRY_RUN = S.env_flag("SMOKE_DRY_RUN", False)
 # 轻量回归：注入故障以验证"检查失败 ⇒ 落盘 + 非零退出"（**不加载模型**）
 SELFTEST = os.environ.get("SMOKE_SELFTEST", "").strip()
+# 诊断（**默认关闭**）：prefill 后记录 target/draft 各自的初始状态摘要
+# （全层 KV 硬检查 + 稳定 sha256 + next logits 摘要）⇒ 让 AR 与 Spec 的初始状态**跨进程**可比。
+PREFILL_DIGEST = S.env_flag("SMOKE_PREFILL_DIGEST", False)
 
 
 def _cache_len(cache) -> int:
@@ -280,8 +284,35 @@ def main() -> int:
             rec["stage"] = f"{key}_prefill_done"
             _write(rec, run_id)                   # 逐阶段落盘
 
+        # ---- 诊断用（**默认关闭**）：prefill 后记录 **target / draft 各自**的初始状态摘要 ----
+        # 目的：让 AR 与 Spec 的 target 初始状态可**跨进程**比较（稳定 sha256，而不是进程内 hash）。
+        # 只读、不改计算；未设 SMOKE_PREFILL_DIGEST 时完全不执行。
+        def _digest_row(lg):
+            """取最后一个位置的 logits 行（兼容 `(1,V)` 与 `(1,1,V)`）。"""
+            r = lg.detach().float()
+            return r.reshape(-1, r.shape[-1])[-1]
+
+        def _prefill_digest(key: str, lg, cache) -> dict:
+            n_layers = len(cache)
+            layers = A.require_full_cache(cache, expect_len=_cache_len(cache),
+                                          n_layers=n_layers, what=f"{key} prefill 全层 KV")
+            r = _digest_row(lg)
+            t2 = torch.topk(r, 2).values
+            return dict(model=key, cache_len=_cache_len(cache), n_layers=n_layers,
+                        layers=layers, logits=dict(sha=A.stable_sha(lg), sum=float(r.sum()),
+                                                   argmax=int(torch.argmax(r)),
+                                                   max_score=float(r.max()),
+                                                   margin_top1_top2=float(t2[0] - t2[1]),
+                                                   n_finite=int(torch.isfinite(r).sum())))
+
+        def on_prefill_post(key, lg, cache):
+            if PREFILL_DIGEST:
+                rec.setdefault("prefill_digest", {})[key] = _prefill_digest(key, lg, cache)
+                print(f"[smoke] prefill_digest {key}: cache_len={_cache_len(cache)} "
+                      f"n_layers={len(cache)} argmax={int(torch.argmax(_digest_row(lg)))}")
+
         hooks = DecisionHooks(tgt=tgt, drf=drf, registry=reg, prefill_impl=inner,
-                              on_prefill=on_prefill)
+                              on_prefill=on_prefill, on_prefill_post=on_prefill_post)
         hooks.install()
         # ---- G4：跨层 cache 结构检查（**显式启用**；只读，不改计算）----
         struct_seen: list = []
@@ -328,6 +359,10 @@ def main() -> int:
                 reg.check_finite(lg, phase="prefill", model="target", role="prefill_lg",
                                  where="AR prefill 返回：首步 argmax 的输入")
                 _struct_check(cache, "ar_prefill_post")
+                if PREFILL_DIGEST:      # 诊断（默认关闭）：AR 的 target 初始状态摘要
+                    rec.setdefault("prefill_digest", {})["target"] = _prefill_digest("target", lg, cache)
+                    print(f"[smoke] prefill_digest target(AR): cache_len={_cache_len(cache)} "
+                          f"n_layers={len(cache)}")
                 stage["target_prefill_done"] = True
                 stage["target_prefill_s"] = time.perf_counter() - t1
                 mem("after_target_prefill", rec)
@@ -421,15 +456,25 @@ def main() -> int:
         # **确认新路径确实启用、且没有错误扩展到验证阶段**
         fused_by_phase = a_stats.get("fused_by_phase", {})
         eager_by_phase = a_stats.get("eager_by_phase", {})
+        # **按臂判定**：`cudnn_prefill` 臂要求融合**只**出现在 prefill；
+        # `eager` 臂要求**融合调用严格为 0**（同时 prefill 必须真的走过）。
+        # 这不是放宽：对 eager 臂而言「融合计数必须为 0」比原检查更严格；
+        # 原检查隐含「必须用融合」，对 eager 臂本身就不适用（2026-09-30 修正）。
+        if ARM == "cudnn_prefill":
+            fused_ok = sorted(k for k, v in fused_by_phase.items() if v > 0) == ["prefill"]
+        else:
+            fused_ok = not any(v > 0 for v in fused_by_phase.values())
         if MODE == "ar":
-            dispatch_ok = (sorted(k for k, v in fused_by_phase.items() if v > 0) == ["prefill"]
+            dispatch_ok = (fused_ok
                            and all(fused_by_phase.get(p, 0) == 0
                                    for p in ("propose", "verify", "repair", "decode"))
+                           and eager_by_phase.get("prefill", 0) > 0
                            and eager_by_phase.get("decode", 0) > 0)
         else:
-            dispatch_ok = (sorted(k for k, v in fused_by_phase.items() if v > 0) == ["prefill"]
+            dispatch_ok = (fused_ok
                            and all(fused_by_phase.get(p, 0) == 0
                                    for p in ("propose", "verify", "repair", "decode"))
+                           and eager_by_phase.get("prefill", 0) > 0
                            and eager_by_phase.get("verify", 0) > 0)
         # ---- 停止原因：**不能少生成却当固定长度完成** ----
         gen_len = len(gen)

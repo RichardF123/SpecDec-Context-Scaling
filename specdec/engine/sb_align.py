@@ -146,6 +146,15 @@ def compare_arms(rows_s: list, rows_b: list, common: dict, *, limit: int) -> dic
             s_cache_len=rs["cache_len_after"], s_n_visible=rs["n_visible"],
             prefix_len=len(rs["hist"])))
     out["incomparable"].sort(key=lambda x: (x["pred_pos"], x["which"]))
+    # ---- 去重口径（任务要求）：**行级**条目与**按 (位置, 原因) 去重**后的条目分别计数。
+    # 每个行级条目对应**一行**（source/detail 唯一）⇒ 行级计数不是"重复登记"；
+    # 而同一 (位置, 原因) 可能被多行共享 ⇒ 去重计数用于避免看起来像多个独立观测。
+    out["n_incomparable_rows"] = len(out["incomparable"])
+    out["n_incomparable_distinct_pos_reason"] = len(
+        {(x["pred_pos"], x["reason"]) for x in out["incomparable"]})
+    out["n_incomparable_distinct_pos"] = len({x["pred_pos"] for x in out["incomparable"]})
+    out["dedup_note"] = ("行级条目 = 一行一条（source/detail 唯一，非重复登记）；"
+                         "`n_incomparable_distinct_pos_reason` 是按 (位置, 原因) 去重后的条数")
     out["paired_b_rows"] = len(paired_b)
     out["b_rows_total"] = len(rows_b)
     out["s_rows_total"] = len(rows_s)
@@ -157,17 +166,26 @@ def compare_arms(rows_s: list, rows_b: list, common: dict, *, limit: int) -> dic
     return out
 
 
-def require_full_cache(cache: list, *, expect_len: int, n_layers: int, what: str) -> dict:
-    """全层 KV 的 shape/dtype/finite/长度**硬检查**。"""
+def require_full_cache(cache: list, *, expect_len: int, n_layers: int, what: str,
+                       head_dim: int | None = None) -> dict:
+    """全层 KV 的 shape/dtype/finite/长度**硬检查**。
+
+    `head_dim=None` 时从第一层推断，并要求**所有层一致**
+    （target 为 128、draft 为 64 —— 不得硬编码成 128）。
+    """
     require(len(cache) == n_layers, f"{what}: 层数不符", f"{len(cache)} vs {n_layers}")
+    if head_dim is None:
+        require("k" in cache[0], f"{what}: 第 0 层缺少 'k'")
+        head_dim = int(cache[0]["k"].shape[-1])
     info = {}
     for i, d in enumerate(cache):
         for kk in ("k", "v"):
             require(kk in d, f"{what}: 第 {i} 层缺少 {kk!r}")
             t = d[kk]
             require(t.dim() == 4, f"{what}: L{i}.{kk} 必须是 4 维", str(tuple(t.shape)))
-            require(int(t.shape[0]) == 1 and int(t.shape[3]) == 128,
-                    f"{what}: L{i}.{kk} 末维/批维不符", str(tuple(t.shape)))
+            require(int(t.shape[0]) == 1 and int(t.shape[3]) == head_dim,
+                    f"{what}: L{i}.{kk} 末维/批维不符（期望 head_dim={head_dim}）",
+                    str(tuple(t.shape)))
             require(int(t.shape[2]) == expect_len,
                     f"{what}: L{i}.{kk} 长度不符", f"{t.shape[2]} vs {expect_len}")
             require(str(t.dtype) == "torch.bfloat16", f"{what}: L{i}.{kk} 必须是 bf16", str(t.dtype))

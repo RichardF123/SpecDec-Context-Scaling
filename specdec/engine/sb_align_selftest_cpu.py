@@ -105,6 +105,11 @@ def main() -> int:
     check("★ 未配对行总数 = B 行数 − 已配对数（无隐去）",
           res["paired_b_rows"] + len([x for x in res["incomparable"] if x["which"] == "B"])
           == res["b_rows_total"])
+    check("★ 去重口径：行级条目数 与 按(位置,原因)去重数 分别给出且行级≥去重",
+          res["n_incomparable_rows"] >= res["n_incomparable_distinct_pos_reason"] > 0
+          and res["n_incomparable_distinct_pos"] > 0,
+          {k: res[k] for k in ("n_incomparable_rows", "n_incomparable_distinct_pos_reason",
+                               "n_incomparable_distinct_pos")})
 
     print("== 5. 位置偏移 / cache 长度 / 非有限值被拦截 ==")
     check("★ n_visible != pred_pos（位置偏移）被拦截",
@@ -170,6 +175,21 @@ def main() -> int:
     d = A.cache_digest_diff({"L0_k": dict(sha="a")}, {"L0_k": dict(sha="b")})
     check("★ 摘要不同 ⇒ 确证存在差异（n_diff_digest=1）", d["n_diff_digest"] == 1)
     check("摘要语义写明「一致不等于逐元素」", "不等于" in d["semantics"])
+    # head_dim 不再硬编码 128：推断 + 跨层一致性（draft 是 64）
+    draft_like = [dict(k=torch.zeros(1, 2, 8192, 64, dtype=torch.bfloat16),
+                       v=torch.zeros(1, 2, 8192, 64, dtype=torch.bfloat16)) for _ in range(2)]
+    inf = A.require_full_cache(draft_like, expect_len=8192, n_layers=2, what="draft_like")
+    check("★ head_dim 从张量推断（draft 的 64 也通过，不再硬编码 128）",
+          inf["L0_k"]["shape"][3] == 64 and len(inf) == 4)
+    mixed = [dict(k=torch.zeros(1, 2, 8, 128, dtype=torch.bfloat16),
+                  v=torch.zeros(1, 2, 8, 128, dtype=torch.bfloat16)),
+             dict(k=torch.zeros(1, 2, 8, 64, dtype=torch.bfloat16),
+                  v=torch.zeros(1, 2, 8, 64, dtype=torch.bfloat16))]
+    check("★ 跨层 head_dim 不一致被拦截",
+          raises(lambda: A.require_full_cache(mixed, expect_len=8, n_layers=2, what="mixed")))
+    check("显式给 head_dim=128 时 64 的张量被拦截",
+          raises(lambda: A.require_full_cache(draft_like, expect_len=8192, n_layers=2,
+                                              what="explicit", head_dim=128)))
 
     print(f"\nCPU 自测：PASS {npass} / FAIL {nfail}")
     return 0 if nfail == 0 else 1

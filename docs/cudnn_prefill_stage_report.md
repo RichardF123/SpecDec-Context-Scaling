@@ -2944,3 +2944,125 @@ Spec=`verify`(s=4)/`repair`(s=1)，均 eager。
 运行 `…_prefillsb_cudnn_prefill_20260930T183054Z.json/.pt`、
 `…_prefillsb_eager_20260930T183142Z.json/.pt`；**旧失败记录全部保留未覆盖**（见报告 §8 运行清单）。
 
+---
+
+## 9.36 真实 eager Spec 路径的 F06 8K 完整生成一致性验证（2026-09-30 第三轮）
+
+**本轮是候选配置诊断，不是正式实验**：**未**改默认 backend/精度/验收门槛；**未**改 tie-breaking；
+**未**改 chunk/k/max_new；**未** teacher forcing、**未**复用旧候选或旧 repair 日程。
+
+### 9.36.1 配置（全部按冻结值，backend 仅由**运行期环境变量**指定）
+
+F06（8192 token，manifest 来源与 token hash 已核）·target `Qwen2.5-1.5B-Instruct` ·
+draft `Qwen2.5-0.5B-Instruct` · BF16 · target/draft KV 均 `base_bf16` · **attention 全程 eager（显式阶段标记）** ·
+chunk **2048** · k **4** · max_new **64** · `qk_fp32=False, prob_fp32=False`（**未新增精度开关**）·
+greedy argmax · EOS `151645`（实际未触发）。
+
+**关键机制**：仍走生产的 `DecisionHooks`（`smoke_hooks.py`），因此 Spec 的 target **与** draft **都是分块
+（chunk=2048）+ 显式 `phase='prefill'`**，**不会**退化成默认 `_prefill` 的一次性 8192 前向。
+
+### 9.36.2 四次运行（独立进程、串行、各自从加载与 prefill 开始）
+
+| # | 运行记录 | 模式 | stage | gen_len | stop_reason | 必需检查 | 未覆盖 | fused 调用 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 | `smoke8k_eager_20260930T185121Z.json` | AR | `run_ended` | 64 | `max_new_reached` | passed（10） | `[]` | **`{}`（零）** |
+| 2 | `smoke8k_eager_20260930T185535Z.json` | Spec | `run_ended` | 64 | `max_new_reached` | passed（14） | `[]` | **`{}`（零）** |
+| 3 | `smoke8k_eager_20260930T185302Z.json` | AR | `run_ended` | 64 | `max_new_reached` | passed（10） | `[]` | **`{}`（零）** |
+| 4 | `smoke8k_eager_20260930T185655Z.json` | Spec | `run_ended` | 64 | `max_new_reached` | passed（14） | `[]` | **`{}`（零）** |
+
+阶段计数（**实际执行**）：AR `eager_by_phase={'prefill':112,'decode':1764}`；
+Spec `eager_by_phase={'prefill':208,'propose':1944,'verify':588,'repair':468}`
+（208 = target 28 层×4 chunk + draft 24 层×4 chunk ⇒ **两者都分块、且都 eager**）。
+
+### 9.36.3 初始状态（target / draft **分开**记录）
+
+| 项 | AR | Spec |
+| --- | --- | --- |
+| target prefill 后 cache | **8192**，28 层，全层 bf16、finite、长度=8192 ✓ | 同 |
+| target 全层摘要（稳定 sha256） | 56/56 张量有摘要 | **与 AR 逐层 56/56 一致** |
+| target next logits 摘要 | sha `62f21b17cc10e90e`、sum 436652.5625、argmax **659**、max 23.75、margin 0.375 | **完全相同** |
+| draft prefill 后 cache | — | **8192**，**24 层**，bf16、finite ✓（head_dim=64，摘要独立记录） |
+| 同模式重复一致 | rep1 vs rep2 全层摘要**一致** | rep1 vs rep2 全层摘要（含 draft）**一致** |
+
+> ⚠️ **口径**：上表用**稳定 sha256 摘要**比较（跨进程可比）。**摘要一致 ≠ 直接逐元素比较**；
+> 但由于摘要是对**完整张量字节**计算、且 shape/dtype/长度已硬检查 ⇒ 摘要在两臂间逐层全等，
+> 是本轮可得的**最强**等价证据（**未**做 `.pt` 级逐元素比对，见 §9.36.7 缺项）。
+> 由于 AR 与 Spec 的 target 初始状态**相同**，本轮**可以**合法地继续声称「相同起点」。
+
+### 9.36.4 判定结果
+
+| 判定 | 结果 |
+| --- | --- |
+| **1. AR rep1 vs rep2** | 完整 64 token **逐位相同**；stop_reason 均 `max_new_reached` ✓ |
+| **2. Spec rep1 vs rep2** | 完整 64 token **逐位相同**；stop_reason 一致 ✓ |
+| **3. AR vs Spec** | **64/64 token 完全一致**；**无首次分歧**（`gen_len` 均为 64，stop_reason 一致，EOS 未触发）✓ |
+| **4. 有限性 / cache 不变量 / 资源** | 有限性检查 AR 64 次、Spec 164 次（覆盖 prefill·propose·verify·repair 的决策用 logits），**未覆盖项为空**；`SMOKE_STRUCT_CHECK=1` 的结构检查通过；commit 护栏 `ok=True` ✓ |
+
+生成的 64 个 token（AR 与 Spec 相同）：
+`659, 330, 576, 8017, 572, 1083, 36375, 553, 279, 7055, 364, 82, 7211, 1154, 879, 614, 2474, 6941, 432, 825, 315, 862, 6930, 74623, 27685, 659, 576, …`（周期重复至 64）。
+
+**结论（严格限定）**：
+> **F06、该 eager 配置（chunk=2048、k=4、max_new=64、base_bf16、全程 eager）的完整生成诊断通过。**
+
+- **不**宣称全局修复；**不**删除 cuDNN 的失败记录（§9.23–§9.35 的 715/576 分歧**依然成立**）；
+- **不**自动改正式 backend；**不**把本结果当作正式验收。
+
+### 9.36.5 与上一轮「固定日程」实验的区别
+
+| 维度 | 上一轮（`prefillsb`） | 本轮（`smoke8k_eager`） |
+| --- | --- | --- |
+| 生成方式 | **teacher forcing** 固定 token 前缀，止于预测位置 8217 | **真实自由生成**，64 token 全程 |
+| 候选来源 | **复用旧记录**的 cands / accept 日程 | **真实 draft** 生成候选 |
+| 接受/拒绝/回滚 | 由旧日程**人为固定** | **真实**生产过程 |
+| 初始状态 | 同 backend 内两次建立 + 深拷贝 | 独立进程各自 prefill（跨进程摘要比对） |
+| 结论范围 | 只说明「该固定日程下 S/B 差异存否」 | 说明「真实 Spec 与 AR 在完整生成上是否一致」 |
+
+### 9.36.6 资源（仅作运行观察，**不作 performance 声明**）
+
+| 运行 | peak allocated | peak reserved（计数器） | 设备侧峰值 smi_used | prefill 耗时（观察） |
+| --- | --- | --- | --- | --- |
+| AR rep1 / rep2 | 6153 MiB | 9668 MiB | 7840 / 7813 MiB | 4.34 s / 4.24 s |
+| Spec rep1 / rep2 | 7795 MiB | 10648 MiB | 7785 / 7831 MiB | 26.0 s（target 7.9 + draft 17.9）/ 23.0 s（7.8 + 15.2） |
+
+⚠️ **风险提示（如实记录）**：eager 8K 下 `pt_reserved` 计数器**高于设备总显存**（8188 MiB）且多次出现
+`cuda_free=0.0` ⇒ 显存余量很薄；**这属于本候选配置的工程风险**，与正确性结论无关，
+也未因此降配或缩短生成。**未**把耗时用于任何 speedup 或正式性能结论。
+
+### 9.36.7 缺项（不得当作已完成）
+
+1. **未做 `.pt` 级逐元素比较**：初始状态只比了稳定摘要（§9.36.3 已显式声明该口径差别）；
+2. **未保存决策 top 候选与 margin**：本轮**无分歧点**，因此"分歧处 margin"不适用；
+   非分歧位置的 margin 由 smoke 工具**不记录** ⇒ 若后续要报 margin，需要新的默认关闭开关；
+3. **只覆盖 1 个 family（F06）× 1 个 KV 档（base_bf16）× max_new=64 × 单个 prompt**；
+   **V-only FP8 未测**、fam16 其余 15 格未测、短上下文组合未测；
+4. **正式验收证据仍缺**：B6 正式门（10 case × 2 KV = 20 组合）与主门（FP32 逐 token 精确相等）**未被本轮替代**；
+5. 生产**默认**仍为 `cudnn_prefill`（本轮只通过运行期环境变量做候选配置诊断）。
+
+### 9.36.8 本轮最小工具修改（默认关闭，未改变任何默认行为）
+
+| 文件 | 修改 | 自测 |
+| --- | --- | --- |
+| `smoke_hooks.py` | 新增**可选** `on_prefill_post(key, lg, cache)` 回调（默认 `None`） | `smoke_midstep_selftest_cpu` **28/0** |
+| `g5_8k_smoke_cudnn.py` | 新增 `SMOKE_PREFILL_DIGEST`（**默认关闭**）：prefill 后记录 **target/draft 各自**的全层 KV 硬检查 + 稳定 sha256 + next logits 摘要；`dispatch_only_prefill` 改为**按臂判定**（`eager` 臂要求**融合调用严格为 0**，比原检查更严格） | `smoke_checks_selftest_cpu` **27/0** |
+| `sb_align.py` | `require_full_cache` 的 head_dim 改为**推断 + 跨层一致性**（draft 是 64，原硬编码 128 会误杀）；排除项统计新增**行级 / 按(位置,原因)去重**两套口径 | `sb_align_selftest_cpu` **38/0** |
+
+**保留的失败记录（未覆盖）**：`smoke8k_eager_20260930T184854Z.json`（我的摘要助手 reshape 缺陷）、
+`smoke8k_eager_20260930T184947Z.json`（`dispatch_only_prefill` 未按臂判定）、
+`smoke8k_eager_20260930T185154Z.json` 与 `…T185333Z.json`（draft head_dim=64 被硬编码的 128 误杀，
+即"用同一条检查套两个不同 head_dim 的模型"这一真实缺口）。
+
+### 9.36.9 排除项统计口径（去重，补齐上一轮）
+
+上一轮 cuDNN 臂的「不可比较/缺失」条目：**行级 63 条**（每个条目对应**一行**，其
+`pred_pos + source + detail` 唯一 ⇒ **不是重复登记**）；按 **(位置, 原因)** 去重后 **33 条**；
+涉及 **21 个位置**。分类（行级）：`prefix` 60、`limit` 2、`B 臂无该预测位置的行` 1。
+⇒ 报数时两套口径都要给：**行级 63 / 去重 33 / 位置 21**。`sb_align.py` 的 `compare_arms`
+现已自动产出 `n_incomparable_rows`、`n_incomparable_distinct_pos_reason`、`n_incomparable_distinct_pos`。
+
+### 9.36.10 下一步（唯一优先）
+
+按本轮同一套四运行协议，把**候选配置诊断**扩展到**其它已参与调试的条件**与 **V-only FP8**
+（含其 fp8 路径下的 eager 一致性），并**另行安排独立验收**；同时把 §9.34.6 的
+**prefill 统一 + 入口自检**作为配套工程项（防止任何入口静默退回一次性 eager 前向）。
+**不**自动扩展矩阵、**不**改生产默认、**不**放宽正确性标准。
+
