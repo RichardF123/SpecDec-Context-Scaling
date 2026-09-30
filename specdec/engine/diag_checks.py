@@ -176,6 +176,31 @@ def _selftest() -> int:
     check("对非连续切片：control_valid=True 或如实报告",
           isinstance(lc2["control_valid"], bool) and "contiguous" in lc2["note"])
 
+    print("== 6. 严格三维切片回归：二维误切片必须被抓住（MLP 四格 §二 修正） ==")
+    U3 = torch.randn(1, 4, 1536)
+    good = U3[:, 1:2, :]
+    bad2d = U3[:, 1, :]
+    check("严格三维切片 (1,1,1536)", tuple(good.shape) == (1, 1, 1536))
+    check("二维误切片退化为 (1,1536)", tuple(bad2d.shape) == (1, 1536))
+    # 同一对齐行：值相同但形状不同 ⇒ 只有 shape 断言能挡住
+    check("两种切法取到的是同一行数值", torch.equal(good.reshape(-1), bad2d.reshape(-1)))
+    try:
+        cmp_tensor(good, bad2d, "strict3d_vs_2d")
+        raised = False
+    except CheckError:
+        raised = True
+    check("★ B 格 (1,1,1536) 与误切片 (1,1536) 直接比较 ⇒ 抛 CheckError", raised)
+    try:
+        require(tuple(bad2d.shape) == (1, 1, 1536), "B 格输入必须是 (1,1,1536)", str(tuple(bad2d.shape)))
+        raised = False
+    except CheckError:
+        raised = True
+    check("★ 显式 require 形状 ⇒ 二维误切片抛 CheckError（不靠人工目测）", raised)
+    # 三维切片是非连续的视图：必须如实记录，不能当成独立内存控制
+    lg = layout(good)
+    check("三维切片 is_view=True 且 stride 与整块不同",
+          lg["is_view"] is True and lg["stride"][1] == 1536 and lg["is_contiguous"] is True)
+
     print(f"\nCPU 自测：PASS {npass} / FAIL {nfail}")
     return 0 if nfail == 0 else 1
 
