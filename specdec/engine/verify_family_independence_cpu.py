@@ -84,7 +84,9 @@ MANIFEST_MACHINERY = {
 }
 # 本轮**新增**的 opt-in 消费方：只有它带 manifest 输入路径，且默认关闭（SMOKE_FAMILY 未设即 legacy）。
 OPT_IN_CONSUMERS = {"g5_8k_smoke_cudnn.py",      # fam16 授权轮（SMOKE_FAMILY，默认关闭）
-                    "g5_f06_index25_forensics.py"}  # F06/index25 定点取证（固定 family）
+                    "g5_f06_index25_forensics.py",  # F06/index25 定点取证（固定 family）
+                    # 2026-09-30 经用户授权登记：S/B 对照工具，**注册范围仅限该工具与 F06**
+                    "prefill_sb_replay_f06.py"}
 
 
 def _manifest_consumers() -> list:
@@ -245,12 +247,20 @@ def main() -> int:
     fam16_ids = _this_round_run_ids()
     fam16 = [u for u in used
              if u["file"] in {f"smoke8k_cudnn_prefill_{r}.json" for r in fam16_ids}]
-    authorize_tools = ("g5_f06_index25_forensics",)
+    # 授权消费方（**新增必须显式登记**）：两者都属于 F06/index25 定点取证。
+    # `prefill_sb_replay_f06.py` 于 2026-09-30 经用户授权登记，**注册范围仅限该工具与 F06**
+    # （下方 `scoped` 检查把这一限制变成可判定条件）。
+    authorize_tools = ("g5_f06_index25_forensics", "prefill_sb_replay_f06")
     forensic = [u for u in used if (u.get("tool") or "").startswith(authorize_tools)]
     authorized_files = {u["file"] for u in fam16} | {u["file"] for u in forensic}
     outside = [u for u in used if u["file"] not in authorized_files]
     check("★ **授权范围之外**没有任何 run 消费 manifest family（授权范围 = fam16 16 格 + F06/index25 定点取证）",
           not outside, outside[:5])
+    scoped = [u for u in used if (u.get("tool") or "").startswith("prefill_sb_replay_f06")]
+    bad_family = [u["file"] for u in scoped
+                  if (u.get("family") or {}).get("family_id") != "F06"]
+    check("★ 新登记消费方 `prefill_sb_replay_f06` 只消费 F06（注册范围仅限该工具 + F06）",
+          len(scoped) > 0 and not bad_family, dict(n_scoped=len(scoped), bad=bad_family[:4]))
     if fam16_ids:
         check(f"fam16 授权轮恰好 {len(fam16_ids)} 格用了 family（实测 %d）"
               % len(fam16), len(fam16) == len(fam16_ids),
