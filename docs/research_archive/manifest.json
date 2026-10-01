@@ -1,0 +1,251 @@
+{
+  "created_date": "2026-10-02",
+  "kind": "historical_changed_file_snapshots_not_production_merge",
+  "verification": "Every archived file byte-matched against its source Git blob; no GPU results rerun",
+  "snapshots": [
+    {
+      "pr": 2,
+      "url": "https://github.com/RichardF123/SpecDec/pull/2",
+      "source_commit": "ca8b68c5ad5ebefae7d813a6477208a86e3d3dd4",
+      "merge_base": "da2fac76ba0d011a5f0c5b097a485eceac5d54b8",
+      "archive": "pr2_ca8b68c_snapshot.zip",
+      "archive_sha256": "e55efa19e042cbfd1e7a3a8ba3331ec79e0a89977bff76799a964c3e70c1cce7",
+      "archive_bytes": 56995,
+      "files": [
+        {
+          "path": "docs/data_ledger.md",
+          "git_blob": "fb71ca9d809bf4f844925cc4ad9e3f9cdd6e5de8",
+          "sha256": "431703f8978378c7dbc8f487937010625374f25b4db84a9c534090af3ee9e833",
+          "bytes": 22478
+        },
+        {
+          "path": "docs/gqa_kv_policy_probe.md",
+          "git_blob": "8ccda136833df36ad214893698f32fb7861ed5ae",
+          "sha256": "95dfcf7a34e8d0558e685c4c7fd9b548a4d75ca64aae35332aa6b37db32a5f5f",
+          "bytes": 11124
+        },
+        {
+          "path": "specdec/engine/kv_policy_8k_operational.py",
+          "git_blob": "b9fa86c9287f540e128af95e689031e1bb483bf9",
+          "sha256": "f2e4f2e3ef49d0f98dace1decb13a6ebe40fe2e2746c2c1038c0595aecbe78b8",
+          "bytes": 9329
+        },
+        {
+          "path": "specdec/engine/kv_policy_confirm_residual_v3.py",
+          "git_blob": "7da52a454a6e81c37c8531745fa9f706b9f6e4c3",
+          "sha256": "0ca49f32e6f29fd6c1fb7e905cf000b9bc92081a071de28edfcecdcb96f719d1",
+          "bytes": 6647
+        },
+        {
+          "path": "specdec/engine/kv_policy_confirm_v2.py",
+          "git_blob": "7c042cc8f4e0d22a2ed661670f440980175a568e",
+          "sha256": "c59133c9f4165464fed3c4178075ea845c8f0ac12f1c2365c1e679f5946e9be3",
+          "bytes": 6591
+        },
+        {
+          "path": "specdec/engine/kv_policy_confirm_vint4.py",
+          "git_blob": "72ce9560a10282b024f80a590e857059b3bd3424",
+          "sha256": "20c05a499bab20bb478bf7344bc988fa3421b9ac929011eb0a61464c4091a038",
+          "bytes": 6568
+        },
+        {
+          "path": "specdec/engine/kv_policy_pilot.py",
+          "git_blob": "0439f2f3d0ecbcf412f7cf5006bca2194d95b7b7",
+          "sha256": "4d2193f74c2d4af11d3c5c36778f7978cb53a06052469a3ffe4f9bab489e8646",
+          "bytes": 7092
+        },
+        {
+          "path": "specdec/engine/kv_policy_pilot_v2.py",
+          "git_blob": "c776751ec802989c1437f3a2a336a346635859ea",
+          "sha256": "85551d4b5bad20ef748223e5c660d3b774251f155b7f2f06b92ff3c67523f8a9",
+          "bytes": 6581
+        },
+        {
+          "path": "specdec/engine/kv_policy_pilot_v3.py",
+          "git_blob": "9c660bad5aebad54478abb984d2164daebe8c477",
+          "sha256": "aed457157e29f316d31571ce0845cb037569724d1e8eed84ea820d1e3b1f6889",
+          "bytes": 5516
+        },
+        {
+          "path": "specdec/engine/kv_policy_residual_v1.py",
+          "git_blob": "8c0086353c8836d18bb5ff15936877f14b0fd186",
+          "sha256": "7bbf5a9ec6ae6b17cd51a46648906645eef639a0451085fc30ef0c30a4d98ef9",
+          "bytes": 2383
+        },
+        {
+          "path": "specdec/engine/kv_policy_v1.py",
+          "git_blob": "381fcd09a0aa9ea6c9fe169a611ad69e7446659f",
+          "sha256": "1139a03bb6f27d88c0cef9e73847cc7610df53c39394361ecb29983e15089301",
+          "bytes": 3077
+        },
+        {
+          "path": "specdec/engine/kv_policy_v2.py",
+          "git_blob": "e69bb2afadf72b476820154f651851f80a7b9b1d",
+          "sha256": "d55badb3b8301c4defd59344dd72e4e924a21a0dbc38e8645cfaee84e78eca91",
+          "bytes": 4583
+        },
+        {
+          "path": "specdec/engine/kv_policy_vint4_8k_operational.py",
+          "git_blob": "9fc98ef3981a971419e06cf2c95ceaafc6793899",
+          "sha256": "a6dbe39df1ffadfb044853bc8b18a49fcdf762d16d7c3a8f4115c78b816779e2",
+          "bytes": 6897
+        },
+        {
+          "path": "specdec/engine/kv_vint4_group_tail_confirm.py",
+          "git_blob": "5c243c189e55d5785c2b92ae97cae5153876636c",
+          "sha256": "2be604e2565e8e1c958277a428c32f68ff68985c77c25d30c08add78d317e875",
+          "bytes": 10306
+        },
+        {
+          "path": "specdec/engine/kv_vint4_group_tail_screen.py",
+          "git_blob": "1c861890fa100f23624f9c850183b29c22da8665",
+          "sha256": "fe88e501d0683e3a763b5491bd97700ec660f592cdf0cc1665c392d4c05c99a1",
+          "bytes": 14120
+        },
+        {
+          "path": "specdec/engine/model_self.py",
+          "git_blob": "38a007132fa394d2a5bdbd41f421d6b4596811ad",
+          "sha256": "f7c355edcca7ff1c34db7f868af6cbe280dad0db637e2c6aa70342114eb2ac0c",
+          "bytes": 27101
+        }
+      ]
+    },
+    {
+      "pr": 3,
+      "url": "https://github.com/RichardF123/SpecDec/pull/3",
+      "source_commit": "13b57b12360f70dd331ad68e75511eaaa0b733e4",
+      "merge_base": "d4eb38967f5f51e7b2cd5292e38b6a06f1d8f897",
+      "archive": "pr3_13b57b1_snapshot.zip",
+      "archive_sha256": "e7803e74d61c7d68f1757cabf996b353fc185c992450fc34b95411397e303744",
+      "archive_bytes": 98841,
+      "files": [
+        {
+          "path": "docs/data_ledger.md",
+          "git_blob": "a08056117fb1f5064401299fa64e732da522eb19",
+          "sha256": "47433bc51420d6ebb14678f793b312c428aebc9c39258fe8f514b8c65e0f702b",
+          "bytes": 36327
+        },
+        {
+          "path": "docs/flash_g4_change_ownership.md",
+          "git_blob": "c273a4b28759dcbce8b57b82fc0005175abbea37",
+          "sha256": "8542170d413e1fc8dc8d0a285e6266997ffb8e203c937eb7447debbc94a29728",
+          "bytes": 5382
+        },
+        {
+          "path": "docs/flash_g4_latest_g4_results.md",
+          "git_blob": "d2c33e26fb76488f8b6ba58d066d62f509baf7a5",
+          "sha256": "a73b19b036f7813bf0848ab7caac04c93baa295836b3d8e80edde5cac5387078",
+          "bytes": 16350
+        },
+        {
+          "path": "docs/flash_g4_runbook.md",
+          "git_blob": "db24d4ca4217441e36e7c83e8ccc67fcf4e31c1f",
+          "sha256": "c7deb3fc929acd49db47a9bfead9fabbf17a19082dea3499157a2a12b81d98de",
+          "bytes": 7139
+        },
+        {
+          "path": "specdec/engine/flash_attention_g4_ablation.py",
+          "git_blob": "d350ed12c4be4d4c5fb08b610bbd527ff847760c",
+          "sha256": "d4e2924ff0058865b553e4652ddf22314024862aa513cd88ec9cafcb4ed85854",
+          "bytes": 14914
+        },
+        {
+          "path": "specdec/engine/flash_attention_g4_block_serial_screen.py",
+          "git_blob": "3bfb3076b4e2457f8ce22223bc2d22a1ba08eff6",
+          "sha256": "6d25ebd06f7e4dcfc80b21acbe55349eb56649b7be270cbc1c63fc35ee8b1ac7",
+          "bytes": 12829
+        },
+        {
+          "path": "specdec/engine/flash_attention_g4_bottleneck.py",
+          "git_blob": "743439ece3d6e73cca7b340fdedeac618c2c6368",
+          "sha256": "8b68f78f1710ec65e93a73ab64d8fbca7cd9a6c9ef50bad64bba035fc9847b63",
+          "bytes": 13461
+        },
+        {
+          "path": "specdec/engine/flash_attention_g4_bottleneck_profile.py",
+          "git_blob": "4db8b730b5eda39f14b2153ea19ce97e80478aa0",
+          "sha256": "d7603b9f3209433b2eaa63fd14687d944c4e5421d2dbe37de36a28835c6facad",
+          "bytes": 17128
+        },
+        {
+          "path": "specdec/engine/flash_attention_g4_core_probe.py",
+          "git_blob": "ca02e616d992cbcac1c35caf7f7c09d35f0059c0",
+          "sha256": "0637706ebb9fdb1118aca1bff334b4a4a15b6ca3f1a84894e6266ffb73bba6ed",
+          "bytes": 9255
+        },
+        {
+          "path": "specdec/engine/flash_attention_g4_hybrid_attribution.py",
+          "git_blob": "e3ca917ead6f438adcf0b647028a26b685b29077",
+          "sha256": "bd42a418ace6d4e3b771ce248629571a2de5ff85b602d81b7cf70bafecd8238f",
+          "bytes": 12154
+        },
+        {
+          "path": "specdec/engine/flash_attention_g4_hybrid_compat.py",
+          "git_blob": "41438ec4bfb1085e85c01945bc42d30262b51389",
+          "sha256": "9cb99841ebb83448db350c19eae4b0c80773506458cd16de3b75df8af21bdf1f",
+          "bytes": 4003
+        },
+        {
+          "path": "specdec/engine/flash_attention_g4_numerical_screen.py",
+          "git_blob": "9d628a95e816aa0e6b2a65d075cfad102abf1c7d",
+          "sha256": "dfdd36d4632693861bcf6bac6cc9c84a88a7eee5faea35c4fd8ea410b1bc7354",
+          "bytes": 10587
+        },
+        {
+          "path": "specdec/engine/flash_attention_g4_operator_isolation.py",
+          "git_blob": "66121b60d575fbf721d9789ff35b350a25046561",
+          "sha256": "0b5df25a7c945784617a588eaa9393bb2c4be03990d9feebfeb1d65a46ab0f08",
+          "bytes": 13608
+        },
+        {
+          "path": "specdec/engine/flash_attention_g4_phase_isolation.py",
+          "git_blob": "ad34d71149999f1d353915773625dd9093cc7806",
+          "sha256": "7c356f0222c3f056ecdd067bf1eebffb649085aff79b90c843372b7dd61a1900",
+          "bytes": 18365
+        },
+        {
+          "path": "specdec/engine/flash_attention_g4_ppl_gate.py",
+          "git_blob": "8cdb2a8a63e24120b0b93595bcecd79d6c6e1eba",
+          "sha256": "6664d64c932d1749a89031a24064fa187e6612f36e49b1ff42812918bc940037",
+          "bytes": 8326
+        },
+        {
+          "path": "specdec/engine/flash_attention_g4_specdec_compat.py",
+          "git_blob": "07ba1dee60493d5d64eb6b01333087148e512d92",
+          "sha256": "e6e96f8d6e97b5652fd9f728141703f69963760760a6756148d29b8ef0ade99e",
+          "bytes": 24178
+        },
+        {
+          "path": "specdec/engine/flash_attention_g4_supporting_bench.py",
+          "git_blob": "84a81a4706b93b8a0578bc7ff0bda12b418a755f",
+          "sha256": "bfcfa31825367119688f033196882c58ce1e2e9d901cebc6dbfbac48c1d16686",
+          "bytes": 21092
+        },
+        {
+          "path": "specdec/engine/flash_attention_sdpa_reference_probe.py",
+          "git_blob": "aec57f290b1d8c370021f088cd43ca7ec463bd3b",
+          "sha256": "3d89998df7b24ef3249ed556c5e628bce8a544250e165e246c1b9b8c298d2f0d",
+          "bytes": 5524
+        },
+        {
+          "path": "specdec/engine/flash_attention_small_q_tune.py",
+          "git_blob": "efce5d0b98069a8c2abaea9152c460bea44f638d",
+          "sha256": "cf2eaa7753eff68a6ccd9b9722529e12a92eaa01dbd5a34edb8560196b1967a6",
+          "bytes": 7777
+        },
+        {
+          "path": "specdec/engine/flash_attention_two_pass_triton.py",
+          "git_blob": "06e93997d40541d6f40f24ea09add5715b45e8ac",
+          "sha256": "d55a392af2f3249d0e62eaa628e8f8af3c1b3ef1a96d00c8194a573f752aa6cd",
+          "bytes": 12236
+        },
+        {
+          "path": "specdec/engine/model_self.py",
+          "git_blob": "a09cacf6a50085831943fee63ff5810b1a15253b",
+          "sha256": "bbaac8094dc20b778ef0f447cb1c1877e1549e9949c31791b8c5468943b46c62",
+          "bytes": 17495
+        }
+      ]
+    }
+  ]
+}

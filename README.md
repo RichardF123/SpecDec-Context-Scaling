@@ -158,6 +158,7 @@ python -m specdec.engine.g4_b6_tie_diag                 # 分歧位置的 signal
 
 ## 文档
 
+- [合作者 PR #2 / #3 评审与隔离研究归档](docs/collaborator_pr_review_2026-10-02.md) — 保留 KV 压缩、two-pass attention 和性能归因成果；未整包合并旧引擎，不改变现有默认或正式验收。
 - `docs/plan_v7_1_protocol_freeze.md` — 实验协议冻结（v7.1 + §0 **Amendment v7.2**：Compute=BF16、KV 因子、12 conditions）
 - `docs/plan_v7.md` — v7 方案（方向、承诺、裁剪序）；`docs/plan_v6.md` — v6/v6.1 历史方案
 - `docs/data_ledger.md` — 实测数据台账（§3.4 G1、§3.5.x FP8 KV、§4.5.1 G2、§4.5.2 B3、§4.5.3 B4、§4.5.4 B5、§4.5.5 B6-bf16、§4.5.6 B6-fp32）
