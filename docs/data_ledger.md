@@ -3124,6 +3124,52 @@ UCG-Spec vs **旧生产 Spec identical=True**；UCG-AR vs 旧生产 AR **identic
 未验证其它 k/chunk/KV/长度；proposal 与验收门槛未动，**正式正确性状态不变**。
 **失败记录（保留未覆盖）**：`…F13_spec_T114228Z`（自我递归）、`…T114350Z`（把 4 行列表传给 step 形态包装）。
 
+### 4.55 HF 外部对照：**HF 上单步/块也有同类差异** + 外部方案调研（2026-10-01）
+
+**① 报告与代码修订（不新增 GPU 运行，历史原文保留）**：① UCG **只**统一了 `s=4` 与 `T-pre=4`，
+**未**证明"同一预测位置的完整计算几何一致"；② **撤回**"严格一致必然要求串行验证""块验证与严格一致结构上不相容"；
+③ 改为「**本候选在 F13 失败；固定行数不足以保证一致，具体致因尚未唯一定位**」；
+④ Spec 侧逐轮元数据缺失 ⇒ 决策行 `T` 差异属**结构分析**，**不得**写成该分歧点的实测归因；
+⑤ CPU 小模型 padding 测试**只支持已测范围**，不外推为 GPU BF16 全局保证；
+⑥ "显存不增加""约 4×"**不得**当实测结论（额外计算与显存影响须另测）；⑦ 代码注释已同步（`unified_geometry.py`/`unified_geometry_run.py`）。
+
+**② HF 外部对照（`hf_serial_block_probe.py`，独立入口，不调用自研 `model_self`/`spec_dec`/`spec_cache`）**：
+torch **2.6.0+cu124** / transformers **5.16.1** / `Qwen2.5-1.5B-Instruct`（**只 target**）/ bf16 / **未量化 KV** /
+`attn_implementation="eager"`（实测断言）；HF v5 `DynamicCache`；**HF 自己分块构建**到 `pre=8240`（chunk=2048）；
+固定输入 `[220,16,16,1154]` 取自已登记 F13/index50 记录。**CPU 微型 HF 自测 8 PASS / 0 FAIL**
+（行对齐 / 深拷贝不共享存储 / **实际 attention 张量级 mask 支撑集逐 head 一致** / 快照未改写 / 有限性）。
+
+| j | 预测位置 | serial argmax/margin | block argmax/margin | 同 argmax | max\|Δ\| | mean\|Δ\| | 不同元素 |
+|---|---|---|---|---|---|---|---|
+| 0 | 8241 | 16 / 0.375 | 16 / 0.5 | 是 | **0.171875** | 0.025586 | 134330 |
+| 1 | **8242** | 20 / **0.125** | 20 / **0.125** | 是 | **0.25** | 0.024778 | 129226 |
+| 2 | 8243 | 11 / 0.5 | 11 / 0.625 | 是 | **0.25** | 0.041597 | 134624 |
+| 3 | 8244 | 220 / 5.125 | 220 / 5.125 | 是 | **0.1875** | 0.029691 | 126254 |
+
+* **可见集合逐行一致**（张量级核验：逐 head `counts`/`lasts` 相同；block 的 `T` 恒为 8244，serial 为 8241..8244）；
+* **同路径重复逐位相同**（8/8）；两次独立运行的 HF 对照**数值逐位相同**（跨进程可复现）；
+* **K/V 4 步后 28/28 层不同**（layer 0 keys 相同、values 不同）⇒ 历史也分叉；
+* **关键**：j=3 时 serial 与 block 的 `T` **相同**（8244）且可见集合相同，输出**仍不同**
+  ⇒ "统一 `T`"也不充分，`s`（单行 vs 4 行同一次调用）本身即差异来源之一。
+* **结论（限定）**：**HF 也有差异 ⇒ 支持"成熟实现也存在同类现象"**；**不**证明自研实现完全正确，
+  也**不**说明自研实现一定无逻辑错误；本轮 4 行 argmax 未翻转；**严格 AR/Spec 门槛未放宽**；
+  未做 FP8/全层定位/参数扫描/性能声明；**未**改生产默认/proposal/门槛。
+* **资源**：peak_alloc 5802 MiB、peak_reserved 7904 MiB、`cuda_free=0.0`（余量薄）；commit 护栏 ok。
+* **不可强行归因**：HF 与自研在**缓存实现、GQA 处理、softmax/upcast 路径、prefill 分块实现、mask 构造**上均不同，
+  只在"同初始缓存 + 同 token + 对齐预测位置"这一层可比。
+
+**③ 外部方案调研**（`docs/external_batch_invariance_survey_2026-10-01.md`，只读、未安装）：
+PyTorch 官方**明确不保证** `(A@B)[0] == A[0]@B[0]` 这类**批次/切片**逐位一致；已有旋钮
+（`use_deterministic_algorithms`、`allow_bf16_reduced_precision_reduction`、TF32 默认关闭）都**不**针对形状依赖。
+TML `batch_invariant_ops` 覆盖 `mm`/`addmm` 与 `mean`（间接 RMSNorm），**attention 未随代码发布**；
+在 **PyTorch 2.6 + 公开 Triton 上会 `TypeError`**（issue #14），其示例要求 PyTorch ≥ 2.9，**无 Windows/sm_89 证据**。
+vLLM batch invariance 要求 CC ≥ 8.0（形式上满足），但**未合并 PR #52522** 显示 BI 关闭时投机解码有 exact-BI 不匹配、
+BI 开启后为 0（吞吐代价 −3%~−25%，验证环境 ≥32 GB）；其官方文档把投机解码"无损"**限定为浮点/批大小层面**，
+且跟踪 issue 把 "Speculative decoding support" 标为未完成。⇒ **没有任何现成算子直接覆盖"1 token vs 4 token 同历史"的差异**。
+
+**④ 治理**：`hf_serial_block_probe.py` 登记为 F13 定点诊断消费方（**仅限该工具与 F13**），
+记录补齐标准 `input.family` 块 ⇒ `verify_family_independence_cpu` 全绿。
+
 **下一步（唯一优先）**：按同一四运行协议把候选配置诊断扩展到**其它已参与调试的条件**与 **V-only FP8**，
 并**另行安排独立验收**；配套工程项＝prefill 统一 + 入口自检（§4.49 末）。**不**自动扩展矩阵、**不**改生产默认、**不**放宽标准。
 

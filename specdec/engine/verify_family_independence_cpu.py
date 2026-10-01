@@ -90,7 +90,9 @@ OPT_IN_CONSUMERS = {"g5_8k_smoke_cudnn.py",      # fam16 授权轮（SMOKE_FAMIL
                     # 2026-10-01 经用户授权登记：F13/index50 定点取证，**注册范围仅限该工具与 F13**
                     "f13_i50_capture.py",
                     # 2026-10-01 经用户授权登记：UCG 原型诊断，**注册范围仅限该工具与 F13**
-                    "unified_geometry_run.py"}
+                    "unified_geometry_run.py",
+                    # 2026-10-01 经用户授权登记：HF 外部对照，**注册范围仅限该工具与 F13**
+                    "hf_serial_block_probe.py"}
 
 
 def _manifest_consumers() -> list:
@@ -255,7 +257,7 @@ def main() -> int:
     # `prefill_sb_replay_f06.py` 于 2026-09-30 经用户授权登记，**注册范围仅限该工具与 F06**
     # （下方 `scoped` 检查把这一限制变成可判定条件）。
     authorize_tools = ("g5_f06_index25_forensics", "prefill_sb_replay_f06", "f13_i50_capture",
-                       "unified_geometry_run")
+                       "unified_geometry_run", "hf_serial_block_probe")
     forensic = [u for u in used if (u.get("tool") or "").startswith(authorize_tools)]
     # `g5_8k_smoke_cudnn.py` 的**非 fam16** 运行（2026-09-30 的 eager 候选配置诊断、
     # 2026-10-01 的 F13 eager 扩展验证）也消费 manifest；按用户授权，
@@ -295,6 +297,12 @@ def main() -> int:
               if (u.get("family") or {}).get("family_id") != "F13"]
     check("★ 新登记消费方 `unified_geometry_run` 只消费 F13（注册范围仅限该工具 + F13）",
           len(scoped_ug) > 0 and not bad_ug, dict(n_scoped=len(scoped_ug), bad=bad_ug[:4]))
+    # 2026-10-01：HF 外部对照的注册范围**仅限 F13**
+    scoped_hf = [u for u in used if (u.get("tool") or "").startswith("hf_serial_block_probe")]
+    bad_hf = [u["file"] for u in scoped_hf
+              if (u.get("family") or {}).get("family_id") != "F13"]
+    check("★ 新登记消费方 `hf_serial_block_probe` 只消费 F13（注册范围仅限该工具 + F13）",
+          len(scoped_hf) > 0 and not bad_hf, dict(n_scoped=len(scoped_hf), bad=bad_hf[:4]))
     if fam16_ids:
         check(f"fam16 授权轮恰好 {len(fam16_ids)} 格用了 family（实测 %d）"
               % len(fam16), len(fam16) == len(fam16_ids),

@@ -1,14 +1,20 @@
 """unified_geometry.py — **统一执行几何（UCG）**最小原型的共享逻辑。
 
-设计见 `docs/unified_exec_geometry_design_2026-10-01.md`。核心：
+设计见 `docs/unified_exec_geometry_design_2026-10-01.md`（**§12.5 为修订说明**）。核心：
   target 的**每一次**前向都使用 `s = K_BLOCK(=4)` 的块形状：
     * AR 每步喂 `[t, pad, pad, pad]` ⇒ 取 **row 0** ⇒ `trim_cache(blk, pre+1)`；
-    * Spec 的 verify 本来就是 s=4（不变）；repair 走 `_step_padded`（pad 成 4 行）；
+    * Spec 的 verify 本来就是 s=4；repair 走 `_step_padded`（pad 成 4 行）；
     * 尾轮 `k_eff < 4` 时把候选 pad 到 4，只取前 `k_eff` 行的 logits。
-  ⇒ 两臂对**相同 token 历史**的每一次前向：`s`、`T`、mask 对角线、LM head 的 M 维**全部相同**。
+
+⚠️ **口径限制（2026-10-01 修订，勿再过度表述）**：
+  * 本模块**只统一** `s` 与 `T-pre`（以及块 mask 的对角线偏移）；**没有**证明"同一预测位置的**完整**
+    计算几何一致"（查询行数 / `T` / 批次形状带来的 kernel 启发式都可能各自不同）；
+  * F13 实测：**两臂仍分歧**（首次分歧 index 47）⇒ **固定行数不足以保证一致，具体致因尚未唯一定位**；
+  * **不要**把本模块表述为"结构上必然修复"或"块验证与严格一致不相容"；后者已**撤回**；
+  * 模块内"几何一致"只指 `require_geometry_uniform` 检查的那三个量，**不是**完整计算等价。
 
 本模块只做**纯逻辑**与**断言**；调用生产 `spec_dec`/`spec_cache` 的部分在运行脚本里。
-**不改生产默认行为**：`_step_padded` / `_verify_padded` 只在诊断入口显式使用。
+**不改生产默认行为**：`step_padded` / `verify_padded` 只在诊断入口显式使用。
 """
 from __future__ import annotations
 

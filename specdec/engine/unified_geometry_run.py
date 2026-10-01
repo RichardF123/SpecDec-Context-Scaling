@@ -70,9 +70,11 @@ def main() -> int:
                            diag_precision="qk_fp32=False, prob_fp32=False",
                            block=U.KB, pad_id=U.PAD_ID),
                target_semantics="**B**：AR 与 Spec 同时改用统一几何后彼此一致；"
-                                "**不**宣称复现旧 AR 的逐 token（旧 AR 与新 AR 的差异单独记录）",
+                                "**不**宣称复现旧 AR 的逐 token（旧 AR 与新 AR 的差异单独记录）。"
+                                "口径限制：本原型**只统一** `s` 与 `T-pre`，**未**证明完整计算几何一致；"
+                                "F13 实测仍分歧（index 47）⇒ 固定行数不足以保证一致，致因未唯一定位。",
                scope="独立诊断入口；只包 `_verify`/`_step`；不改生产默认 backend/精度/门槛；"
-                     "不做 speedup 声明（AR 侧 target 计算量约 4×，属正确性控制）。")
+                     "**不做** speedup 声明（AR 侧的额外计算量按前向行数估算约 4×，**未经受控实测**）。")
     print(f"[ucg] run_id={run_id} mode={MODE} family={FAMILY}", flush=True)
     print(f"RUN_ID={run_id}", flush=True)
     ok, why = P5V.commit_guard()
