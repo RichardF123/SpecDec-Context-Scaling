@@ -76,6 +76,8 @@ CAP_SP = os.environ.get("CELLS_CAP_SP", "")
 CELLS_MODE = os.environ.get("CELLS_MODE", "gpu").strip().lower()
 REF_RUN_AR = os.environ.get("CELLS_REF_AR", "")      # 捕获对应的**运行记录**（提供 rounds/ar_inv/gen）
 REF_RUN_SP = os.environ.get("CELLS_REF_SP", "")
+# 前缀策略：strict（默认，要求两臂逻辑前缀逐 token 相同）| record（不等也照算，但明确标注"非同一前缀"）
+PREFIX_POLICY = os.environ.get("CELLS_PREFIX_POLICY", "strict").strip().lower()
 # 本轮捕获把 AR 侧的行存在 `row_target`/`row_prev` 键下（位置写在 JSON 元数据里）；
 # 旧捕获用 `row_<预测位置>`（如 `row_8242`）。默认沿用旧约定，可用环境变量切换。
 AR_ROW_KEY = os.environ.get("CELLS_AR_ROW_KEY", "")    # 空 ⇒ 用 f"row_{TARGET_POS}"
@@ -114,6 +116,19 @@ def _mv(cap: dict, key, default=None):
 
 def _ar_row_key() -> str:
     return AR_ROW_KEY or f"row_{TARGET_POS}"
+
+
+def _declared_len(cap: dict, *keys: str) -> tuple:
+    """在多个**历史命名**里找一个"声明的长度"字段（旧捕获用 `snapshot_len`，本轮用 `snapshot_cache_len`）。
+
+    找不到就返回 `(None, None)`，由调用方退回"从快照推导"并**标注来源**——
+    这样既不破坏旧格式，也不把"推导值"冒充"声明值"。
+    """
+    for k in keys:
+        v = _mv(cap, k)
+        if v is not None:
+            return int(v), k
+    return None, None
 
 
 def _cache_len(c):
@@ -284,10 +299,14 @@ def _provenance_cpu(rec, run_id) -> int:
     gen_sp = list(_mv(cap_sp, "gen") or [])
     gen_ar = list(_mv(cap_ar, "gen") or [])
     pre = int(_mv(cap_sp, "pre"))
-    kp = int(_mv(cap_sp, "Kp"))
     cands = list(_mv(cap_sp, "cands") or [])
-    rows = cap_sp["rows"]
-    rows_argmax = [int(rows[j].argmax()) for j in range(rows.shape[0])]
+    rows = cap_sp.get("rows")
+    rows_argmax = ([int(rows[j].argmax()) for j in range(rows.shape[0])] if rows is not None else [])
+    kp = _mv(cap_sp, "Kp")
+    if kp is None:
+        br = _mv(cap_sp, "block_round")
+        kp = (br.get("Kp") if isinstance(br, dict) else None) or len(cands)
+    kp = int(kp)
     tab = DR.slot_table(pre, kp)
     # (1) 槽位表：每一槽的**判断行来源**与**它预测的位置**、以及该行可见的最大 key
     slots = [dict(s, g_token=(list(_mv(cap_sp, "g") or [])[s["slot"]]
@@ -448,37 +467,59 @@ def _run(rec, run_id) -> int:
         ca, cs = _resolve_caps()
         cap_ar = _load_cap(ca)
         cap_sp = _load_cap(cs)
+        rows_sp = cap_sp.get("rows")
+        rows_ar = cap_ar.get("rows")
         rec["sources"] = dict(capture_ar=str(ca), capture_spec=str(cs),
                               ar_row_key=_ar_row_key(),
                               captured_AR_row_sha=A.stable_sha(cap_ar[_ar_row_key()]),
-                              captured_SP_rows_sha=A.stable_sha(cap_sp["rows"][ROW_INDEX]),
+                              captured_SP_rows_sha=(A.stable_sha(rows_sp[ROW_INDEX])
+                                                    if rows_sp is not None else None),
+                              captured_AR_rows_present=rows_ar is not None,
                               AR_capture_meta=cap_ar.get("_meta") or {},
                               SP_capture_meta=cap_sp.get("_meta") or {})
         pref_ar = list(_mv(cap_ar, "prefix_tokens") or [])
         pref_sp = list(_mv(cap_sp, "prefix_tokens") or [])
         A.require(pref_ar and pref_sp, "捕获缺少 prefix_tokens（在 JSON 元数据里）",
                   f"ar={len(pref_ar)} sp={len(pref_sp)}")
-        A.require(pref_ar == pref_sp, "两次捕获的 token 前缀不一致",
-                  f"{pref_ar[:6]} vs {pref_sp[:6]}")
+        _prefix_equal = bool(pref_ar == pref_sp)
+        if PREFIX_POLICY == "strict":
+            A.require(_prefix_equal, "两次捕获的 token 前缀不一致",
+                      f"{pref_ar[:6]} vs {pref_sp[:6]}")
+        else:
+            A.require(len(pref_ar) == len(pref_sp), "两臂前缀长度不一致（无法逐 token 对位）",
+                      f"{len(pref_ar)} vs {len(pref_sp)}")
         A.require(len(pref_ar) == TARGET_POS - 8192,
                   f"前缀长度应为 {TARGET_POS - 8192}", str(len(pref_ar)))
-        rec["prefix"] = dict(n=len(pref_ar), tokens=pref_ar,
-                             note="两臂捕获的共同前缀逐 token 相同（到 TARGET_POS-1 为止）")
+        rec["prefix"] = dict(n=len(pref_ar), tokens=pref_ar, equal=_prefix_equal,
+                             policy=PREFIX_POLICY, tokens_sp=pref_sp,
+                             note=("两臂捕获的共同前缀逐 token 相同（到 TARGET_POS-1 为止）"
+                                   if _prefix_equal else
+                                   "⚠️ 两臂逻辑前缀**不同** ⇒ 下面的四格**不是**同一前缀对照，"
+                                   "只能作为「不同历史 + 不同前缀」的描述"))
         snap_ar, snap_sp = cap_ar["snapshot_cpu"], cap_sp["snapshot_cpu"]
         A.require(snap_ar is not None and snap_sp is not None, "捕获缺少 snapshot_cpu")
         A.require(_cache_len(snap_ar) == PRE and _cache_len(snap_sp) == PRE,
                   "两份快照长度必须都是 PRE", f"{_cache_len(snap_ar)} / {_cache_len(snap_sp)}")
         # 快照完整性：长度可从 K 的形状推出、层内键集合一致、且与真实运行的报告长度一致
-        sp_pre_rec = _mv(cap_sp, "pre")
+        sp_pre_rec, pre_src = _declared_len(cap_sp, "pre")
+        if sp_pre_rec is None:
+            sp_pre_rec, pre_src = _declared_len(cap_sp, "snapshot_cache_len", "snapshot_len")
+        if sp_pre_rec is None:
+            sp_pre_rec, pre_src = _cache_len(snap_sp), "derived_from_snapshot"
+        ar_len_rec, ar_len_src = _declared_len(cap_ar, "snap_cache_len", "snapshot_cache_len",
+                                               "snapshot_len")
+        if ar_len_rec is None:
+            ar_len_rec, ar_len_src = _cache_len(snap_ar), "derived_from_snapshot"
         sp_g = list(_mv(cap_sp, "g") or [])
-        A.require(sp_pre_rec is not None, "Spec 捕获缺少 `pre` 元数据（无法核对起点长度）")
-        A.require(_cache_len(snap_sp) == int(sp_pre_rec), "Spec 快照长度与捕获记录的 pre 不符")
-        A.require(_cache_len(snap_ar) == int(_mv(cap_ar, "snap_cache_len")),
-                  "AR 快照长度与捕获记录不符")
+        A.require(_cache_len(snap_ar) == PRE and _cache_len(snap_sp) == PRE,
+                  "两份快照长度必须都是 PRE", f"{_cache_len(snap_ar)} / {_cache_len(snap_sp)}")
+        A.require(_cache_len(snap_sp) == int(sp_pre_rec), "Spec 快照长度与捕获记录不符")
+        A.require(_cache_len(snap_ar) == int(ar_len_rec), "AR 快照长度与捕获记录不符")
         rec["snapshot_integrity"] = dict(
             ar_len=_cache_len(snap_ar), sp_len=_cache_len(snap_sp), n_layers=[len(snap_ar), len(snap_sp)],
             keys_ar=sorted(snap_ar[0].keys()), keys_sp=sorted(snap_sp[0].keys()),
-            sp_declared_pre=sp_pre_rec, ar_declared_len=_mv(cap_ar, "snap_cache_len"),
+            sp_declared_pre=sp_pre_rec, pre_source=pre_src,
+            ar_declared_len=ar_len_rec, ar_len_source=ar_len_src,
             non_tensor_keys_preserved=sorted({k for lay in snap_ar for k in lay
                                               if not torch.is_tensor(lay[k])}),
             clone_helper="cache_clone.clone_list_cache_full (deepcopy，保留全部层内键)")
@@ -508,7 +549,8 @@ def _run(rec, run_id) -> int:
         rec["probe_rows"] = probes
         # 真实决策行的来源核对（用真实捕获的 rows 与捕获记录里的 g）
         g_rec = list(sp_g)
-        rows_argmax = [int(cap_sp["rows"][j].argmax()) for j in range(cap_sp["rows"].shape[0])]
+        rows_argmax = ([int(rows_sp[j].argmax()) for j in range(rows_sp.shape[0])]
+                       if rows_sp is not None else None)
         rec["provenance"] = dict(
             sp_pre=sp_pre_rec, sp_Kp=_mv(cap_sp, "Kp"), sp_cands=_mv(cap_sp, "cands"),
             sp_round=_mv(cap_sp, "round"), sp_decision_slot=_mv(cap_sp, "decision_slot"),
@@ -518,8 +560,8 @@ def _run(rec, run_id) -> int:
             ar_row_predicts=_mv(cap_ar, "row_target_predicts"),
             ar_row_input_token=_mv(cap_ar, "row_target_input_token"),
             ar_row_cache_len_after=_mv(cap_ar, "row_target_cache_len_after"),
-            rows_match_g=[bool(g_rec[j + 1] == rows_argmax[j]) for j in range(len(rows_argmax))
-                          if j + 1 < len(g_rec)],
+            rows_match_g=([bool(g_rec[j + 1] == rows_argmax[j]) for j in range(len(rows_argmax))
+                           if j + 1 < len(g_rec)] if rows_argmax is not None else []),
             note="rows[j] 应当预测位置 pre+1+j；与真实记录的 g[j+1] 逐个核对（真实值，不是重算）。"
                  "`saved_next` 的张量本体不经引擎接口暴露（未捕获）→ 其位置由 g[0]=位置 pre 的 token "
                  "与 slot_table 证实，不伪造。")
@@ -543,20 +585,41 @@ def _run(rec, run_id) -> int:
             ar_ok=bool(_cache_len(snap_ar) == PRE and _cache_len(snap_sp) == PRE))
         A.require(rec["source_untouched"]["ar_ok"], "源快照被污染（长度改变）")
         # ---- 控制：只对"真实运行里发生过的组合"要求逐元素复现 ----
+        # Spec 侧控制**只在"捕获的 rows 确实由这张快照算出"时才成立**：
+        #   旧捕获格式没有 `block_round` ⇒ 按原行为默认成立；
+        #   新捕获（重建实验）带 `block_round.pre` ⇒ 只有当它 == PRE 时 rows 才出自该快照。
+        _br = _mv(cap_sp, "block_round")
+        _rows_pre = int(_br["pre"]) if isinstance(_br, dict) and "pre" in _br else None
+        _sp_ctrl_ok = bool(rows_sp is not None and (True if _rows_pre is None else _rows_pre == PRE))
         rec["controls"] = dict(
             H_AR_S_vs_captured_AR_row=_cmp(res["H_AR-S"], cap_ar[_ar_row_key()],
                                            "H_AR-S_vs_captured_AR"),
-            H_SP_B_vs_captured_SP_row=_cmp(res["H_SP-B"], cap_sp["rows"][ROW_INDEX],
-                                           "H_SP-B_vs_captured_SP"),
+            H_SP_B_vs_captured_SP_row=(_cmp(res["H_SP-B"], rows_sp[ROW_INDEX],
+                                            "H_SP-B_vs_captured_SP")
+                                       if rows_sp is not None else None),
+            H_SP_B_control_applicable=_sp_ctrl_ok,
+            H_SP_B_control_rows_pre=_rows_pre,
+            H_SP_B_rows_present=rows_sp is not None,
             note="只有这两格有对应的**真实捕获行**；H_AR-B / H_SP-S 是干预组合，"
-                 "真实运行里没有发生 ⇒ 不设参考、不编造参考。")
+                 "真实运行里没有发生 ⇒ 不设参考、不编造参考。"
+                 "Spec 侧控制要求：捕获里确有 `rows`，且 `block_round.pre == PRE`"
+                 "（否则那批 rows 不是由本快照算出的）。")
         A.require(rec["controls"]["H_AR_S_vs_captured_AR_row"]["elementwise_equal"],
                   "控制失败：H_AR-S 未逐元素复现真实 AR 决策行",
                   str(rec["controls"]["H_AR_S_vs_captured_AR_row"]))
-        A.require(rec["controls"]["H_SP_B_vs_captured_SP_row"]["elementwise_equal"],
-                  "控制失败：H_SP-B 未逐元素复现真实 Spec 决策行",
-                  str(rec["controls"]["H_SP_B_vs_captured_SP_row"]))
-        print("[cells] 控制 ✔ H_AR-S == 真实 AR 行、H_SP-B == 真实 Spec 决策行（均逐元素）")
+        if _sp_ctrl_ok:
+            A.require(rec["controls"]["H_SP_B_vs_captured_SP_row"]["elementwise_equal"],
+                      "控制失败：H_SP-B 未逐元素复现真实 Spec 决策行",
+                      str(rec["controls"]["H_SP_B_vs_captured_SP_row"]))
+            print("[cells] 控制 ✔ H_AR-S == 真实 AR 行、H_SP-B == 真实 Spec 决策行（均逐元素）")
+        else:
+            rec["controls"]["H_SP_B_control_skipped"] = dict(
+                reason=("捕获里没有 `rows`（本轮该长度附近没有发生块验证）"
+                        if rows_sp is None else
+                        "捕获的 rows 来自长度 %s 的缓存，而非本快照（PRE=%d）" % (_rows_pre, PRE)),
+                rows_present=rows_sp is not None, rows_pre=_rows_pre, PRE=PRE)
+            print(f"[cells] 控制 ⚠ H_SP-B 的参考**不适用**（rows_present={rows_sp is not None}，"
+                  f"rows_pre={_rows_pre}，PRE={PRE}）；只保留 H_AR-S 控制")
         # ---- 四格两两比较 ----
         rec["compare"] = dict(
             same_history_S_vs_B_AR=_cmp(res["H_AR-S"], res["H_AR-B"], "H_AR_S_vs_B"),

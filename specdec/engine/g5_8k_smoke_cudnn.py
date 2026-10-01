@@ -81,6 +81,12 @@ TARGET_ROPE = os.environ.get("SMOKE_TARGET_ROPE", "default").strip().lower()
 # 只读捕获，不改变任何计算；未设时完全不执行。
 DIVCAP = S.env_flag("SMOKE_DIVCAP", False)
 DIVCAP_POS = int(os.environ.get("SMOKE_DIVCAP_POS", "8239"))
+# 串行重建诊断（**默认关闭**）：把 Spec 每轮实际提交的 token 从**轮前快照**逐 token 重放，
+# 用重放缓存替换下一轮的 target 缓存、并用最后一次重放的 logits 更新 saved_next。
+# 目的：判断首个分歧是否由**既有 KV 历史差异**驱动（不改本轮接受决策）。
+SMOKE_REBUILD = S.env_flag("SMOKE_SPEC_REBUILD", False)
+# 重放中要捕获的长度（默认 = DIVCAP_POS-2 = 8237，与既有现场/四格工具对齐）
+REBUILD_CAP_LEN = int(os.environ.get("SMOKE_REBUILD_CAP_LEN", str(DIVCAP_POS - 2)))
 
 
 def _apply_red_red() -> dict:
@@ -290,6 +296,7 @@ def main() -> int:
     from .lowmem_load import load_ours_bf16
     reg: CheckRegistry | None = None      # 先声明：FinitenessError 处理器需要它（避免 NameError 掩盖原始错误）
     TRS = None                            # 诊断：target RoPE 频率来源作用域（默认不安装）
+    SHR = None                            # 诊断：串行重建 target 缓存历史包装（默认不安装）
     try:
         # **关闭所有诊断精度开关**：本 smoke 只回答"能否完成完整双模型流程"，
         # 不许把诊断用的精度干预混进来（它们只在 §9 的定位实验里启用）。
@@ -353,6 +360,20 @@ def main() -> int:
             rec["target_rope_scope"] = dict(
                 installed=False, requested=TARGET_ROPE,
                 note="未启用 ⇒ target 与 draft 都用原实现（在 device 上算 inv_freq）")
+
+        # ---- 诊断（**默认关闭**）：Spec 的"串行重建 target 缓存历史"包装 ----
+        # 生产 `spec_dec.spec_decode_greedy` **一字未改**：这里只临时替换模块属性，
+        # 并在 finally 里用 `is` 核查还原；不设开关时**完全不安装** ⇒ 原路径逐位不变。
+        if SMOKE_REBUILD:
+            from . import spec_history_rebuild as _SHR
+            SHR = _SHR
+            rec["spec_history_rebuild"] = SHR.install(rebuild=True, capture_len=REBUILD_CAP_LEN,
+                                                      capture_row_at=DIVCAP_POS)
+            print("[smoke] 串行重建包装已安装：" + json.dumps(rec["spec_history_rebuild"],
+                                                              ensure_ascii=False), flush=True)
+        else:
+            rec["spec_history_rebuild"] = dict(installed=False, requested=False,
+                                               note="未启用 ⇒ 走生产 spec_decode_greedy，行为逐位不变")
 
         # ---- G1：输入来源。**默认 legacy 路径不变**；只有显式 `SMOKE_FAMILY` 才走 manifest ----
         plan = FI.resolve_input_plan()
@@ -593,10 +614,46 @@ def main() -> int:
                 rec["target_rope_scope_restore"] = TRS.assert_restored()
                 print("[smoke] target RoPE 作用域已恢复：" 
                       + json.dumps(rec["target_rope_scope_restore"], ensure_ascii=False), flush=True)
+            if SHR is not None:
+                rec["spec_history_rebuild_restore"] = SHR.assert_restored()
+                print("[smoke] 串行重建包装已恢复："
+                      + json.dumps(rec["spec_history_rebuild_restore"], ensure_ascii=False), flush=True)
 
         mem("after_decode", rec)
         rec["stage_decode_done"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
         _save_divcap(div, rec, run_id, gen_ids if MODE == "ar" else list(out["gen"]), ids, eos_id)
+        if SHR is not None:
+            # 先取"重建后"的现场（快照/真实决策行/该轮真实块 rows/逐轮诊断），再还原包装
+            meta, tens = SHR.capture_payload()
+            gen_final = [int(x) for x in out["gen"]]
+            meta.update(divergence_pos=DIVCAP_POS, capture_len=REBUILD_CAP_LEN, mode=MODE,
+                        gen=gen_final, gen_hash=P5V._gen_hash(gen_final),
+                        stop_reason=("eos" if (gen_final and eos_id is not None
+                                               and gen_final[-1] == eos_id)
+                                     else ("max_new_reached" if len(gen_final) >= MAXNEW
+                                           else "other_short")),
+                        prompt_len=int(ids.shape[1]),
+                        # 与 f13_i50_cells 的 PRE/口径对齐：快照长度即 PRE
+                        pre=int(meta.get("snapshot_cache_len") or 0),
+                        prefix_tokens=gen_final[:max(0, DIVCAP_POS - CTX)],
+                        kv=KV, arm=ARM, ctx=CTX, chunk=CHUNK, k=K, max_new=MAXNEW,
+                        target_rope=TARGET_ROPE, bf16_reduced_precision_reduction=RED_RED_INFO)
+            for _k in ("cands", "g"):
+                if isinstance(meta.get("block_round"), dict):
+                    meta[_k] = meta["block_round"][_k]           # 供四格工具读顶层 provenance
+            if isinstance(meta.get("block_round"), dict):
+                meta["round"] = meta["block_round"]["round"]
+                meta["Kp"] = meta["block_round"]["Kp"]
+            rp = OUTDIR / f"divasc_rebuild_{run_id}.pt"
+            torch.save(tens, str(rp))
+            jp = OUTDIR / f"divasc_rebuild_{run_id}.json"
+            jp.write_text(json.dumps(meta, ensure_ascii=False, indent=1, default=str),
+                          encoding="utf-8")
+            rec["rebuild_capture"] = dict(meta=meta, pt=str(rp), json=str(jp),
+                                          has_snapshot=("snapshot_cpu" in tens), tens_keys=sorted(tens))
+            print(f"[smoke] 重建现场已落盘：{jp.name} / {rp.name}"
+                  f"（snapshot_len={meta.get('snapshot_cache_len')}，tens={sorted(tens)}，"
+                  f"重放喂入数={meta.get('n_replay_feeds')}）", flush=True)
         rec["stage_flags"] = dict(stage)
         rec["rounds"] = rounds
         # ---- 冻结的逐轮不变量（与 spec_dec 的契约一致）----
@@ -816,6 +873,9 @@ def main() -> int:
         # 兜底：若因异常在 hooks/作用域安装之后、内层 finally 之前退出，这里仍然还原并留证
         if TRS is not None and TRS.is_installed():
             rec["target_rope_scope_restore_fallback"] = TRS.assert_restored()
+            _write(rec, run_id)
+        if SHR is not None and SHR.is_installed():
+            rec["spec_history_rebuild_restore_fallback"] = SHR.assert_restored()
             _write(rec, run_id)
 
     _write(rec, run_id)
