@@ -40,6 +40,31 @@ CHUNK = int(os.environ.get("HFSB_CHUNK", "2048"))
 PRE = int(os.environ.get("HFSB_PRE", "8240"))
 TOKENS = [int(x) for x in os.environ.get("HFSB_TOKENS", "220,16,16,1154").split(",")]
 TINY = os.environ.get("HFSB_TINY", "1") == "1"
+# 唯一实验变量：`torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction`
+#   default = 不动（记录实际值）| 1 = 显式 True | 0 = 显式 False
+RED = os.environ.get("HFSB_RED_REDUCTION", "default").strip().lower()
+
+
+def _apply_flag() -> dict:
+    """**在模型计算与 prefill 之前**设置并读回；记录"默认值 / 是否显式设置 / 生效值"。"""
+    import torch
+    backend = torch.backends.cuda.matmul
+    default_at_import = bool(getattr(backend, "allow_bf16_reduced_precision_reduction"))
+    if RED in ("1", "true", "on"):
+        backend.allow_bf16_reduced_precision_reduction = True
+        how = "explicit True"
+    elif RED in ("0", "false", "off"):
+        backend.allow_bf16_reduced_precision_reduction = False
+        how = "explicit False"
+    elif RED == "default":
+        how = "未显式设置（保持导入时的值）"
+    else:
+        raise ValueError(f"未知 HFSB_RED_REDUCTION={RED!r}")
+    effective = bool(backend.allow_bf16_reduced_precision_reduction)
+    return dict(requested=RED, default_at_import=default_at_import, how=how,
+                effective_after_set=effective,
+                doc="PyTorch 2.6 数值精度说明：BF16 GEMM 的 reduced-precision reduction "
+                    "**默认开启**，可用该开关关闭")
 
 
 def _newest(pat):
@@ -82,6 +107,100 @@ def _kv_digest(c) -> dict:
             out[f"L{i}_{a[0]}"] = dict(shape=[int(x) for x in t.shape], dtype=str(t.dtype),
                                        finite=bool(torch.isfinite(t).all()), sha=_sha(t))
     return out
+
+
+def clone_checks(src, c1, c2, what: str) -> dict:
+    """**K 与 V 都要**查：与源逐位相同、两臂之间**都不共享存储**。"""
+    n = len(src.layers)
+    res = dict(n_layers=n, per_attr={}, k_shares_storage=False, v_shares_storage=False,
+               bitwise_equal_to_source=True)
+    for a in ("keys", "values"):
+        eq1 = eq2 = True
+        for i in range(n):
+            s = getattr(src.layers[i], a)
+            t1 = getattr(c1.layers[i], a)
+            t2 = getattr(c2.layers[i], a)
+            if not torch.equal(s, t1) or not torch.equal(s, t2):
+                eq1 = False
+            if t1.data_ptr() == t2.data_ptr():
+                res["k_shares_storage" if a == "keys" else "v_shares_storage"] = True
+        res["per_attr"][a] = dict(bitwise_equal_to_source=bool(eq1))
+        if not eq1:
+            res["bitwise_equal_to_source"] = False
+    if not res["bitwise_equal_to_source"]:
+        raise RuntimeError(f"{what}: 克隆臂与源快照不是逐位相同")
+    if res["k_shares_storage"] or res["v_shares_storage"]:
+        raise RuntimeError(f"{what}: 两臂共享存储（K={res['k_shares_storage']} "
+                           f"V={res['v_shares_storage']}）")
+    return res
+
+
+_MASK_LOG: list = []
+
+
+def install_mask_recorder():
+    """**拦截本机 HF 实际使用的 attention 接口**，捕获它收到的 `attention_mask` 实参。
+
+    v5 的实际形态：`Qwen2Attention.forward` 内
+    `ALL_ATTENTION_FUNCTIONS.get_interface(config._attn_implementation, eager_attention_forward)`
+    ⇒ 包装 `get_interface` 返回的接口即可拿到**模型真实使用的 mask**（逐层逐次调用记录）。
+
+    为什么不用 `create_causal_mask` 重建：实测重建结果与模型实际收到的 mask **不一致**
+    （重建未传 `cache_position`/完整序列等内部上下文）⇒ 重建**不能**作为 mask 验证。
+    """
+    from transformers.models.qwen2 import modeling_qwen2 as mq
+    AF = mq.ALL_ATTENTION_FUNCTIONS
+    if getattr(AF, "_dsh_wrapped", False):
+        return AF
+    orig_get = AF.get_interface
+
+    def patched_get_interface(name, default=None):
+        fn = orig_get(name, default)
+
+        def wrapped(module, query, key, value, attention_mask=None, *a, **k):
+            if attention_mask is None and a:          # 位置参数形态
+                attention_mask = a[0]
+                a = a[1:]
+            _MASK_LOG.append(dict(layer_idx=getattr(module, "layer_idx", None),
+                                  q_len=int(query.shape[-2]), kv_len=int(key.shape[-2]),
+                                  name=str(name),
+                                  mask=(None if attention_mask is None else
+                                        dict(shape=[int(x) for x in attention_mask.shape],
+                                             dtype=str(attention_mask.dtype))),
+                                  mask_obj=attention_mask))
+            return fn(module, query, key, value, attention_mask, *a, **k)
+
+        return wrapped
+
+    AF.get_interface = patched_get_interface
+    AF._dsh_wrapped = True
+    return AF
+
+
+def mask_allowed_from_actual(entry) -> dict:
+    """从**实际传给 attention 的 mask 实参**解析允许访问的 key 集合（逐行）。"""
+    m = entry.get("mask_obj")
+    if m is None:
+        return dict(kind="none", note="该调用未传 mask（q_len=1 的常见情形）⇒ **记隐式**，不算已验证")
+    t = m
+    while t.dim() > 2:
+        t = t[0]
+    rows = t if t.dim() == 2 else t.reshape(1, -1)
+    out = []
+    for r in range(rows.shape[0]):
+        row = rows[r].reshape(-1)
+        if row.dtype == torch.bool:
+            allowed = row
+        else:
+            # 加法掩码语义：**允许 = 0**，禁止 = 大负数 / -inf（实测 HF bf16 掩码用 `finfo.min` 量级，
+            # 因此**不能**用 `> -inf` 判定 —— 首跑就是这样把"全允许"误读出来的）。
+            allowed = (row == 0)
+            if not bool(allowed.any()):            # 退路：全非零时取最大值为"允许"
+                allowed = (row == row.max())
+        idx = torch.nonzero(allowed).reshape(-1)
+        out.append(dict(first=int(idx[0]) if idx.numel() else None,
+                        last=int(idx[-1]) if idx.numel() else None, count=int(idx.numel())))
+    return dict(kind="tensor", shape=[int(x) for x in m.shape], dtype=str(m.dtype), rows=out)
 
 
 def _row_fields(r) -> dict:
@@ -212,6 +331,9 @@ def _run() -> int:
         return 3
     try:
         from transformers import AutoTokenizer
+        rec["bf16_reduced_precision_reduction"] = _apply_flag()
+        print(f"[hfsb] bf16 reduced-precision reduction: "
+              f"{json.dumps(rec['bf16_reduced_precision_reduction'], ensure_ascii=False)}", flush=True)
         tok = AutoTokenizer.from_pretrained(TARGET, trust_remote_code=True)
         ids_list, fam_meta = FI.load_family_ids(tok, FAMILY, ctx=CTX)
         ids = torch.tensor([ids_list], device="cuda")
@@ -233,6 +355,7 @@ def _run() -> int:
                             ctx=int(ids.shape[1]), eos_id=int(tok.eos_token_id))
         model = AutoModelForCausalLM.from_pretrained(TARGET, torch_dtype=torch.bfloat16,
                                                      attn_implementation="eager").to("cuda").eval()
+        install_mask_recorder()
         impl = getattr(model.config, "_attn_implementation", None)
         rec["impl"] = dict(attn_implementation=str(impl))
         A_req = (str(impl) == "eager")
@@ -260,33 +383,83 @@ def _run() -> int:
         C0 = clone_cache(cache)
 
         def arm_serial(c):
-            rows, masks = [], []
+            rows, masks, checks = [], [], []
             for j, t in enumerate(TOKENS):
+                pre_call = c.get_seq_length()
+                if pre_call != PRE + j:
+                    raise RuntimeError(f"serial step {j}: 调用前 cache 长度 {pre_call} != {PRE + j}")
+                piece = torch.tensor([[t]], device="cuda")
+                am = torch.ones(1, PRE + j + 1, dtype=torch.long, device="cuda")
+                pos = torch.tensor([[PRE + j]], device="cuda")
+                _MASK_LOG.clear()
                 with torch.inference_mode():
-                    o = model(torch.tensor([[t]], device="cuda"), past_key_values=c, use_cache=True,
-                              position_ids=torch.tensor([[PRE + j]], device="cuda"),
-                              attention_mask=torch.ones(1, PRE + j + 1, dtype=torch.long, device="cuda"),
-                              output_attentions=True)
-                rows.append(o.logits[0, -1].clone())
+                    o = model(piece, past_key_values=c, use_cache=True,
+                              position_ids=pos, attention_mask=am, output_attentions=True)
+                m_entry = _MASK_LOG[0] if _MASK_LOG else None
+                m_parsed = mask_allowed_from_actual(m_entry) if m_entry else dict(kind="no_call")
+                # ---- 逐步硬检查 ----
+                if c.get_seq_length() != PRE + j + 1:
+                    raise RuntimeError(f"serial step {j}: 调用后 cache 长度 {c.get_seq_length()} "
+                                       f"!= {PRE + j + 1}")
+                lr = o.logits[0, -1]
+                if not bool(torch.isfinite(lr.float()).all()):
+                    raise RuntimeError(f"serial step {j}: logits 非有限")
+                kv = c.layers[-1]
+                if not bool(torch.isfinite(kv.keys[:, :, -1, :]).all()) \
+                        or not bool(torch.isfinite(kv.values[:, :, -1, :]).all()):
+                    raise RuntimeError(f"serial step {j}: 新增 K/V 非有限")
+                checks.append(dict(step=j, pred_pos=PRE + j + 1, cache_before=pre_call,
+                                   cache_after=c.get_seq_length(), pos=PRE + j,
+                                   n_attn_calls=len(_MASK_LOG),
+                                   mask_actual=m_parsed))
+                rows.append(lr.clone())
                 masks.append(_mask_support(o.attentions[-1][0, :, 0, :]))
-            return rows, masks, c
+            return rows, masks, checks, c
 
         def arm_block(c):
+            piece = torch.tensor([TOKENS], device="cuda")
+            am = torch.ones(1, PRE + len(TOKENS), dtype=torch.long, device="cuda")
+            pos = torch.arange(PRE, PRE + len(TOKENS), device="cuda").view(1, -1)
+            _MASK_LOG.clear()
             with torch.inference_mode():
-                o = model(torch.tensor([TOKENS], device="cuda"), past_key_values=c, use_cache=True,
-                          position_ids=torch.arange(PRE, PRE + len(TOKENS), device="cuda").view(1, -1),
-                          attention_mask=torch.ones(1, PRE + len(TOKENS), dtype=torch.long, device="cuda"),
-                          output_attentions=True)
-            rows = [o.logits[0, j].clone() for j in range(len(TOKENS))]
+                o = model(piece, past_key_values=c, use_cache=True, position_ids=pos,
+                          attention_mask=am, output_attentions=True)
+            m_entry = _MASK_LOG[0] if _MASK_LOG else None
+            m_parsed = mask_allowed_from_actual(m_entry) if m_entry else dict(kind="no_call")
+            if c.get_seq_length() != PRE + len(TOKENS):
+                raise RuntimeError(f"block: cache 长度 {c.get_seq_length()} != {PRE + len(TOKENS)}")
+            rows, checks = [], []
+            for j in range(len(TOKENS)):
+                lr = o.logits[0, j]
+                if not bool(torch.isfinite(lr.float()).all()):
+                    raise RuntimeError(f"block row {j}: logits 非有限")
+                checks.append(dict(row=j, pred_pos=PRE + j + 1, cache_before=PRE,
+                                   cache_after=c.get_seq_length(), pos=PRE + j,
+                                   n_attn_calls=len(_MASK_LOG), mask_actual=m_parsed))
+                rows.append(lr.clone())
+            kv = c.layers[-1]
+            if not bool(torch.isfinite(kv.keys[:, :, -len(TOKENS):, :]).all()) \
+                    or not bool(torch.isfinite(kv.values[:, :, -len(TOKENS):, :]).all()):
+                raise RuntimeError("block: 新增 K/V 非有限")
             masks = [_mask_support(o.attentions[-1][0, :, j, :]) for j in range(len(TOKENS))]
-            return rows, masks, c
+            return rows, masks, checks, c
 
-        S1, Sm1, cs1 = arm_serial(clone_cache(C0))
-        B1, Bm1, cb1 = arm_block(clone_cache(C0))
-        S2, _, cs2 = arm_serial(clone_cache(C0))
-        B2, _, cb2 = arm_block(clone_cache(C0))
-        if snap_digest != json.dumps(_kv_digest(cache), sort_keys=True):
+        C0 = clone_cache(cache)                     # 共同起点（用于克隆两臂）
+        C0_digest = json.dumps(_kv_digest(C0), sort_keys=True)
+        cs1 = clone_cache(C0)
+        cb1 = clone_cache(C0)
+        rec["clone_checks_rep1"] = clone_checks(C0, cs1, cb1, "rep1 初始两臂")
+        S1, Sm1, chk_s1, cs1 = arm_serial(cs1)
+        B1, Bm1, chk_b1, cb1 = arm_block(cb1)
+        cs2 = clone_cache(C0)
+        cb2 = clone_cache(C0)
+        rec["clone_checks_rep2"] = clone_checks(C0, cs2, cb2, "rep2 初始两臂")
+        S2, _, _, cs2 = arm_serial(cs2)
+        B2, _, _, cb2 = arm_block(cb2)
+        if json.dumps(_kv_digest(cache), sort_keys=True) != snap_digest:
             raise RuntimeError("原始 HF 历史 cache 被改写")
+        if json.dumps(_kv_digest(C0), sort_keys=True) != C0_digest:
+            raise RuntimeError("共同起点 C0（克隆来源）被改写")
         rec["alignment"] = dict(
             rule="serial 第 j 步 T=pre+j+1、可见 key ≤ pre+j；block 第 j 行 T=pre+4、可见 key ≤ pre+j；"
                  "两者都预测 pre+j+1",
@@ -294,11 +467,41 @@ def _run() -> int:
                          for j in range(len(TOKENS))],
             block_rows=[dict(j=j, pred_pos=PRE + j + 1, T=PRE + len(TOKENS), mask_support=Bm1[j])
                         for j in range(len(TOKENS))],
+            checks_serial=chk_s1, checks_block=chk_b1,
+            mask_object_vs_softmax=dict(
+                mask_actual="**拦截本机 HF 实际使用的 attention 函数**，取它收到的 `attention_mask` 实参"
+                            "（逐层调用记录），再按加法(-inf)/布尔语义解析每行允许访问的 key 集合",
+                reconstruction_attempt="曾用 `create_causal_mask` 重建：实测**与模型实际收到的 mask 不一致**"
+                                       "（重建未传 `cache_position`/完整序列等内部上下文）⇒ **不作为验证依据**，"
+                                       "仅记录该失败尝试",
+                softmax_support="仅作**交叉参考**（最后一层、逐 head 的非零计数/最后非零下标）；"
+                                "**softmax 后的零概率不等于被 mask**，因此它**不构成** mask 验证"),
+            mask_actual_serial=[c["mask_actual"] for c in chk_s1],
+            mask_actual_block=[c["mask_actual"] for c in chk_b1],
             mask_support_equal=all(Sm1[j]["counts"] == Bm1[j]["counts"]
                                    and Sm1[j]["lasts"] == Bm1[j]["lasts"]
                                    for j in range(len(TOKENS))),
-            mask_note="`mask_support` 取自 **实际 attention 概率张量**（>0 支撑集）",
             row_source="block 行 j 与 serial 第 j 步**对齐到同一预测位置**；错位比较被禁止")
+        # 实际 mask 实参核对：有显式 mask 的行必须给出允许集合且与位置公式一致；没有的记为**隐式**（不算 PASS）
+        for j in range(len(TOKENS)):
+            for side, chk in (("serial", chk_s1[j]), ("block", chk_b1[j])):
+                ma = chk["mask_actual"]
+                if ma.get("kind") != "tensor":
+                    rec.setdefault("missing_checks", []).append(
+                        f"{side} row {j}: 实际调用未传显式 mask（{ma.get('kind')}）⇒ 记为**隐式**，"
+                        f"不作为已验证的 mask 检查")
+                    continue
+                rows_allowed = ma["rows"]
+                want_row = 0 if side == "serial" else j
+                got = rows_allowed[want_row] if want_row < len(rows_allowed) else None
+                if got is None or got["first"] != 0 or got["last"] != PRE + j:
+                    raise RuntimeError(f"{side} row {j}: 实际 mask 允许集合 {got} 不符"
+                                       f"（期望 0..{PRE + j}）")
+        rec["mask_actual_verified_rows"] = sum(
+            1 for chk in chk_s1 + chk_b1 if chk["mask_actual"].get("kind") == "tensor")
+        rec.setdefault("missing_checks", []).append(
+            "全层/全 head 的 mask 只按 layer_idx=0 用 HF mask API 取了一次；"
+            "未逐层逐 head 展开（如需更严格需另做）")
         if not rec["alignment"]["mask_support_equal"]:
             raise RuntimeError("实际 mask 支撑集不一致 ⇒ 不能做同前缀比较")
         rec["rows"] = dict(

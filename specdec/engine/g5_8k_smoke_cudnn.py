@@ -65,6 +65,29 @@ SELFTEST = os.environ.get("SMOKE_SELFTEST", "").strip()
 # 诊断（**默认关闭**）：prefill 后记录 target/draft 各自的初始状态摘要
 # （全层 KV 硬检查 + 稳定 sha256 + next logits 摘要）⇒ 让 AR 与 Spec 的初始状态**跨进程**可比。
 PREFILL_DIGEST = S.env_flag("SMOKE_PREFILL_DIGEST", False)
+# 单变量实验（**默认不动**）：BF16 GEMM 的 reduced-precision reduction。
+#   default = 不设置（记录导入时的值）| 1 = 显式 True | 0 = 显式 False
+# 必须在**任何模型计算与 prefill 之前**生效 ⇒ 在模块导入时立即应用。
+RED_RED = os.environ.get("SMOKE_BF16_RED_REDUCTION", "default").strip().lower()
+
+
+def _apply_red_red() -> dict:
+    b = torch.backends.cuda.matmul
+    default_at_import = bool(getattr(b, "allow_bf16_reduced_precision_reduction"))
+    if RED_RED in ("1", "true", "on"):
+        b.allow_bf16_reduced_precision_reduction = True
+        how = "explicit True"
+    elif RED_RED in ("0", "false", "off"):
+        b.allow_bf16_reduced_precision_reduction = False
+        how = "explicit False"
+    else:
+        how = "未显式设置（保持导入时的值）"
+    return dict(requested=RED_RED, default_at_import=default_at_import, how=how,
+                effective_after_set=bool(b.allow_bf16_reduced_precision_reduction),
+                doc="PyTorch 2.6：BF16 GEMM reduced-precision reduction **默认开启**")
+
+
+RED_RED_INFO = _apply_red_red()
 
 
 def _cache_len(cache) -> int:
@@ -206,6 +229,9 @@ def main() -> int:
         # **关闭所有诊断精度开关**：本 smoke 只回答"能否完成完整双模型流程"，
         # 不许把诊断用的精度干预混进来（它们只在 §9 的定位实验里启用）。
         rec["diag_precision"] = M.set_diag_preset("eager")
+        rec["bf16_reduced_precision_reduction"] = RED_RED_INFO
+        print(f"[smoke] bf16 reduced-precision reduction: "
+              f"{json.dumps(RED_RED_INFO, ensure_ascii=False)}", flush=True)
         rec["profiler_used"] = False              # 本工具不使用 profiler
         rec["default_strategy_at_start"] = M.attention_strategy()
 
