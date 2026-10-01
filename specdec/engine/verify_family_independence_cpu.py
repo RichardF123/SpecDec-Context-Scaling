@@ -264,7 +264,7 @@ def main() -> int:
     # （下方 `scoped` 检查把这一限制变成可判定条件）。
     authorize_tools = ("g5_f06_index25_forensics", "prefill_sb_replay_f06", "f13_i50_capture",
                        "unified_geometry_run", "hf_serial_block_probe", "xb_probe",
-                       "l0_k_replay", "l0_k_diff_cpu")
+                       "l0_k_replay", "l0_k_diff_cpu", "c1_rope_source_diag")
     forensic = [u for u in used if (u.get("tool") or "").startswith(authorize_tools)]
     # `g5_8k_smoke_cudnn.py` 的**非 fam16** 运行（2026-09-30 的 eager 候选配置诊断、
     # 2026-10-01 的 F13 eager 扩展验证）也消费 manifest；按用户授权，
@@ -322,6 +322,12 @@ def main() -> int:
                if (u.get("family") or {}).get("family_id") != "F13"]
     check("★ 新登记消费方 `l0_k_diff_cpu` 只引用 F13（注册范围仅限该工具 + F13）",
           len(scoped_l0d) > 0 and not bad_l0d, dict(n_scoped=len(scoped_l0d), bad=bad_l0d[:4]))
+    # 2026-10-01：C1 频率来源对齐诊断（只消费已消费的 F13）的注册范围**仅限 F13**
+    scoped_c1r = [u for u in used if (u.get("tool") or "").startswith("c1_rope_source_diag")]
+    bad_c1r = [u["file"] for u in scoped_c1r
+               if (u.get("family") or {}).get("family_id") != "F13"]
+    check("★ 新登记消费方 `c1_rope_source_diag` 只消费 F13（注册范围仅限该工具 + F13）",
+          len(scoped_c1r) > 0 and not bad_c1r, dict(n_scoped=len(scoped_c1r), bad=bad_c1r[:4]))
     if fam16_ids:
         check(f"fam16 授权轮恰好 {len(fam16_ids)} 格用了 family（实测 %d）"
               % len(fam16), len(fam16) == len(fam16_ids),
