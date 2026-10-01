@@ -74,6 +74,13 @@ RED_RED = os.environ.get("SMOKE_BF16_RED_REDUCTION", "default").strip().lower()
 #   cpu_fp32 = **实例级**只作用于 target（draft 保持原实现），见 `target_rope_scope.py`
 # 只改"频率来源"，不改权重/精度/backend/mask/投影/旋转实现；作用域与恢复到产物里留证。
 TARGET_ROPE = os.environ.get("SMOKE_TARGET_ROPE", "default").strip().lower()
+# 分歧定位诊断（**默认关闭**）：在真实生成过程中，把**首个分歧决策**所需的现场原样落盘——
+#   ① 该决策轮起点（AR/Spec **各自**）的 target **完整缓存快照**（deepcopy 全部层内键，含长度/元数据）；
+#   ② 决策行本身（AR：单步得到的行；Spec：block 的 rows）+ 输入 token 与位置。
+#   `SMOKE_DIVCAP_POS` = 要定位的**预测位置**（本协议为 8239）。
+# 只读捕获，不改变任何计算；未设时完全不执行。
+DIVCAP = S.env_flag("SMOKE_DIVCAP", False)
+DIVCAP_POS = int(os.environ.get("SMOKE_DIVCAP_POS", "8239"))
 
 
 def _apply_red_red() -> dict:
@@ -106,6 +113,47 @@ def _versions() -> dict:
     return dict(torch=torch.__version__, transformers=transformers.__version__,
                 cuda=torch.version.cuda, python=__import__("sys").version.split()[0],
                 gpu=(torch.cuda.get_device_name(0) if torch.cuda.is_available() else None))
+
+
+def _snap_cpu_full(cache):
+    """**完整缓存状态**的 CPU 快照（分歧定位诊断用）。
+
+    为什么必须这么做：`cache_clone.clone_list_cache_full` = `copy.deepcopy`，保留**全部层内键**
+    （张量 + 非张量元数据）与长度信息；**不得**只复制 K/V —— 那正是 b0db582 修掉的那类错误。
+    快照本身与源缓存**不共享存储**（deepcopy），因此后续任何格子的前向都不可能污染源。
+    """
+    from .cache_clone import clone_list_cache_full
+    full = clone_list_cache_full(cache)
+    return [{k: (v.detach().to("cpu") if torch.is_tensor(v) else v) for k, v in layer.items()}
+            for layer in full]
+
+
+def _save_divcap(div: dict, rec: dict, run_id: str, gen_ids: list, ids, eos_id) -> None:
+    """落盘分歧现场：小字段进 JSON，大张量进 PT（**不覆盖**：带 run_id）。"""
+    if not div.get("enabled"):
+        return
+    meta = {k: v for k, v in div.items() if not torch.is_tensor(v)}
+    tens = {k: v for k, v in div.items() if torch.is_tensor(v)}
+    if "snap" in div:
+        meta["snap_cache_len"] = _cache_len(div["snap"])
+        meta["snap_n_layers"] = len(div["snap"])
+        meta["snap_keys"] = sorted(div["snap"][0].keys())
+        tens["snapshot_cpu"] = div["snap"]          # list[dict]，作为单一对象存入
+        meta.pop("snap", None)
+    meta.update(divergence_pos=DIVCAP_POS, mode=MODE, gen=list(gen_ids),
+                gen_hash=P5V._gen_hash(gen_ids), prompt_len=int(ids.shape[1]),
+                eos_id=eos_id, kv=KV, arm=ARM, ctx=CTX, chunk=CHUNK, k=K, max_new=MAXNEW,
+                target_rope=TARGET_ROPE,
+                prefix_tokens=list(gen_ids[:DIVCAP_POS - CTX]),
+                prefix_note=("prefix_tokens = 位置 %d..%d 的 token（两臂逐 token 相同），"
+                             "与 f13_i50_cells 的 `prefix_tokens` 口径一致" % (CTX, DIVCAP_POS - 1)))
+    pp = OUTDIR / f"divcap_{MODE}_{run_id}.pt"
+    torch.save(tens, str(pp))
+    jp = OUTDIR / f"divcap_{MODE}_{run_id}.json"
+    jp.write_text(json.dumps(meta, ensure_ascii=False, indent=1, default=str), encoding="utf-8")
+    rec["divergence_capture"] = dict(meta=meta, pt=str(pp), json=str(jp))
+    print(f"[smoke] 分歧现场已落盘：{jp.name} / {pp.name}（snap 长度="
+          f"{meta.get('snap_cache_len')}，键={meta.get('snap_keys')}）", flush=True)
 
 
 def mem(tag: str, rec: dict) -> None:
@@ -371,8 +419,38 @@ def main() -> int:
                 print(f"[smoke] prefill_digest {key}: cache_len={_cache_len(cache)} "
                       f"n_layers={len(cache)} argmax={int(torch.argmax(_digest_row(lg)))}")
 
+        # ---- 分歧定位诊断（**默认关闭**）：捕获决策轮起点的**完整缓存**与 block rows ----
+        div: dict = dict(enabled=bool(DIVCAP), note="分歧定位诊断（只读捕获）")
+
+        def div_pre(cache, cands_):
+            """`_verify` **调用之前**：此时 target cache 尚未被就地改写 ⇒ 只有这里能拿到真正的起点状态。"""
+            if not DIVCAP or "snap" in div:
+                return
+            kp, pre = len(cands_), _cache_len(cache)
+            if not (1 <= DIVCAP_POS - pre <= kp - 1):
+                return                      # 该轮不包含"预测 DIVCAP_POS"的决策槽
+            div["snap"] = _snap_cpu_full(cache)
+            div["round"] = int(reg.round)
+            div["pre"] = pre
+            div["Kp"] = kp
+            div["cands"] = [int(x) for x in cands_]
+            div["decision_slot"] = int(DIVCAP_POS - pre)
+            div["row_index_for_decision"] = int(DIVCAP_POS - pre - 1)
+            div["snap_note"] = ("Spec 历史：位置 0..pre-1 的 target 缓存，由**分块/修复混合**路径建起"
+                               "（块内算出的 KV 经 trim 保留）")
+            div["snap_digests"] = A.require_full_cache(cache, expect_len=pre, n_layers=len(cache),
+                                                       what="divcap Spec 起点缓存")
+
+        def div_post(rows_):
+            if DIVCAP and "snap" in div and "rows" not in div:
+                div["rows"] = rows_.detach().float().cpu().clone()
+                div["rows_argmax"] = [int(x.argmax()) for x in
+                                      [rows_[j] for j in range(rows_.shape[0])]]
+
         hooks = DecisionHooks(tgt=tgt, drf=drf, registry=reg, prefill_impl=inner,
-                              on_prefill=on_prefill, on_prefill_post=on_prefill_post)
+                              on_prefill=on_prefill, on_prefill_post=on_prefill_post,
+                              on_verify_pre=(div_pre if DIVCAP else None),
+                              on_verify_post=(div_post if DIVCAP else None))
         hooks.install()
         # ---- G4：跨层 cache 结构检查（**显式启用**；只读，不改计算）----
         struct_seen: list = []
@@ -440,6 +518,13 @@ def main() -> int:
                 for i in range(MAXNEW):
                     gen_ids.append(nxt)                      # ← 先记录（本步 token 来自上一步的 logits）
                     clen = _cache_len(cache)
+                    # 诊断：捕获**决策轮起点**的完整缓存（长度 = DIVCAP_POS-2 = 8237）
+                    if DIVCAP and clen == DIVCAP_POS - 2 and "snap" not in div:
+                        div["snap"] = _snap_cpu_full(cache)
+                        div["snap_taken_at_step"] = i
+                        div["snap_taken_gen_len"] = len(gen_ids)
+                        div["snap_note"] = ("AR 历史：位置 0..DIVCAP_POS-3 的 target 缓存，"
+                                            "由**单步**（s=1）逐 token 建起")
                     ar_inv.append(dict(step=i, gen_len=len(gen_ids), decode_runs=decode_runs,
                                        cache_len=clen, expected=prompt_len + decode_runs,
                                        pt_allocated_mib=torch.cuda.memory_allocated() / 2 ** 20,
@@ -455,6 +540,17 @@ def main() -> int:
                             tgt.embed_tokens(torch.tensor([[nxt]], device=ids.device)),
                             cache, need_logits=True)
                     decode_runs += 1
+                    # 诊断：捕获**决策行**——`_cache_len(cache)` 等于 DIVCAP_POS 时，本次 `lg`
+                    # 是在位置 DIVCAP_POS-1 上算出的行（喂入的 token 即位置 DIVCAP_POS-2 的 `nxt`）。
+                    if DIVCAP and _cache_len(cache) == DIVCAP_POS and "row_target" not in div:
+                        div["row_target"] = lg[0, -1].detach().float().cpu().clone()
+                        div["row_target_at_position"] = DIVCAP_POS - 1
+                        div["row_target_predicts"] = DIVCAP_POS
+                        div["row_target_input_token"] = int(nxt)
+                        div["row_target_cache_len_after"] = _cache_len(cache)
+                    elif DIVCAP and _cache_len(cache) == DIVCAP_POS - 1 and "row_prev" not in div:
+                        div["row_prev"] = lg[0, -1].detach().float().cpu().clone()
+                        div["row_prev_predicts"] = DIVCAP_POS - 1
                     # **决策前检查**：下一次 argmax 用的就是这份 logits
                     reg.check_finite(lg, phase="decode", model="target", role="decode_lg",
                                      round_=i, step=decode_runs,
@@ -500,6 +596,7 @@ def main() -> int:
 
         mem("after_decode", rec)
         rec["stage_decode_done"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+        _save_divcap(div, rec, run_id, gen_ids if MODE == "ar" else list(out["gen"]), ids, eos_id)
         rec["stage_flags"] = dict(stage)
         rec["rounds"] = rounds
         # ---- 冻结的逐轮不变量（与 spec_dec 的契约一致）----
