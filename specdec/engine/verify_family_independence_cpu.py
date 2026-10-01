@@ -92,7 +92,9 @@ OPT_IN_CONSUMERS = {"g5_8k_smoke_cudnn.py",      # fam16 授权轮（SMOKE_FAMIL
                     # 2026-10-01 经用户授权登记：UCG 原型诊断，**注册范围仅限该工具与 F13**
                     "unified_geometry_run.py",
                     # 2026-10-01 经用户授权登记：HF 外部对照，**注册范围仅限该工具与 F13**
-                    "hf_serial_block_probe.py"}
+                    "hf_serial_block_probe.py",
+                    # 2026-10-01 经用户授权登记：自研 vs HF 同路径对齐，**注册范围仅限该工具与 F13**
+                    "xb_probe.py"}
 
 
 def _manifest_consumers() -> list:
@@ -257,7 +259,7 @@ def main() -> int:
     # `prefill_sb_replay_f06.py` 于 2026-09-30 经用户授权登记，**注册范围仅限该工具与 F06**
     # （下方 `scoped` 检查把这一限制变成可判定条件）。
     authorize_tools = ("g5_f06_index25_forensics", "prefill_sb_replay_f06", "f13_i50_capture",
-                       "unified_geometry_run", "hf_serial_block_probe")
+                       "unified_geometry_run", "hf_serial_block_probe", "xb_probe")
     forensic = [u for u in used if (u.get("tool") or "").startswith(authorize_tools)]
     # `g5_8k_smoke_cudnn.py` 的**非 fam16** 运行（2026-09-30 的 eager 候选配置诊断、
     # 2026-10-01 的 F13 eager 扩展验证）也消费 manifest；按用户授权，
