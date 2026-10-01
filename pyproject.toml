@@ -22,3 +22,6 @@ specdec = "specdec.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["specdec*"]
+
+[tool.setuptools.package-data]
+"specdec.kernels" = ["cuda/*.cu", "cuda/*.cuh", "cuda/*.cpp", "README.md"]

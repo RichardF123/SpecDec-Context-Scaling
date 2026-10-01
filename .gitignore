@@ -35,6 +35,9 @@ Thumbs.db
 .ipynb_checkpoints/
 scratch/
 
+# ---- JIT / local caches (kernel extension build) ----
+.cache/
+
 # ---- Local data / probe scratch (downloadable; raw outputs not source) ----
 data/
 output/
