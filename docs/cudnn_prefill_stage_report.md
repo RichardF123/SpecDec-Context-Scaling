@@ -3206,6 +3206,77 @@ Spec `eager_by_phase={'prefill':208,'propose':1944,'verify':588,'repair':468}`
 
 ---
 
+## 9.39 F13 四格诊断收束 + 统一执行几何（UCG）最小原型：**候选被否定**（2026-10-01）
+
+设计全文 `docs/unified_exec_geometry_design_2026-10-01.md`（含 §12 实测结论）。
+
+### 9.39.1 先修诊断记录（**不新增 GPU 运行**，历史产物全部保留）
+
+新增 `f13_i50_corrections_cpu.py` → `…_corrected_<run_id>.json`，逐条修正：
+
+| # | 修正 | 依据 |
+| --- | --- | --- |
+| 1 | AR 捕获末两步是**固定喂入** `[220,16]`，**不能**称完全自由生成 | 离线核对 `row_8241.argmax == 16` **= 喂入值** ⇒ 8242 的决策行仍是真实 AR 决策行；工具已加硬断言 `require(row_8241.argmax == FEED[1])` |
+| 2 | `probe_rows.ar_row8241_vs_sp_saved_next` 两侧**预测位置不同**（8241 vs 8240） ⇒ 显式标 `incomparable=True`，**不得**用于同位置比较 | 位置公式；其 `max_abs=12.86` 无意义 |
+| 3 | `execution_effect_*` / `history_effect_*` 实际存的是 **`same_argmax`**（命名误导：同一个 `False` 在 H_AR 表示"效应存在"、在 H_SP 表示"不存在"） ⇒ 新增 **`same_argmax` / `choice_changed`** 明确字段（**不改写**旧 JSON） | 旧 JSON 字段值比对 |
+| 4 | margin 只作**描述标签**；AR/Spec 不一致仍记 **FAIL** | 政策声明 |
+| 5 | 可见范围只是**按位置公式推导**（`decision_rows.slot_table`）；本轮**未**取 attention mask 张量 ⇒ **不得**写成"已验证实际 mask" | 工具实现核对 |
+
+### 9.39.2 候选设计（一句话）与语义
+
+**统一执行几何（UCG）**：target 的**每一次**前向都用 `s=4` 的块形状 —— AR 每步喂 `[t,pad,pad,pad]` 取 **row 0**；
+Spec 的 verify 本就是 s=4，**repair 改为 pad 成 4 行**；尾轮 `k_eff<4` 把候选 pad 到 4 只取前 `k_eff` 行；
+pad 行的 KV **一律 trim 丢弃**。
+**目标语义 = B**（AR 与 Spec **同时**改用统一几何后彼此一致）；**不**宣称复现旧 AR（旧 vs 新 AR 差异单独记录）。
+
+### 9.39.3 先过 CPU/短输入测试（**26 PASS / 0 FAIL**）
+
+* **padding 不变性逐位成立**（四种 pad 内容下 row 0 的 logits **逐位相同**）⇒ pad 不可能影响决策或泄题；
+* **trim 后提交位置的 K/V 与"非 padded 单步"逐位相同**（pad 行的 KV 未进入有效 cache）；
+* 计划表 `(s, T-pre, mask 对角线)` 在 AR 步 / repair / verify / 尾轮之间**完全一致**（`(4,4,1)`）；
+* 尾轮 / 接受 / 拒绝 / rollback（m=4/1/0）判定正确；有限性 / 长度 / 快照未改。
+
+### 9.39.4 F13 GPU 实测：**两臂仍分歧 ⇒ 候选被否定**
+
+| 运行 | 结果 |
+| --- | --- |
+| UCG-AR `ucg_20261001_F13_ar_20261001T114131Z` | 64 token、`max_new_reached`、几何一致 `s=4,T-pre=4`（63 计划）、`fused={}` |
+| UCG-Spec `ucg_20261001_F13_spec_20261001T114629Z` | 64 token、`max_new_reached`、几何一致（59 计划）、`fused={}` |
+
+* **UCG-AR vs UCG-Spec：不一致** —— 共同前缀 **47**，首次分歧 **index 47（位置 8239）：AR=6702、Spec=6652**
+  ⇒ **目标 B 未达成**；
+* UCG-Spec vs 旧生产 Spec：**identical=True**（pad 化 repair 未改变任何决策）；
+* UCG-AR vs 旧生产 AR：**identical=False**，首次差异 index 47 ⇒ 新几何**确实改变了 AR 的轨迹**
+  （故只能宣称 B，不能宣称复现旧 AR）。
+
+### 9.39.5 否决的机制：统一 `s` 不足以统一决策行的 `T`
+
+AR(UCG) 的决策行 `T = P+3`（`pre=P-1` 的行 0）；Spec 的块内**第 j 行**预测 `P` 时 `T = pre+4 = P+3-j`
+⇒ 只有 `j=0` 与 AR 相同。**决定某个位置的那一行的 `T`** 依"块内行号/接受模式"而变，
+要让 `T_ar(P)=T_spec(P)` 就必须让"预测 P 的那一行"始终是 `pre=P-1` 的行 0 ⇒ **等于放弃块验证**。
+
+**结论（限定于本实现、本配置、F13 样本）**：候选被否定；**块验证与"逐位等于单步 AR"在该引擎的表格下
+结构上不相容**。**不**证明实现有 bug，也**不**证明其它几何（手写统一 kernel、固定 T 的 padding 方案）不可能；
+本轮**不新增候选**（按停止规则）。
+
+### 9.39.6 缺项与不能保证的事项
+
+* **Spec 侧逐轮 `pre/Kp/m` 与 `plans` 未落盘**（runner 未传 `log=`、未保存 `plans`）⇒ §9.39.5 是**依据
+  `_verify` 索引语义的结构性分析**，**不是**本轮实测的块内行号；**未**为补记录重跑；
+* UCG 的 AR 侧 target 计算量约 **4×** ⇒ **正确性控制，不是加速方案**；本轮**无**任何 speedup 声明；
+* 只测 **F13**；**F06 未跑**（先 F13、出现分歧即停）；未验证其它 k/chunk/KV/长度；
+* 未改生产默认 backend/精度/tie-breaking；proposal 与验收门槛未动；**正式正确性状态不变**。
+
+### 9.39.7 本轮产物
+
+`unified_geometry.py`（原型）、`unified_geometry_selftest_cpu.py`（26/0）、`unified_geometry_run.py`（独立诊断入口）、
+`f13_i50_corrections_cpu.py`、`decision_rows.py`（+28/0 自测）、两份 UCG 运行 JSON、一份修正 JSON；
+设计文档 `docs/unified_exec_geometry_design_2026-10-01.md`。
+**失败记录（保留未覆盖）**：`ucg_20261001_F13_spec_T114228Z`（自我递归：包装调用被 hooks 替换的模块属性）、
+`…_T114350Z`（把 4 行列表传给了 step 形态的 hooks 包装）。
+
+---
+
 ## 9.38 F13 index50 首次分歧的有界取证（**新捕获**，2026-10-01）
 
 只回答：① 原始决策行是否取对、可见前缀是否相同；② 固定本轮起点后 S/B 是否仍不同；

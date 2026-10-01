@@ -225,6 +225,16 @@ def main() -> int:
                       f"{FEED} vs {[old_gen[PRE - CTX], old_gen[PRE - CTX + 1]]}")
             A.require(held["row_8242"]["argmax"] == EXPECT_AR,
                       "AR 复现门失败：位置 8242 应为 17", str(held["row_8242"]["argmax"]))
+            # ★ 硬断言（2026-10-01 修正补入）：末两步是**固定喂入**，必须证明喂入值与该行**模型自己的选择**一致，
+            #    否则 8242 的决策行就不是"真实 AR 决策行"。离线核对见 `f13_i50_corrections_cpu.py`。
+            A.require(held["row_8241"]["argmax"] == FEED[1],
+                      "固定喂入的 token 与 row_8241 的 argmax 不一致 ⇒ 不能称 8242 为真实 AR 决策行",
+                      f"fed={FEED[1]} row_8241.argmax={held['row_8241']['argmax']}")
+            rec["free_generation_coverage"] = dict(
+                model_decided_until_index=(PRE - CTX), n_model_decided=PRE - CTX,
+                fixed_feed_steps=len(FEED), fed=FEED,
+                fed_matches_row_8241_argmax=True,
+                note="到 cache=8240 之前由模型自决；末两步为**固定喂入**（已断言与 row_8241 的 argmax 一致）")
             rec["align"] = al
             rec["ar"] = dict(row_8241=held["row_8241"], row_8242=held["row_8242"],
                              prefix_end_token=FEED[-1],

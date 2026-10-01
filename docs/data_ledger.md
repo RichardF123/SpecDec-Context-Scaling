@@ -3085,6 +3085,45 @@ top-2 margin 与并列集合（默认关闭开关），并在判定逻辑里要�
 `verify_family_independence_cpu` **19 PASS / 0 FAIL**。proposal 维持冻结的 6 主 + 2 补充；
 **正式正确性状态不变**。
 
+### 4.54 F13 四格诊断收束 + 统一执行几何（UCG）原型：**候选被否定**（2026-10-01）
+
+设计全文 `docs/unified_exec_geometry_design_2026-10-01.md`（§12 为实测结论）。
+
+**① 先修诊断记录（不新增 GPU 运行，历史产物全保留）**：新增 `f13_i50_corrections_cpu.py` →
+`…_corrected_<run_id>.json`：① AR 捕获末两步是**固定喂入** `[220,16]`，不能称完全自由生成
+（离线核对 `row_8241.argmax==16` **= 喂入值** ⇒ 8242 的决策行仍是真实 AR 决策行；工具已加硬断言）；
+② `probe_rows.ar_row8241_vs_sp_saved_next` 两侧**预测位置不同**（8241 vs 8240）⇒ 标 `incomparable=True`，
+**不得**用于同位置比较；③ `execution_effect_*`/`history_effect_*` 实际存的是 `same_argmax`（命名误导）⇒
+新增明确字段 `same_argmax`/`choice_changed`（**不改写**旧 JSON）；④ margin 只作描述标签，不一致仍记 **FAIL**；
+⑤ 可见范围只是**公式推导**，本轮**未**取 mask 张量 ⇒ 不得称"已验证实际 mask"。
+
+**② 候选（UCG）**：target 的**每一次**前向都用 `s=4` 块形状 —— AR 每步 `[t,pad,pad,pad]` 取 row 0；
+verify 本就是 s=4；**repair pad 成 4 行**；尾轮 pad 到 4 只取前 `k_eff` 行；pad 行的 KV **一律 trim 丢弃**。
+**目标语义 = B**（AR 与 Spec 同时改用统一几何后彼此一致）；**不**宣称复现旧 AR。原型只在独立诊断入口，
+不改生产默认 backend/精度/tie-breaking。
+
+**③ CPU/短输入测试 26 PASS / 0 FAIL**：**padding 不变性逐位成立**（四种 pad 内容下 row 0 的 logits 逐位相同
+⇒ pad 不可能影响决策或泄题）；**trim 后提交位置的 K/V 与"非 padded 单步"逐位相同**；
+AR 步 / repair / verify / 尾轮的计划几何**完全一致**（`(s=4, T-pre=4, diag=pre+1)`）；尾轮/接受/拒绝/rollback 判定正确。
+
+**④ F13 GPU 实测（全 eager、`fused={}`、几何一致）**：UCG-AR `…F13_ar_T114131Z`（64 token）、
+UCG-Spec `…F13_spec_T114629Z`（64 token）。**UCG-AR vs UCG-Spec 不一致**：共同前缀 **47**，
+首次分歧 **index 47（位置 8239）：AR=6702、Spec=6652** ⇒ **目标 B 未达成，候选被否定**。
+UCG-Spec vs **旧生产 Spec identical=True**；UCG-AR vs 旧生产 AR **identical=False（首次差异 index 47）**
+⇒ 新几何确实改变了 AR 的轨迹（故只能宣称 B）。
+
+**⑤ 否决机制**：AR(UCG) 的决策行 `T = P+3`（`pre=P-1` 的行 0）；Spec 的块内**第 j 行**预测 `P` 时
+`T = pre+4 = P+3-j` ⇒ 只有 `j=0` 与 AR 相同。**统一行数 `s` 不足以统一决策行的 `T`**；
+要让 `T_ar(P) = T_spec(P)` 必须让"预测 P 的那一行"始终是 `pre=P-1` 的行 0 ⇒ **等于放弃块验证**。
+**结论（限定本实现/本配置/F13 样本）**：**块验证与"逐位等于单步 AR"在该引擎下结构上不相容**；
+**不**证明实现有 bug，也**不**证明其它几何不可能；**本轮不新增候选**。
+
+**⑥ 缺项（不为补记录重跑）**：Spec 侧逐轮 `pre/Kp/m` 与 `plans` **未落盘**（runner 未传 `log=`、未存 `plans`）
+⇒ §⑤ 是**依据 `_verify` 索引语义的结构性分析**，不是本轮实测行号；UCG 的 AR 侧 target 计算量约 **4×**
+⇒ **正确性控制，非加速方案**，本轮**无** speedup 声明；只测 F13，**F06 未跑**（先 F13、分歧即停）；
+未验证其它 k/chunk/KV/长度；proposal 与验收门槛未动，**正式正确性状态不变**。
+**失败记录（保留未覆盖）**：`…F13_spec_T114228Z`（自我递归）、`…T114350Z`（把 4 行列表传给 step 形态包装）。
+
 **下一步（唯一优先）**：按同一四运行协议把候选配置诊断扩展到**其它已参与调试的条件**与 **V-only FP8**，
 并**另行安排独立验收**；配套工程项＝prefill 统一 + 入口自检（§4.49 末）。**不**自动扩展矩阵、**不**改生产默认、**不**放宽标准。
 
