@@ -86,10 +86,12 @@ def comparable(row: dict, common: dict, *, limit: int) -> tuple:
 
 def compare_arms(rows_s: list, rows_b: list, common: dict, *, limit: int) -> dict:
     """**保留来源**的对照：按预测位置配对，逐行判可比性，不可比者不入统计。"""
-    out = dict(limit=limit, pairs=[], incomparable=[], first_nonzero=None, first_argmax=None)
+    out = dict(limit=limit, pairs=[], excluded_rows=[], excluded_by_reason={},
+               first_nonzero=None, first_argmax=None)
     by_pos_b: dict = {}
     for rb in rows_b:
         by_pos_b.setdefault(rb["pred_pos"], []).append(rb)
+    paired_keys = set()
     for rs in rows_s:
         cands = by_pos_b.get(rs["pred_pos"], [])
         ok_s, why_s = comparable(rs, common, limit=limit)
@@ -99,13 +101,11 @@ def compare_arms(rows_s: list, rows_b: list, common: dict, *, limit: int) -> dic
         for rb in cands:
             ok_b, why_b = comparable(rb, common, limit=limit)
             if not (ok_s and ok_b):
-                out["incomparable"].append(dict(
-                    pred_pos=rs["pred_pos"], which=("S" if not ok_s else "B"),
-                    reason=(why_s if not ok_s else why_b),
-                    s_source=f"{rs['source']}:{rs['detail']}",
-                    b_source=f"{rb['source']}:{rb['detail']}",
-                    s_ok=ok_s, b_ok=ok_b))
+                # ⚠️ **不在这里登记排除项**：本循环是「S×B 组合」，同一行会被登记多次
+                # （实测 63 条里只有 51 行是不同行）。排除清单统一由下面的**逐行清点**产生。
                 continue
+            paired_keys.add(("S", f"{rs['source']}:{rs['detail']}", rs["pred_pos"]))
+            paired_keys.add(("B", f"{rb['source']}:{rb['detail']}", rb["pred_pos"]))
             d = (rs["row"] - rb["row"]).abs()
             rec = dict(pred_pos=rs["pred_pos"],
                        s_source=f"{rs['source']}:{rs['detail']}",
@@ -120,44 +120,48 @@ def compare_arms(rows_s: list, rows_b: list, common: dict, *, limit: int) -> dic
                        n_diff=int((d > 0).sum()), n_elem=int(d.numel()))
             out["pairs"].append(rec)
     out["pairs"].sort(key=lambda x: (x["pred_pos"], x["b_source"]))
-    # ---- 显式清点**未被配对的每一行**（不可比 / 无对手位置），避免"隐去来源" ----
-    paired_b = {(x["pred_pos"], x["b_source"]) for x in out["pairs"]}
-    paired_s = {x["pred_pos"] for x in out["pairs"]}
-    for rb in rows_b:
-        if (rb["pred_pos"], f"{rb['source']}:{rb['detail']}") in paired_b:
-            continue
-        ok_b, why_b = comparable(rb, common, limit=limit)
-        has_s = any(rs["pred_pos"] == rb["pred_pos"] for rs in rows_s)
-        out["incomparable"].append(dict(
-            pred_pos=rb["pred_pos"], which="B",
-            reason=(why_b if not ok_b else ("S 臂无该预测位置的行" if not has_s
-                                            else "S 臂该位置的行不可比")),
-            b_source=f"{rb['source']}:{rb['detail']}", b_ok=ok_b,
-            b_cache_len=rb["cache_len_after"], b_n_visible=rb["n_visible"],
-            prefix_len=len(rb["hist"])))
-    for rs in rows_s:
-        if rs["pred_pos"] in paired_s:
-            continue
-        ok_s, why_s = comparable(rs, common, limit=limit)
-        out["incomparable"].append(dict(
-            pred_pos=rs["pred_pos"], which="S",
-            reason=(why_s if not ok_s else "B 臂无该预测位置的行"),
-            s_source=f"{rs['source']}:{rs['detail']}", s_ok=ok_s,
-            s_cache_len=rs["cache_len_after"], s_n_visible=rs["n_visible"],
-            prefix_len=len(rs["hist"])))
-    out["incomparable"].sort(key=lambda x: (x["pred_pos"], x["which"]))
-    # ---- 去重口径（任务要求）：**行级**条目与**按 (位置, 原因) 去重**后的条目分别计数。
-    # 每个行级条目对应**一行**（source/detail 唯一）⇒ 行级计数不是"重复登记"；
-    # 而同一 (位置, 原因) 可能被多行共享 ⇒ 去重计数用于避免看起来像多个独立观测。
-    out["n_incomparable_rows"] = len(out["incomparable"])
-    out["n_incomparable_distinct_pos_reason"] = len(
-        {(x["pred_pos"], x["reason"]) for x in out["incomparable"]})
-    out["n_incomparable_distinct_pos"] = len({x["pred_pos"] for x in out["incomparable"]})
-    out["dedup_note"] = ("行级条目 = 一行一条（source/detail 唯一，非重复登记）；"
-                         "`n_incomparable_distinct_pos_reason` 是按 (位置, 原因) 去重后的条数")
-    out["paired_b_rows"] = len(paired_b)
-    out["b_rows_total"] = len(rows_b)
-    out["s_rows_total"] = len(rows_s)
+    # ---- 排除清单：**严格一行一条**（键 = which + source:detail + pred_pos，并断言唯一）----
+    out.pop("incomparable", None)
+    seen = set()
+    for which, rows in (("S", rows_s), ("B", rows_b)):
+        for r in rows:
+            key = (which, f"{r['source']}:{r['detail']}", r["pred_pos"])
+            if key in paired_keys or key in seen:
+                continue
+            seen.add(key)
+            okr, why = comparable(r, common, limit=limit)
+            if which == "B":
+                has_s = any(rs["pred_pos"] == r["pred_pos"] for rs in rows_s)
+                reason = why if not okr else ("S 臂无该预测位置的行" if not has_s
+                                              else "S 臂该位置的行不可比")
+            else:
+                reason = why if not okr else "B 臂无该预测位置的行"
+            out["excluded_rows"].append(dict(
+                which=which, pred_pos=r["pred_pos"], source=f"{r['source']}:{r['detail']}",
+                comparable=okr, reason=reason, cache_len=r["cache_len_after"],
+                n_visible=r["n_visible"], prefix_len=len(r["hist"]), argmax=r["argmax"]))
+    out["excluded_rows"].sort(key=lambda x: (x["pred_pos"], x["which"], x["source"]))
+    keys = [(x["which"], x["source"], x["pred_pos"]) for x in out["excluded_rows"]]
+    require(len(keys) == len(set(keys)),
+            "排除清单出现**重复登记**（同一 which+source+pred_pos 多次）",
+            str(sorted({k for k in keys if keys.count(k) > 1})[:4]))
+    by_reason: dict = {}
+    for x in out["excluded_rows"]:
+        k = ("预测位置超出上限" if "上限" in x["reason"] else
+             ("token 前缀与共同前缀不符" if "!=" in x["reason"] else
+              ("无共同前缀记录" if "无共同前缀记录" in x["reason"] else x["reason"])))
+        by_reason[k] = by_reason.get(k, 0) + 1
+    out["excluded_by_reason"] = by_reason
+    out["n_excluded_rows"] = len(out["excluded_rows"])
+    out["n_excluded_distinct_pos"] = len({x["pred_pos"] for x in out["excluded_rows"]})
+    out["dedup_note"] = ("`excluded_rows` 严格**一行一条**（键 = which + source:detail + pred_pos，"
+                         "已 require 唯一）；`pairs` 只含可比配对。"
+                         "上一版把「S×B 组合」也登记为条目 ⇒ 同一行被记多次（63 条里实际只有 51 行），已修。")
+    out["counts"] = dict(s_rows=len(rows_s), b_rows=len(rows_b),
+                         paired_s_rows=len({x["s_source"] for x in out["pairs"]}),
+                         paired_b_rows=len({x["b_source"] for x in out["pairs"]}),
+                         paired_positions=len({x["pred_pos"] for x in out["pairs"]}),
+                         excluded_rows=out["n_excluded_rows"])
     for rec in out["pairs"]:
         if out["first_nonzero"] is None and not rec["elementwise_equal"]:
             out["first_nonzero"] = rec["pred_pos"]

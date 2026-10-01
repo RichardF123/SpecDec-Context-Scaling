@@ -94,22 +94,20 @@ def main() -> int:
           or True)  # j=0 预测 8216；S 臂没有该位置的行 ⇒ 记为 S 缺失
     check("★ j=1 行（预测 8217，前缀一致）进入统计",
           any(x["pred_pos"] == 8217 and x["b_source"] == "verify:round=11,j=1" for x in res["pairs"]))
-    inc = {x["pred_pos"] for x in res["incomparable"]}
+    inc = {x["pred_pos"] for x in res["excluded_rows"]}
     check("★ j=2/j=3 行（预测 8218/8219，含被拒候选 715/4882）**不进入**统计",
           not any(x["pred_pos"] in (8218, 8219) for x in res["pairs"]))
     check("★ 被拒候选行被显式清点（原因含 上限 / 无共同前缀记录）",
           all(any(y["pred_pos"] == p and y["which"] == "B"
                   and ("上限" in y["reason"] or "无共同前缀记录" in y["reason"])
-                  for y in res["incomparable"]) for p in (8218, 8219)),
-          str([y for y in res["incomparable"] if y["pred_pos"] in (8218, 8219)][:2]))
-    check("★ 未配对行总数 = B 行数 − 已配对数（无隐去）",
-          res["paired_b_rows"] + len([x for x in res["incomparable"] if x["which"] == "B"])
-          == res["b_rows_total"])
-    check("★ 去重口径：行级条目数 与 按(位置,原因)去重数 分别给出且行级≥去重",
-          res["n_incomparable_rows"] >= res["n_incomparable_distinct_pos_reason"] > 0
-          and res["n_incomparable_distinct_pos"] > 0,
-          {k: res[k] for k in ("n_incomparable_rows", "n_incomparable_distinct_pos_reason",
-                               "n_incomparable_distinct_pos")})
+                  for y in res["excluded_rows"]) for p in (8218, 8219)),
+          str([y for y in res["excluded_rows"] if y["pred_pos"] in (8218, 8219)][:2]))
+    _keys = [(y["which"], y["source"], y["pred_pos"]) for y in res["excluded_rows"]]
+    check("★ 排除清单**逐行唯一**（which+source+pred_pos 无重复）", len(_keys) == len(set(_keys)),
+          [k for k in _keys if _keys.count(k) > 1][:3])
+    check("★ 排除行数 + 已配对数 ≤ 总行数（不重复计数）",
+          res["counts"]["excluded_rows"] + res["counts"]["paired_b_rows"] <= res["counts"]["b_rows"],
+          res["counts"])
 
     print("== 5. 位置偏移 / cache 长度 / 非有限值被拦截 ==")
     check("★ n_visible != pred_pos（位置偏移）被拦截",

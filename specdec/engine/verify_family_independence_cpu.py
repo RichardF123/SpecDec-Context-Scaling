@@ -252,24 +252,26 @@ def main() -> int:
     # （下方 `scoped` 检查把这一限制变成可判定条件）。
     authorize_tools = ("g5_f06_index25_forensics", "prefill_sb_replay_f06")
     forensic = [u for u in used if (u.get("tool") or "").startswith(authorize_tools)]
-    # `g5_8k_smoke_cudnn.py` 的**非 fam16** 运行（例如 2026-09-30 的 eager 候选配置诊断）
-    # 也消费 manifest；按用户授权，**只有 family == F06** 才纳入 F06 定点诊断范围，
-    # 其它 family 一律仍算「授权范围之外」。
+    # `g5_8k_smoke_cudnn.py` 的**非 fam16** 运行（2026-09-30 的 eager 候选配置诊断、
+    # 2026-10-01 的 F13 eager 扩展验证）也消费 manifest；按用户授权，
+    # **只允许 F06 与 F13**（两者都是已参与调试的定点诊断 family），
+    # 其它 family 一律仍算「授权范围之外」；**不**扩大到任何别的 family。
+    REGISTERED_DIAG_FAMILIES = ("F06", "F13")
     fam16_files = {f"smoke8k_cudnn_prefill_{r}.json" for r in fam16_ids}
     smoke_f06 = [u for u in used
                  if (u.get("tool") or "").startswith("g5_8k_smoke_cudnn")
                  and u["file"] not in fam16_files
-                 and (u.get("family") or {}).get("family_id") == "F06"]
+                 and (u.get("family") or {}).get("family_id") in REGISTERED_DIAG_FAMILIES]
     smoke_other = [u for u in used
                    if (u.get("tool") or "").startswith("g5_8k_smoke_cudnn")
                    and u["file"] not in fam16_files
-                   and (u.get("family") or {}).get("family_id") != "F06"]
+                   and (u.get("family") or {}).get("family_id") not in REGISTERED_DIAG_FAMILIES]
     authorized_files = ({u["file"] for u in fam16} | {u["file"] for u in forensic}
                         | {u["file"] for u in smoke_f06})
     outside = [u for u in used if u["file"] not in authorized_files]
     check("★ **授权范围之外**没有任何 run 消费 manifest family（授权范围 = fam16 16 格 + F06/index25 定点取证）",
           not outside, outside[:5])
-    check("★ smoke 工具的非 fam16 运行只允许 F06（eager 候选配置诊断的登记范围）",
+    check("★ smoke 工具的非 fam16 运行只允许已登记的定点诊断 family（F06 / F13）",
           not smoke_other, [u["file"] for u in smoke_other][:4])
     scoped = [u for u in used if (u.get("tool") or "").startswith("prefill_sb_replay_f06")]
     bad_family = [u["file"] for u in scoped

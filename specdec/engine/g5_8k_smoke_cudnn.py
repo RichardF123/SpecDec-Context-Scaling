@@ -36,6 +36,7 @@ from . import g5_driver as D
 from .smoke_checks import (CheckRegistry, FinitenessError, evaluate,
                            prefill_finiteness_live, verify_decision_coverage)
 from . import family_input as FI
+from .dispatch_judge import judge_dispatch
 from . import status_fields
 from .smoke_hooks import DecisionHooks
 from . import spec_cache
@@ -456,26 +457,13 @@ def main() -> int:
         # **确认新路径确实启用、且没有错误扩展到验证阶段**
         fused_by_phase = a_stats.get("fused_by_phase", {})
         eager_by_phase = a_stats.get("eager_by_phase", {})
-        # **按臂判定**：`cudnn_prefill` 臂要求融合**只**出现在 prefill；
-        # `eager` 臂要求**融合调用严格为 0**（同时 prefill 必须真的走过）。
-        # 这不是放宽：对 eager 臂而言「融合计数必须为 0」比原检查更严格；
-        # 原检查隐含「必须用融合」，对 eager 臂本身就不适用（2026-09-30 修正）。
-        if ARM == "cudnn_prefill":
-            fused_ok = sorted(k for k, v in fused_by_phase.items() if v > 0) == ["prefill"]
-        else:
-            fused_ok = not any(v > 0 for v in fused_by_phase.values())
-        if MODE == "ar":
-            dispatch_ok = (fused_ok
-                           and all(fused_by_phase.get(p, 0) == 0
-                                   for p in ("propose", "verify", "repair", "decode"))
-                           and eager_by_phase.get("prefill", 0) > 0
-                           and eager_by_phase.get("decode", 0) > 0)
-        else:
-            dispatch_ok = (fused_ok
-                           and all(fused_by_phase.get(p, 0) == 0
-                                   for p in ("propose", "verify", "repair", "decode"))
-                           and eager_by_phase.get("prefill", 0) > 0
-                           and eager_by_phase.get("verify", 0) > 0)
+        # **按臂判定**（`dispatch_judge.judge_dispatch`）：期望路径由生产
+        # `decide_attention_path` 契约裁决 —— `eager` 臂要求融合**严格为 0**；
+        # `cudnn_prefill` 臂要求 prefill 按策略融合（若策略对该 s 判 eager 则是**合法回退**，记录依据）。
+        # 这不是放宽：对 eager 臂更严格，对 cudnn 臂也不再误判正常的全融合 prefill。
+        dj = judge_dispatch(ARM, MODE, a_stats)
+        dispatch_ok = dj["ok"]
+        rec["dispatch_judge"] = dj
         # ---- 停止原因：**不能少生成却当固定长度完成** ----
         gen_len = len(gen)
         if gen and eos_id is not None and gen[-1] == eos_id:
@@ -532,7 +520,10 @@ def main() -> int:
             invariants_detail=f"{len(inv)} 轮，全部满足 tgt_len==drf_len==pre+(m+1 if m<Kp else Kp)"
                               if inv else "无轮次记录",
             dispatch_ok=dispatch_ok,
-            dispatch_detail=f"fused={fused_by_phase} eager={eager_by_phase}",
+            dispatch_detail=(f"fused={fused_by_phase} eager={eager_by_phase}"
+                             f" expected_prefill_path={dj['expected_prefill_path']}"
+                             f" fallback={dj['fallback_reason']}"
+                             + (f" failures={dj['failures']}" if dj["failures"] else "")),
             attention_assert=attn_ok, gen_len=gen_len, max_new=MAXNEW, eos_id=eos_id,
             gen=gen, stop_reason=stop_reason, exception=None,
             alloc_ok=bool(rec.get("mem_timeline")),

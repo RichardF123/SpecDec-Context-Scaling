@@ -2970,6 +2970,66 @@ Spec peak_alloc 7795 / peak_res 10648 / smi 7785·7831，prefill 26.0·23.0 s（
 只覆盖 1 family × 1 KV 档 × max_new=64 × 单 prompt；**V-only FP8 未测**、fam16 其余 15 格未测；
 B6 正式门（20 组合）与主门（FP32 逐 token 相等）**未被替代**；生产默认仍为 `cudnn_prefill`。
 
+### 4.52 后端检查器修复 + F13 8K eager 扩展验证（2026-10-01）
+
+依据 `docs/proposal_freeze_2026-10-01.md`（FROZEN：6 主 + 2 个 8K FP8 补充；旧 12 条件属历史，未沿用）。
+**不**测 FP8、**不**计正式性能、**不**改默认 backend、**不**改生产计算。
+
+**① 后端检查器修复**：旧 `dispatch_ok` 无论后端都要求 `eager_by_phase['prefill']>0`
+⇒ **正常的全融合 cuDNN prefill 会被误判失败**。抽出纯函数 `dispatch_judge.judge_dispatch`：
+「prefill 是否应融合」由生产 `decide_attention_path('prefill', s_max)` 裁决；
+`by_phase['prefill']==0` 与非 prefill 阶段融合一律失败；`eager` 臂要求**融合严格为 0**（更严）；
+`cudnn_prefill` 臂要求 prefill 按策略融合，**已定义回退**（如 `s<2`）不判失败但记录依据；
+AR 须有 eager `decode`、Spec 须有 eager `verify`+`propose`。
+CPU 自测 `dispatch_judge_selftest_cpu` **22 PASS / 0 FAIL**，且**用生产记录路径**生成统计
+（`set_attention_strategy` → `decide_attention_path` → `_record_attention_call` → `attention_stats` → judge），
+含「旧口径会误判正常全融合运行」的对照。
+
+**② 排除行统计纠正（真的去重）**：上一轮报的「行级 63」**是错的** —— 旧 `compare_arms` 把
+「S×B **组合**配对失败」也登记为条目 ⇒ 同一行重复登记（63 = 30 条组合级重复 + 33 条逐行清点）。
+**真实排除行数 = 33**（`which + source:detail + pred_pos` 逐行唯一；S 臂 1 + B 臂 32），涉及 21 个位置；
+原因：前缀不符 30 · 超出上限 2 · 无对手位置 1。已修为**逐行唯一**并加 `require`；
+可比配对数不变（**25**）⇒ **重复登记只影响计数、未进入误差统计，结论不受影响**。
+`sb_align` 自测 **38/0**（新增「逐行唯一」「排除行数+已配对数 ≤ 总行数」）。
+
+**③ F13 / 8K / base_bf16 四次运行（独立进程、串行）**：AR `…T065923Z`、Spec `…T070019Z`、
+AR `…T070134Z`、Spec `…T070207Z`。四者 `run_ended`、`gen_len=64`、`stop=max_new_reached`、
+检查 passed（10/14）、`未覆盖=[]`、**`fused_by_phase={}`**。
+输入 F13 `token_sha1 == ids_hash == 9a278731d744a859`；
+阶段计数 AR `{'prefill':112,'decode':1764}`、Spec `{'prefill':208,'propose':2328,'verify':700,'repair':936}`
+⇒ **target/draft 都分块（2048）都 eager**。初始状态：target 8192/28 层、draft 8192/**24 层**，
+全层 bf16·finite·长度硬检查通过；**AR vs Spec target 摘要 56/56 一致**，next logits 摘要相同
+（sha `c35f0a1a5adb3c27`、argmax 220、margin 2.25）；同模式两次重复摘要一致。
+
+**④ 判定**：**AR rep1==rep2** ✓、**Spec rep1==rep2** ✓（25 轮结构亦一致）；
+**AR vs Spec 不一致**：共同前缀 **50**，**首次分歧 index 50（预测位置 8242）：AR=17、Spec=20**；
+长度（64/64）与停止原因一致 ⇒ `length_mismatch_only=false`。
+**分支覆盖**：25 轮 = 全接受 **7** · 零接受 **7** · 部分接受 **11** ⇒ 接受/拒绝/replacement/回滚**均真实执行** ✓。
+**分歧决策上下文（来自记录，未新跑）**：落在 **round 19**（`pre=8240,Kp=4,m=2`），
+`cands=[220,16,16,1154]`、`g=[220,16,20,11]`、`emitted=[220,16,20]` ⇒ draft 候选 index 50 为 16、
+Spec `rows[1]` 给 20（替换）、AR 给 17（与前几轮同类：块行 vs 串行步）。
+**缺项**：未保存决策行 logits/top 候选/margin ⇒ **不报 margin**（**不**为补数据重跑）；
+首次分歧之后只报「轨迹不同」。
+
+**⑤ 与 cuDNN 历史对照（同 family 同 KV）**：F06/base cuDNN 首次分歧 **25**（715 vs 576）、
+F06/base **eager 无分歧（64/64）**、F13/base cuDNN **47**（13282 vs 25806）、
+F13/base **eager 50**（17 vs 20）、F13/v_fp8 cuDNN **23**（28693 vs 25179）。
+⇒ **eager 让 F06 一致但 F13 仍分歧（位置 47→50）** ⇒ **F06 通过不能推广**；**不**称 eager 修复了问题；
+**也**不能说 cuDNN 是分歧的必要条件。本轮**不做**逐层追查。
+
+**⑥ 资源**：commit 护栏全 `ok=True`；AR peak_alloc 6153 MiB、Spec 7795 MiB，
+设备侧峰值 7774–7804 MiB（设备 8188）⇒ 余量很薄；含插桩诊断，**不得**当正式性能结果。
+
+**⑦ 下一轮清单（预登记，未执行）**：先处理 F13 分歧（加**默认关闭**的决策行 margin 开关补齐记录，
+不改计算；不逐层追查、不改 tie-breaking）→ 最小 BF16 扩展回归（2K/4K 真实 AR/Spec 配对，
+复用四运行协议）→ 分支边界用例（EOS/全接受/回滚/`k_eff<k`，用短上下文）→ **无重型插桩**的 8K 稳定性验证
+（关掉 digest/struct 开关，AR/Spec 各 2 次比对 token/长度/停止原因/`fused=0`/内存；与插桩版**分开**列表）
+→ 入口自检 → **FP8 仅排在主线 BF16 之后** → **F06/F13 不得标为独立验收输入**，后续独立验收需另选并登记。
+
+**⑧ 治理**：smoke 工具的非 fam16 运行登记范围扩为**已登记定点诊断 family（F06 / F13）**，
+`verify_family_independence_cpu` **18 PASS / 0 FAIL**；未扩大到其它 family，未重标 F06/F13。
+**旧结果与历史 PASS/FAIL 全部保留未改**。
+
 **下一步（唯一优先）**：按同一四运行协议把候选配置诊断扩展到**其它已参与调试的条件**与 **V-only FP8**，
 并**另行安排独立验收**；配套工程项＝prefill 统一 + 入口自检（§4.49 末）。**不**自动扩展矩阵、**不**改生产默认、**不**放宽标准。
 

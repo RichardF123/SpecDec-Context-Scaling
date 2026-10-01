@@ -3051,13 +3051,18 @@ Spec `eager_by_phase={'prefill':208,'propose':1944,'verify':588,'repair':468}`
 `smoke8k_eager_20260930T185154Z.json` 与 `…T185333Z.json`（draft head_dim=64 被硬编码的 128 误杀，
 即"用同一条检查套两个不同 head_dim 的模型"这一真实缺口）。
 
-### 9.36.9 排除项统计口径（去重，补齐上一轮）
+### 9.36.9 排除项统计口径（**2026-10-01 纠正**）
 
-上一轮 cuDNN 臂的「不可比较/缺失」条目：**行级 63 条**（每个条目对应**一行**，其
-`pred_pos + source + detail` 唯一 ⇒ **不是重复登记**）；按 **(位置, 原因)** 去重后 **33 条**；
-涉及 **21 个位置**。分类（行级）：`prefix` 60、`limit` 2、`B 臂无该预测位置的行` 1。
-⇒ 报数时两套口径都要给：**行级 63 / 去重 33 / 位置 21**。`sb_align.py` 的 `compare_arms`
-现已自动产出 `n_incomparable_rows`、`n_incomparable_distinct_pos_reason`、`n_incomparable_distinct_pos`。
+**上一轮报的「行级 63」是错的**：旧 `compare_arms` 把「S×B **组合**配对失败」也登记成条目 ⇒
+同一行被重复登记（63 = **30 条组合级重复** + **33 条逐行清点**）。
+
+**真实排除行数 = 33**（按 `(which, source:detail, pred_pos)` 逐行唯一）：**S 臂 1 行 + B 臂 32 行**，
+涉及 **21 个位置**；原因分布：`token 前缀与共同前缀不符` **30** · `预测位置超出上限` **2** ·
+`S/B 臂无该预测位置的行` **1**。
+
+**已修**：`compare_arms` 现在只从**逐行清点**产生排除清单，并 `require` 逐行唯一；
+`pairs` 可比配对数不变（**25**，重复登记从未进入误差统计，结论不受影响）。
+`sb_align_selftest_cpu` 新增「排除清单逐行唯一」「排除行数+已配对数 ≤ 总行数」检查。
 
 ### 9.36.10 下一步（唯一优先）
 
@@ -3065,4 +3070,137 @@ Spec `eager_by_phase={'prefill':208,'propose':1944,'verify':588,'repair':468}`
 （含其 fp8 路径下的 eager 一致性），并**另行安排独立验收**；同时把 §9.34.6 的
 **prefill 统一 + 入口自检**作为配套工程项（防止任何入口静默退回一次性 eager 前向）。
 **不**自动扩展矩阵、**不**改生产默认、**不**放宽正确性标准。
+
+---
+
+## 9.37 后端检查器修复 + F13 8K eager 扩展验证（2026-10-01）
+
+依据 `docs/proposal_freeze_2026-10-01.md`（**FROZEN**：6 主条件 + 2 个 8K FP8 补充；
+旧 12 条件属历史范围，**未**沿用）。本轮**不**测 FP8、**不**计正式性能、**不**改默认 backend。
+
+### 9.37.1 后端检查器修复（**不改生产计算**，只改诊断判定）
+
+**问题**：`dispatch_ok` 无论后端都要求 `eager_by_phase['prefill'] > 0`
+⇒ **正常的全融合 cuDNN prefill 会被误判为失败**（真发生过）。
+
+**修法**：抽出纯函数 `dispatch_judge.judge_dispatch(arm, mode, stats)`，并且**不另造规则**——
+「prefill 是否**应当**融合」由引擎自己的 `model_self.decide_attention_path('prefill', s_max)` 裁决：
+
+| 情形 | 判定 |
+| --- | --- |
+| `by_phase['prefill'] == 0` | **失败**（prefill 从未执行） |
+| 任何 `phase != 'prefill'` 的融合调用 | **失败**（契约：仅 prefill 允许融合） |
+| `arm=eager` | 要求 `eager_by_phase['prefill'] > 0` 且**融合严格为 0**（比旧检查更严） |
+| `arm=cudnn_prefill` 且策略判定 prefill **应融合** | 要求 `fused_by_phase['prefill'] > 0`，否则 = **后端未实际启用** ⇒ 失败 |
+| `arm=cudnn_prefill` 但策略判定 **eager**（已定义回退，如 `s < PREFILL_FUSED_MIN_S`） | **不判失败**，记录 `expected_prefill_path` 与 `fallback_reason` |
+| 模式要求 | AR 必须有 eager `decode`；Spec 必须有 eager `verify` 与 `propose`（防「没跑就报通过」） |
+| 策略名与实际生效不符 / 未知 arm / 未知 mode | **失败** |
+
+**CPU 自测 `dispatch_judge_selftest_cpu`：PASS 22 / FAIL 0**。
+关键：自测**不手工填布尔值**，而是用**生产记录路径**生成统计 ——
+`set_attention_strategy` → `decide_attention_path(phase, s)`（生产裁决函数）→
+`_record_attention_call(...)`（生产记录函数）→ `attention_stats()` → `judge_dispatch`。
+覆盖：合法 eager、合法 cuDNN（含**全融合**）、**旧口径误判正常运行的对照**、prefill 未执行、
+非 prefill 阶段融合（verify/decode 两例）、后端未实际启用、已定义回退（`s=1`）、
+策略名不符/未知 arm/未知 mode、AR 缺 decode、Spec 缺 verify/propose、判定不改变引擎状态。
+
+### 9.37.2 排除行统计：**真的去重了**（上一轮报的 63 是错的）
+
+上一轮报的「行级 63 / 去重 33 / 位置 21」中 **63 是错的**：旧 `compare_arms` 把
+「S×B **组合**配对失败」也登记成条目 ⇒ 同一行被重复登记（63 = **30 条组合级重复** + 33 条逐行清点）。
+
+- **真实排除行数 = 33**（按 `which + source:detail + pred_pos` 逐行唯一）：**S 臂 1 + B 臂 32**，涉及 **21 个位置**；
+- 原因分布：`token 前缀与共同前缀不符` **30** · `预测位置超出上限` **2** · `S/B 臂无该预测位置的行` **1**；
+- **已修**：`compare_arms` 只从**逐行清点**产生排除清单，并 `require` 唯一性；
+  `pairs` 可比配对数不变（**25**）——重复登记只影响计数，**从未进入**误差统计，**结论不受影响**；
+- 自测新增「排除清单逐行唯一」「排除行数 + 已配对数 ≤ 总行数」两条检查（`sb_align` **38/0**）。
+
+### 9.37.3 F13 / 8K / base_bf16 四次运行（独立进程、串行）
+
+| # | 记录 | 模式 | stage | gen_len | stop | 必需检查 | fused | peak_alloc | smi_max |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 | `smoke8k_eager_20261001T065923Z.json` | AR | `run_ended` | 64 | `max_new_reached` | passed(10) | `{}` | 6153 | 7791 |
+| 2 | `smoke8k_eager_20261001T070019Z.json` | Spec | `run_ended` | 64 | `max_new_reached` | passed(14) | `{}` | 7795 | 7774 |
+| 3 | `smoke8k_eager_20261001T070134Z.json` | AR | `run_ended` | 64 | `max_new_reached` | passed(10) | `{}` | 6153 | 7786 |
+| 4 | `smoke8k_eager_20260701T070207Z.json`（实际 `20261001T070207Z`） | Spec | `run_ended` | 64 | `max_new_reached` | passed(14) | `{}` | 7795 | 7804 |
+
+- 输入：F13，`token_sha1 == ids_hash == 9a278731d744a859` ✓；
+- 阶段计数：AR `{'prefill':112,'decode':1764}`；Spec `{'prefill':208,'propose':2328,'verify':700,'repair':936}`
+  ⇒ target/draft **都分块（chunk=2048）都 eager**；`fused_by_phase={}`（零融合）✓；
+- **初始状态**：target 8192 / 28 层、draft 8192 / **24 层**，全层 bf16·finite·长度硬检查通过；
+  **AR vs Spec 的 target 逐层摘要 56/56 一致**；next logits 摘要完全相同
+  （sha `c35f0a1a5adb3c27`、argmax **220**、max 20.625、margin **2.25**）；
+  同模式两次重复的 target 与 draft 摘要均一致 ✓。
+
+### 9.37.4 判定：**F06 的一致未推广到 F13**
+
+| 判定 | 结果 |
+| --- | --- |
+| **AR rep1 vs rep2** | **逐位相同**（64 token）✓ |
+| **Spec rep1 vs rep2** | **逐位相同**（25 轮结构也一致）✓ |
+| **AR vs Spec** | **不一致**：共同前缀 **50** token，**首次分歧在 index 50**（预测位置 **8242**）：**AR=17，Spec=20**；长度（64/64）与停止原因（`max_new_reached`）**一致** → `length_mismatch_only = false` |
+| 必需检查 | 四次全部 `passed`、`未覆盖=[]` ✓ |
+
+**分支覆盖（Spec rep1/rep2 相同）**：25 轮 = **全接受 7 · 零接受 7 · 部分接受 11**，
+`propose 2328 / verify 700 / repair 936` ⇒ **接受、拒绝、replacement、回滚都被真实执行** ✓
+（F06 那轮是 21 轮 / 1944·588·468）。
+
+**首次分歧的决策上下文（来自记录，未新跑）**：分歧落在 **round 19**（`pre=8240, Kp=4, m=2`）：
+`cands=[220,16,16,1154]`、`g=[220,16,20,11]`、`emitted=[220,16,20]`
+⇒ draft 候选在 index 50 是 **16**，Spec 的 `rows[1]` 给出 **20**（替换），而 AR 串行该位置给出 **17**。
+即：**与前几轮同类**——同一预测位置上「块行 vs 串行步」给出不同 token。
+
+**⚠️ 缺项（不为补数据重跑）**：本轮**未保存决策行的 logits / top 候选 / margin**
+（smoke 工具只记录 `cands/g/emitted` 与检查计数）⇒ **不报 margin**，并明确记为缺失。
+首次分歧之后的轨迹**只报告「轨迹不同」**，**不**当作同输入数值比较。
+
+### 9.37.5 与 cuDNN 历史记录的对照（同 family 同 KV）
+
+| family | KV | backend | 首次分歧 index | AR token | Spec token | 来源 |
+| --- | --- | --- | --- | --- | --- | --- |
+| F06 | base_bf16 | cuDNN | **25** | 715 | 576 | fam16 记录 |
+| F06 | base_bf16 | **eager** | **无（64/64 一致）** | — | — | §9.36 |
+| F13 | base_bf16 | cuDNN | **47** | 13282 | 25806 | fam16 记录 |
+| F13 | base_bf16 | **eager** | **50** | **17** | **20** | 本节 |
+| F13 | v_fp8 | cuDNN | 23 | 28693 | 25179 | fam16 记录 |
+
+⇒ **eager 让 F06 一致，但 F13 仍然分歧（位置由 47 变为 50）**。
+因此：**F06 通过不能推广**；**不**能说 eager 修复了问题；也**不**能说 cuDNN 是分歧的必要条件
+（两种 backend 下 F13 都分歧，只是位置不同）。本轮**不做**逐层追查。
+
+### 9.37.6 资源（仅运行观察，**无 speedup/正式性能声明**）
+
+四次运行 commit 护栏全 `ok=True`；AR peak_alloc 6153 MiB、Spec 7795 MiB；
+设备侧峰值 smi_used 7774–7804 MiB（设备 8188 MiB）⇒ **余量很薄**（与 §9.36.6 同）。
+**含插桩诊断**，耗时与显存**不得**直接当正式性能结果。
+
+### 9.37.7 下一轮清单（**预登记，本轮不执行**）
+
+1. **先处理 F13 的分歧**（优先级最高的下一步，见 §9.37.5）：先用**已保存的**产物把
+   「首次分歧 index 50 处的决策行」补齐记录（加一个**默认关闭**的开关记录决策行 top-2 margin，
+   不改任何计算），再判定它属于哪一类；**不**从 L27 开始逐层追查、**不**临时改 tie-breaking。
+2. **最小 BF16 扩展回归**（**仅在**主线候选一致性明确之后）：2K/4K 的**真实 AR/Spec 配对**
+   （现有证据只覆盖 8K；短上下文只跑过 B3/B4 类生存性门与 B6 短上下文正式门，**不是**同协议的
+   eager AR/Spec 配对）；复用同一四运行协议（AR/Spec × rep1/2 + 摘要比对）。
+3. **分支边界用例**：EOS 触发、全接受轮、拒绝/回滚轮、剩余生成预算边界（`k_eff < k`）各至少一例 —— 用**短上下文**跑，避免 8K 显存余量薄带来的额外风险。
+4. **无重型插桩的 8K 稳定性验证方案**：关掉 `SMOKE_PREFILL_DIGEST` 与 `SMOKE_STRUCT_CHECK`，
+   只留生产检查，跑 AR/Spec 各 2 次并比对完整 token、长度、停止原因、`fused=0` 与内存读数；
+   插桩版作为**独立**的一次对照，**不**与无插桩版混在同一张性能表里。
+5. **入口自检**（§9.34.6）：prefill 统一 + `cudnn_prefill` 下 prefill 出现 eager 或
+   `s_max['prefill'] > CHUNK` 即报错停止。
+6. **FP8（V-only）**：**仅安排在主线 BF16 候选验证之后**，按 proposal 的 8K 前置与重复协议，另行验收。
+7. **区分输入角色**：F06/F13 **已参与历史调试**，**不**得标为独立验收输入；后续独立验收需另选取自
+   manifest、未参与调试的 family（须另行登记，**不**在本轮扩大）。
+
+### 9.37.8 本轮工具改动与治理
+
+| 文件 | 改动 | 自测 |
+| --- | --- | --- |
+| `dispatch_judge.py`（新增） | 按后端的阶段分流判定纯函数，期望路径来自生产 `decide_attention_path` | `dispatch_judge_selftest_cpu` **22/0** |
+| `g5_8k_smoke_cudnn.py` | 改用 `judge_dispatch`；`dispatch_detail` 记录 `expected_prefill_path`/`fallback`/`failures` | 编译 + 上述自测 |
+| `sb_align.py` | 排除清单改为**逐行唯一** + `require` 唯一性；`incomparable` → `excluded_rows`（含 reason 分桶） | `sb_align_selftest_cpu` **38/0** |
+| `verify_family_independence_cpu.py` | smoke 工具的非 fam16 运行**只允许已登记定点诊断 family（F06 / F13）** | 该套件 **18/0** |
+
+**旧结果一律保留**：`smoke8k_cudnn_prefill_*`（cuDNN 16 格）、`smoke8k_eager_*`（F06 与 F13）、
+`prefillsb_*`（含失败记录）**全部未覆盖**；历史 PASS/FAIL **未**因修工具而改写。
 
