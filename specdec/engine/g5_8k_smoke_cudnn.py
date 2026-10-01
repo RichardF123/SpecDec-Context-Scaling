@@ -69,6 +69,11 @@ PREFILL_DIGEST = S.env_flag("SMOKE_PREFILL_DIGEST", False)
 #   default = 不设置（记录导入时的值）| 1 = 显式 True | 0 = 显式 False
 # 必须在**任何模型计算与 prefill 之前**生效 ⇒ 在模块导入时立即应用。
 RED_RED = os.environ.get("SMOKE_BF16_RED_REDUCTION", "default").strip().lower()
+# 诊断（**默认关闭**）：是否把 **target** 的 RoPE 频率来源换成 CPU-FP32（HF 公式）。
+#   default = 不动（target 与 draft 都用原实现：在 device 上算 inv_freq）
+#   cpu_fp32 = **实例级**只作用于 target（draft 保持原实现），见 `target_rope_scope.py`
+# 只改"频率来源"，不改权重/精度/backend/mask/投影/旋转实现；作用域与恢复到产物里留证。
+TARGET_ROPE = os.environ.get("SMOKE_TARGET_ROPE", "default").strip().lower()
 
 
 def _apply_red_red() -> dict:
@@ -93,6 +98,14 @@ RED_RED_INFO = _apply_red_red()
 def _cache_len(cache) -> int:
     """KV cache 的当前长度（用引擎自己的 spec_cache.cache_length，不另造口径）。"""
     return int(spec_cache.cache_length(cache))
+
+
+def _versions() -> dict:
+    """软件版本（记录用；不参与任何判定）。"""
+    import transformers
+    return dict(torch=torch.__version__, transformers=transformers.__version__,
+                cuda=torch.version.cuda, python=__import__("sys").version.split()[0],
+                gpu=(torch.cuda.get_device_name(0) if torch.cuda.is_available() else None))
 
 
 def mem(tag: str, rec: dict) -> None:
@@ -186,8 +199,11 @@ def main() -> int:
     rec: dict = dict(run_id=run_id, tool="g5_8k_smoke_cudnn",
                      timestamp_utc=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                      git=S.git_meta(ROOT),
+                     artifact=str(_out_path(run_id)),
+                     versions=_versions(),
                      config=dict(mode=MODE, ctx=CTX, chunk=CHUNK, k=K, max_new=MAXNEW, kv=KV, arm=ARM,
                                  target_model=TARGET, draft_model=DRAFT,
+                                 target_rope=TARGET_ROPE,
                                  load_path="lowmem_load.load_ours_bf16 (双模型, 权重逐位校验)"),
                      scope="**单次 smoke**：只回答能不能跑 + 峰值多少。不是吞吐测量，不是稳定性验证。"
                      if False else "**单次 smoke**：只回答能不能跑 + 峰值多少。不是吞吐测量，不是稳定性验证。",
@@ -225,6 +241,7 @@ def main() -> int:
 
     from .lowmem_load import load_ours_bf16
     reg: CheckRegistry | None = None      # 先声明：FinitenessError 处理器需要它（避免 NameError 掩盖原始错误）
+    TRS = None                            # 诊断：target RoPE 频率来源作用域（默认不安装）
     try:
         # **关闭所有诊断精度开关**：本 smoke 只回答"能否完成完整双模型流程"，
         # 不许把诊断用的精度干预混进来（它们只在 §9 的定位实验里启用）。
@@ -272,6 +289,22 @@ def main() -> int:
                                 draft=("fp16" if drf is not None else "not_loaded"))
         M.set_attention_strategy(ARM)
         M.reset_attention_stats()
+
+        # ---- 诊断（**默认关闭**）：只把 **target** 的 RoPE 频率来源换成 CPU-FP32 ----
+        # 实例级作用域：同一进程里的 draft 走原实现（不按 head_dim/调用顺序猜身份）。
+        # 必须在 DecisionHooks.install() **之前**安装（后者会把当时的 `QwenLM._run` 记成
+        # `_orig["run"]`，于是 hook 内部的调用仍会经过本包装器）。
+        if TARGET_ROPE == "cpu_fp32":
+            from . import target_rope_scope as _TRS
+            TRS = _TRS
+            rec["target_rope_scope"] = TRS.install(tgt, theta=float(tgt.rope_theta),
+                                                   head_dim=int(tgt.head_dim))
+            print("[smoke] target RoPE 作用域已安装（实例级）："
+                  + json.dumps(rec["target_rope_scope"], ensure_ascii=False), flush=True)
+        else:
+            rec["target_rope_scope"] = dict(
+                installed=False, requested=TARGET_ROPE,
+                note="未启用 ⇒ target 与 draft 都用原实现（在 device 上算 inv_freq）")
 
         # ---- G1：输入来源。**默认 legacy 路径不变**；只有显式 `SMOKE_FAMILY` 才走 manifest ----
         plan = FI.resolve_input_plan()
@@ -439,13 +472,31 @@ def main() -> int:
                 t1 = time.perf_counter()
                 out = spec_dec.spec_decode_greedy(tgt, drf, ids, MAXNEW, k=K, eos_id=eos_id,
                                                   target_kv=KV, draft_kv="base_bf16",
-                                                  log=lambda d: rounds.append(dict(d)))
+                                                  # 逐轮字段 + **从 m 与 Kp 直接派生的**回滚/修复标记
+                                                  # （口径与 `spec_dec` 的分支一一对应：m<Kp ⇒ 走
+                                                  #  trim_cache + `_step(target, g[m])` 这条回滚+修复分支）
+                                                  log=lambda d: rounds.append(dict(
+                                                      d,
+                                                      rollback=bool(d["m"] < d["Kp"]),
+                                                      repair=bool(d["m"] < d["Kp"]),
+                                                      correction=(int(d["g"][d["m"]])
+                                                                  if d["m"] < d["Kp"] else None),
+                                                      all_accept=bool(d["m"] == d["Kp"]),
+                                                      tgt_len_after=d["tgt_len"],
+                                                      drf_len_after=d["drf_len"])))
                 torch.cuda.synchronize()
                 wall = time.perf_counter() - t1
         finally:
             if STRUCT_CHECK and MODE != "ar":
                 spec_dec._verify = _orig_verify_for_struct
             hooks.remove()
+            if TRS is not None:
+                # 先快照调用记录（作用域状态），再恢复；`assert_restored` 用 `is` 核查两个模块属性
+                rec["target_rope_scope"] = dict(rec.get("target_rope_scope") or {},
+                                                **TRS.state())
+                rec["target_rope_scope_restore"] = TRS.assert_restored()
+                print("[smoke] target RoPE 作用域已恢复：" 
+                      + json.dumps(rec["target_rope_scope_restore"], ensure_ascii=False), flush=True)
 
         mem("after_decode", rec)
         rec["stage_decode_done"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
@@ -522,6 +573,22 @@ def main() -> int:
                           eager_reason_kinds=a_stats.get("eager_reason_kinds"),
                           note="计时含插桩，仅诊断；禁止进入任何 speedup 表。"
                                "父子阶段耗时**不可相加**（prefill 是 wall 的子集）。")
+        # ---- 结束状态（**派生字段**，来源写清，不另造口径）----
+        _last_round = rounds[-1] if rounds else None
+        rec["end_state"] = dict(
+            mode=MODE, stop_reason=stop_reason, gen_len=gen_len, max_new=MAXNEW, eos_id=eos_id,
+            prompt_len=prompt_len,
+            target_cache_len=(prompt_len + int(out["stats"].get("decode_steps", 0))
+                              if MODE == "ar" else
+                              (int(_last_round["tgt_len"]) if _last_round else prompt_len)),
+            draft_cache_len=(None if MODE == "ar" else
+                             (int(_last_round["drf_len"]) if _last_round else prompt_len)),
+            n_rounds=(len(rounds) if MODE != "ar" else None),
+            n_decode_steps=int(out["stats"].get("decode_steps", 0)),
+            derivation=("AR：cache_len = prompt_len + decode_steps（`ar_inv` 逐步行核对）；"
+                        "Spec：取最后一轮的 tgt_len/drf_len（`rec['rounds']`）"),
+            eos_seen=bool(gen and eos_id is not None and gen[-1] == eos_id),
+            gen_hash=P5V._gen_hash(gen))
         # ---- 通过判定：**执行结束 ≠ 验证通过** ----
         # ---- 决策步覆盖核对（任务要求：阶段出现过一次检查 ≠ 完整覆盖）----
         if MODE == "ar":
@@ -649,6 +716,10 @@ def main() -> int:
     finally:
         M.set_attention_strategy("eager")
         M.reset_attention_stats()
+        # 兜底：若因异常在 hooks/作用域安装之后、内层 finally 之前退出，这里仍然还原并留证
+        if TRS is not None and TRS.is_installed():
+            rec["target_rope_scope_restore_fallback"] = TRS.assert_restored()
+            _write(rec, run_id)
 
     _write(rec, run_id)
     print(f"[smoke] -> {_out_path(run_id)}")
