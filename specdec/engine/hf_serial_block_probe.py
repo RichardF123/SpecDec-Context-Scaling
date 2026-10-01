@@ -29,6 +29,8 @@ from pathlib import Path
 
 import torch
 
+from .cache_clone import clone_cache_full
+
 ROOT = Path(__file__).resolve().parents[2]
 OUTDIR = ROOT / "output" / "g5" / "attn"
 TAG = "hfsb_20261001"
@@ -81,22 +83,14 @@ def _cache_len(c) -> int:
 
 
 def clone_cache(c):
-    """**深拷贝到独立存储**（HF v5 `DynamicCache.layers[i].keys/values`；无 legacy 接口）。"""
-    new = type(c)()
-    for lay in c.layers:
-        d = lay.__class__()
-        for a in ("keys", "values"):
-            t = getattr(lay, a, None)
-            if t is not None:
-                setattr(d, a, t.detach().clone())
-        for a in ("is_initialized", "is_sliding", "layer_idx"):
-            if hasattr(lay, a):
-                try:
-                    setattr(d, a, getattr(lay, a))
-                except Exception:                                  # noqa: BLE001
-                    pass
-        new.layers.append(d)
-    return new
+    """克隆 HF `DynamicCache`。
+
+    **本函数的历史行为是正确的**（在 `type(c)()` 后额外拷贝了 `is_initialized`/`is_sliding`/`layer_idx`，
+    实测克隆 6-token 历史后 `get_seq_length()==6`、追加 1 个 token 后为 7、前 6 位 K 保留），
+    因此本工具此前与今后的产物**不受** xb_probe 那个"只填 keys/values"的 bug 影响。
+    现在统一走 `cache_clone.clone_cache_full`（deepcopy，保留完整对象状态），避免两个克隆实现并存。
+    """
+    return clone_cache_full(c)
 
 
 def _kv_digest(c) -> dict:
