@@ -41,6 +41,7 @@ def load():
             str(src / "rope.cu"),
             str(src / "swiglu.cu"),
             str(src / "attention.cu"),
+            str(src / "paged_attention.cu"),
         ],
         extra_include_paths=[str(src)],
         extra_cflags=["-O3"],
