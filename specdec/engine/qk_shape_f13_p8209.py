@@ -333,17 +333,25 @@ def _run(rec: dict, run_id: str) -> int:
         # ---------------- 六格 + 比较 + 复现门 ----------------
         cells = _build_cells(q1, q4_real, k8209, k8212)
         cmp_block = _cmp_block(cells, real_S, real_B)
-        gate = dict(A_vs_real_S=cmp_block["A_vs_real_S"]["raw"],
-                    D_vs_real_B=cmp_block["D_vs_real_B"]["raw"])
+        # ⚠️ **复现门口径**：生产代码是**一行**表达式 `scores = matmul(...) / (head_dim ** 0.5)`
+        #    ⇒ 探针保存的 `qk_scores_pre_mask` **已经是 scaled**（除法后）。
+        #    因此复现门必须拿本轮的 **scaled** 去比；拿 raw 去比等于与"除以 √d 之前的量"比，
+        #    必然整体差一个 √d 因子（首跑/次跑的 raw 比较差值 ≈11.31 倍即此）。
+        gate = dict(A_vs_real_S=cmp_block["A_vs_real_S"]["scaled"],
+                    D_vs_real_B=cmp_block["D_vs_real_B"]["scaled"])
         gate_ok = QK.expect_fail_gate(gate)
         rec["reproduction_gate"] = dict(ok=bool(gate_ok),
+                                        gate_object="scaled（= 生产 `qk_scores_pre_mask` 的原样口径）",
                                         A_vs_real_S_raw=cmp_block["A_vs_real_S"]["raw"],
                                         A_vs_real_S_scaled=cmp_block["A_vs_real_S"]["scaled"],
                                         D_vs_real_B_raw=cmp_block["D_vs_real_B"]["raw"],
                                         D_vs_real_B_scaled=cmp_block["D_vs_real_B"]["scaled"],
                                         D_vs_real_B_raw_row0=cmp_block["D_vs_real_B"]["raw_row0_prefix"],
-                                        note="A 必须逐位复现真实 S 的 qk_scores_pre_mask；D 必须逐位复现真实 B 的"
-                                             "（**整张量**）⇒ 不过门即停止解释，不换 layout/公式/dtype/参数重试")
+                                        raw_comparison_note="`*_raw` 里与本轮 raw 相比的参考是**已 scaled** 的保存张量"
+                                                            "（生产把除法写在同一条语句里，raw 从未单独物化）⇒ raw 比较必然差一个 "
+                                                            "√head_dim 因子，**只作记录、不作门**",
+                                        note="A 必须逐位复现真实 S 的 `qk_scores_pre_mask`；D 必须逐位复现真实 B 的"
+                                             "（**scaled、整张量**）⇒ 不过门即停止解释，不换 layout/公式/dtype/参数重试")
         # 与上一轮（L0 算子诊断）的 live 张量逐位核对（同一份固定数据）
         if Path(L0OPS_PT).exists():
             prev = torch.load(L0OPS_PT, map_location="cpu")
@@ -538,6 +546,10 @@ def _selftest(rec: dict, run_id: str) -> int:
     real_B, _ = QK.scores_pair(q4, QK.k_rep_prod(k8212))
     cells = _build_cells(q1, q4, k8209, k8212, require_cuda=False)  # 自测在 CPU 上只验证机制
     cmp_block = _cmp_block(cells, real_S, real_B)
+    # 注意口径差异是**有意的**：这里 `scores_pair` 取的是第一个返回值，即 raw，
+    # 所以自测的 `real_S`/`real_B` 本身就是 raw，门的对象自然是 raw。
+    # 而 `_run`（真实路径）的对照是探针保存的 `qk_scores_pre_mask`，那是**已 scaled** 的值，
+    # 因此 `_run` 里门取 `["scaled"]`。两处各自自洽，分属两条不同口径的对照。
     gate = dict(A_vs_real_S=cmp_block["A_vs_real_S"]["raw"],
                 D_vs_real_B=cmp_block["D_vs_real_B"]["raw"])
     check("★ 复现门在合成数据上通过（A == real_S、D == real_B 逐位）", QK.expect_fail_gate(gate))
