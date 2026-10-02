@@ -148,3 +148,100 @@ def paged_attention_decode(
         page_size,
         length,
     )
+
+
+
+def paged_attention_block(
+    q,
+    layer,
+    *,
+    backend: str = "cuda",
+    validate: bool = True,
+):
+    '''Direct paged-KV CUDA attention for q_len=1..4.\n\n    FINAL_PAGED_V2_Q1_Q4_VFP8\n\n    Supported:\n    - fp16/base: K/V match q dtype (BF16 or FP32)\n    - v_fp8: K BF16, V float8_e4m3fn, V scale float32; q BF16\n    '''
+    import torch
+    from specdec.engine import paged_cache
+
+    if backend != "cuda":
+        raise ValueError("paged_attention_block supports backend='cuda' only")
+    if not paged_cache.is_paged_layer(layer):
+        raise TypeError("paged_attention_block requires a paged_v0 layer")
+    if validate:
+        paged_cache.check_consistent(layer)
+
+    if not torch.is_tensor(q):
+        raise TypeError("q must be a tensor")
+    if not q.is_cuda:
+        raise ValueError("q must be on CUDA")
+    if q.ndim != 4 or not (1 <= int(q.shape[2]) <= 4):
+        raise ValueError(
+            f"q shape must be [B,H,S,D] with 1<=S<=4, got {tuple(q.shape)}")
+
+    length = paged_cache.logical_length(layer)
+    page_size = int(layer["page_size"])
+    if length <= 0:
+        raise ValueError("paged cache must be non-empty")
+    if length < int(q.shape[2]):
+        raise ValueError("paged cache length must be >= q_len")
+
+    k_pages = layer["k_pages"]
+    v_pages = layer["v_pages"]
+    if not k_pages:
+        raise ValueError("paged cache has no pages")
+
+    first_k = k_pages[0]
+    first_v = v_pages[0]
+    if first_k.device != q.device or first_v.device != q.device:
+        raise ValueError("q and paged K/V must be on the same CUDA device")
+    if int(first_k.shape[0]) != int(q.shape[0]):
+        raise ValueError("q and paged K/V batch sizes differ")
+    if int(first_k.shape[-1]) != int(q.shape[-1]):
+        raise ValueError("q and paged K head dimensions differ")
+
+    kv_heads = int(first_k.shape[1])
+    if int(q.shape[1]) % kv_heads != 0:
+        raise ValueError("query heads must be divisible by KV heads")
+
+    from .build import load
+
+    if layer["fmt"] == "fp16":
+        if first_k.dtype != q.dtype or first_v.dtype != q.dtype:
+            raise ValueError(
+                f"q/K/V dtype mismatch: {q.dtype}, {first_k.dtype}, {first_v.dtype}")
+        k_ptrs, v_ptrs = paged_cache.cuda_pointer_tables(
+            layer, validate=False)
+        return load().paged_attention_block(
+            q.contiguous(),
+            k_ptrs,
+            v_ptrs,
+            kv_heads,
+            page_size,
+            length,
+        )
+
+    if layer["fmt"] == "v_fp8":
+        if q.dtype != torch.bfloat16 or first_k.dtype != torch.bfloat16:
+            raise ValueError("V-FP8 direct paged attention requires BF16 q/K")
+        if first_v.dtype != torch.float8_e4m3fn:
+            raise ValueError("V-FP8 direct paged attention requires E4M3FN V")
+        first_scale = layer["v_scale_pages"][0]
+        if first_scale.dtype != torch.float32:
+            raise ValueError("V-FP8 direct paged attention requires FP32 scale")
+        scale_groups = int(first_scale.shape[-1])
+        if scale_groups <= 0 or int(q.shape[-1]) % scale_groups != 0:
+            raise ValueError("invalid V-FP8 scale geometry")
+
+        k_ptrs, v_ptrs, s_ptrs = paged_cache.cuda_pointer_tables_vfp8(
+            layer, validate=False)
+        return load().paged_attention_vfp8_block(
+            q.contiguous(),
+            k_ptrs,
+            v_ptrs,
+            s_ptrs,
+            kv_heads,
+            page_size,
+            length,
+            scale_groups,
+        )
+
+    raise ValueError(f"unsupported paged cache format {layer['fmt']!r}")
