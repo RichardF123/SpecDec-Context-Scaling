@@ -439,12 +439,41 @@ def _run(rec: dict, run_id: str) -> int:
         rec["node_compare"] = node_cmp
         cls = OP.classify(OP.CHAIN, node_cmp, OP.CHAIN_NODE_OUT)
         rec["first_divergence"] = cls
+        # ★ 先把**计算完的比较结果与原始张量落盘**，再做打印/收尾：
+        #   这样即使后续打印或收尾出现缺陷，昂贵的数据也不会丢（两次白付加载的教训）。
+        raw_s, _ = _probe_payload(S["probes"])
+        raw_b, _ = _probe_payload(B["probes"])
+        slices = {}
+        for name, (who, kind) in OP.SPECS.items():
+            if kind == "shape_only":
+                continue
+            a, b, _r = OP.slice_pair(kind, S["probes"]["records"][name]["tensor"],
+                                     B["probes"]["records"][name]["tensor"], vis=VIS)
+            slices[f"{name}_S"] = a.detach().cpu()
+            slices[f"{name}_B"] = b.detach().cpu()
+        payload = dict(
+            raw_S={k: v.detach().cpu() for k, v in raw_s.items()},
+            raw_B={k: v.detach().cpu() for k, v in raw_b.items()},
+            slices=slices,
+            cache_pre_S=dict(k=S["cache_pre"]["k"].detach().cpu(), v=S["cache_pre"]["v"].detach().cpu()),
+            cache_pre_B=dict(k=B["cache_pre"]["k"].detach().cpu(), v=B["cache_pre"]["v"].detach().cpu()),
+            x0_row_S=x0_s.detach().cpu(), x0_row_B=x0_b.detach().cpu(),
+            L0_output_row_S=z_s.detach().cpu(), L0_output_row_B=z_b.detach().cpu(),
+            final_row_S=row_s.detach().cpu(), final_row_B=row_b.detach().cpu(),
+            cos_row_S=S["cos"][0, 0, -1].detach().cpu(), cos_row_B=B["cos"][0, 0, 0].detach().cpu(),
+            sin_row_S=S["sin"][0, 0, -1].detach().cpu(), sin_row_B=B["sin"][0, 0, 0].detach().cpu(),
+            meta=dict(vis=VIS, layer=LAYER, shapes={k: v["layout"]["shape"] for k, v in raw_s.items()}),
+            note="`raw_*` = 探针捕获的完整张量（原始 dtype）；`slices` = 实际比较的语义切片；"
+                 "fp32 的 softmax 概率保持 fp32，未强制转 bf16")
+        tp = _save_pt(payload, run_id)
+        rec["artifacts"] = dict(json=str(_write(rec, run_id)), pt=str(tp))
         print("== L0 内部逐算子比较（S/B 对应决策切片）==")
         for (op, ins), out_node in zip(OP.CHAIN, OP.CHAIN_NODE_OUT):
             c = node_cmp[out_node]
             in_eq = [node_cmp[i]["exact_equal"] for i in ins if i in node_cmp]
-            print(f"  {op:<24s} in_eq={all(in_eq)} out_eq={c['exact_equal']:<5s} "
-                  f"n_diff={c['n_diff']:>6d} max|Δ|={c['max_abs']:<10.6g} "
+            # ⚠️ 打印绝不参与结论、也绝不允许因格式问题中断（`exact_equal` 是 bool，不能用 `:<5s`）
+            print(f"  {op:<24s} in_eq={str(all(in_eq)):<5s} out_eq={str(bool(c['exact_equal'])):<5s} "
+                  f"n_diff={int(c['n_diff']):>6d} max|Δ|={float(c['max_abs']):<10.6g} "
                   f"shape {c['shape_s']}→{c['sliced_shape']}", flush=True)
         print(f"[l0op] 首次分歧算子 = {cls['first_divergence_operator']}"
               f"（满足条件的算子全部列出：{cls['all_operators_with_equal_inputs_and_different_output']}）",
@@ -510,31 +539,6 @@ def _run(rec: dict, run_id: str) -> int:
                                       eager_by_phase=att["eager_by_phase"],
                                       s_max_by_phase=att.get("s_max_by_phase"))
         rec["stage"] = "complete"
-        raw_s, _ = _probe_payload(S["probes"])
-        raw_b, _ = _probe_payload(B["probes"])
-        slices = {}
-        for name, (who, kind) in OP.SPECS.items():
-            if kind == "shape_only":
-                continue
-            a, b, _r = OP.slice_pair(kind, S["probes"]["records"][name]["tensor"],
-                                     B["probes"]["records"][name]["tensor"], vis=VIS)
-            slices[f"{name}_S"] = a.detach().cpu()
-            slices[f"{name}_B"] = b.detach().cpu()
-        payload = dict(
-            raw_S={k: v.detach().cpu() for k, v in raw_s.items()},
-            raw_B={k: v.detach().cpu() for k, v in raw_b.items()},
-            slices=slices,
-            cache_pre_S=dict(k=S["cache_pre"]["k"].detach().cpu(), v=S["cache_pre"]["v"].detach().cpu()),
-            cache_pre_B=dict(k=B["cache_pre"]["k"].detach().cpu(), v=B["cache_pre"]["v"].detach().cpu()),
-            x0_row_S=x0_s.detach().cpu(), x0_row_B=x0_b.detach().cpu(),
-            L0_output_row_S=z_s.detach().cpu(), L0_output_row_B=z_b.detach().cpu(),
-            final_row_S=row_s.detach().cpu(), final_row_B=row_b.detach().cpu(),
-            cos_row_S=S["cos"][0, 0, -1].detach().cpu(), cos_row_B=B["cos"][0, 0, 0].detach().cpu(),
-            sin_row_S=S["sin"][0, 0, -1].detach().cpu(), sin_row_B=B["sin"][0, 0, 0].detach().cpu(),
-            meta=dict(vis=VIS, layer=LAYER, shapes={k: v["layout"]["shape"] for k, v in raw_s.items()}),
-            note="`raw_*` = 探针捕获的完整张量（原始 dtype）；`slices` = 实际比较的语义切片；"
-                 "fp32 的 softmax 概率保持 fp32，未强制转 bf16")
-        tp = _save_pt(payload, run_id)
         p = _write(rec, run_id)
         rec["artifacts"] = dict(json=str(p), pt=str(tp))
         _write(rec, run_id)
