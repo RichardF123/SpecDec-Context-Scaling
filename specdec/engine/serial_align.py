@@ -282,6 +282,30 @@ def _selftest() -> int:
         bad += 1
     check("★ 2 维输入必须报错（口径要求 3 维）", bad == 1)
 
+    # ---- 多目标 / MLP 三个投影的不同 in-out 维度（单模块行为必须逐位不变）------------
+    MID = 24
+    gate_like = torch.nn.Linear(IN, MID, bias=False).to(torch.bfloat16).eval()
+    up_like = torch.nn.Linear(IN, MID, bias=False).to(torch.bfloat16).eval()
+    down_like = torch.nn.Linear(MID, IN, bias=False).to(torch.bfloat16).eval()
+    out_g, meta_g = serial_linear_rows(gate_like, x)
+    out_u, meta_u = serial_linear_rows(up_like, x)
+    out_d, meta_d = serial_linear_rows(down_like, out_g)
+    check("★ MLP 三个投影的 in/out 维度各异时逐行调用仍成立（gate/up: in=16→out=24；down: 24→16）",
+          tuple(out_g.shape) == (1, S, MID) and tuple(out_u.shape) == (1, S, MID)
+          and tuple(out_d.shape) == (1, S, IN)
+          and all(sh == [1, 1, IN] for sh in meta_g["per_row_input_shapes"])
+          and all(sh == [1, 1, MID] for sh in meta_d["per_row_input_shapes"])
+          and module_facts(gate_like)["out_features"] == MID
+          and module_facts(down_like)["in_features"] == MID,
+          (meta_g["per_row_input_shapes"], meta_d["per_row_input_shapes"]))
+    check("★ 单模块路径的 CPU 回归：`serial_linear_rows` 与逐行参考实现逐位一致（旧行为不变）",
+          all(torch.equal(serial_linear_rows(m, xx)[0],
+                          torch.cat([m(xx[:, i:i + 1, :]) for i in range(S)], dim=1))
+              for m, xx in ((lin, x), (gate_like, x), (down_like, out_g))))
+    check("★ `module_facts` 逐投影可区分（同一 hidden=16 但 out 维度不同的两个模块权重 data_ptr 不同）",
+          module_facts(gate_like)["weight_data_ptr"] != module_facts(up_like)["weight_data_ptr"]
+          and module_facts(gate_like)["weight_shape"] == [MID, IN])
+
     # ---- H2–H5 分类（合成数据）------------------------------------------------
     r = torch.randn(OUT).to(torch.bfloat16)
     h2 = classify_h2_oproj(r.clone(), r.clone(), r.clone(), r.clone(), (r + 0.01).to(torch.bfloat16))

@@ -167,10 +167,11 @@ def serial_linear_state() -> dict:
                     note="默认关闭 ⇒ Linear 走生产原式的一次调用")
     calls = _SERIAL_LINEAR["calls"]
     return dict(active=True, label=_SERIAL_LINEAR["label"], n_mods=len(_SERIAL_LINEAR["mods"]),
-                mods=[dict(module_id=int(k)) for k in _SERIAL_LINEAR["mods"]],
+                mods=[dict(module_id=int(k), label=_label_of(v)) for k, v in _SERIAL_LINEAR["mods"].items()],
                 n_seen=len(_SERIAL_LINEAR["seen"]), seen_module_ids=sorted(set(_SERIAL_LINEAR["seen"])),
                 n_applied=len(calls),
-                applied=[dict(module_id=int(id(c["module"])), s=int(c["meta"]["s"]),
+                applied=[dict(module_id=int(id(c["module"])), module_label=_label_of(c["module"]),
+                              s=int(c["meta"]["s"]),
                               per_row_input_shapes=list(c["meta"]["per_row_input_shapes"]))
                          for c in calls],
                 note="`seen` = 进入该分支但**未注册**的 Linear（只计数，仍走原调用）；"
@@ -238,15 +239,20 @@ class MLP(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         _probe("mlp_input", x, self)                       # 诊断（默认关闭）
-        g = self.gate_proj(x)
+        # 诊断性因果干预 ③（**默认关闭**）：注册的投影改为**逐行 M=1** 调用同一模块再拼回。
+        # 关闭时 `_SERIAL_LINEAR is None` ⇒ 每处只多一次身份判断，下面走的都是**原样的生产调用**。
+        _sg = (_serial_linear_branch(self.gate_proj, x) if _SERIAL_LINEAR is not None else None)
+        g = _sg if _sg is not None else self.gate_proj(x)
         _probe("mlp_gate_proj", g, self)                   # 诊断（默认关闭）
         gate = F.silu(g)
         _probe("mlp_activation", gate, self)               # 诊断（默认关闭）
-        up = self.up_proj(x)
+        _su = (_serial_linear_branch(self.up_proj, x) if _SERIAL_LINEAR is not None else None)
+        up = _su if _su is not None else self.up_proj(x)
         _probe("mlp_up_proj", up, self)                    # 诊断（默认关闭）
         gp = gate * up
         _probe("mlp_gated_product", gp, self)              # 诊断（默认关闭）
-        down = self.down_proj(gp)
+        _sd = (_serial_linear_branch(self.down_proj, gp) if _SERIAL_LINEAR is not None else None)
+        down = _sd if _sd is not None else self.down_proj(gp)
         _probe("mlp_down_proj", down, self)                # 诊断（默认关闭）
         return down
 

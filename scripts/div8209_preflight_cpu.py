@@ -363,6 +363,55 @@ def _serial_align_section() -> None:
           "⇒ 可进入 GPU 运行")
 
 
+def _serial_mlp_section() -> None:
+    """L0 全部持续 GEMM 对齐工具（`serial_mlp_l0_f13_p8209`）的飞行前检查（纯 CPU、只读）。"""
+    from specdec.engine import serial_mlp_l0_f13_p8209 as QT
+    from specdec.engine import serial_align as SA
+    from specdec.engine import model_self as M
+    print("\n================ L0 全部持续 GEMM 对齐（位置 8209）================")
+    plan = [list(p) for p in QT.PLAN]
+    print(f"  配置：LAYER={QT.LAYER} PRE={QT.PRE} VIS={QT.VIS} REPEAT={QT.REPEAT} "
+          f"ROPE={QT.TARGET_ROPE}；六臂={plan}")
+    assert QT.LAYER == 0 and QT.VIS == QT.PRE + 1 and QT.REPEAT >= 2
+    assert [p[0] for p in plan] == ["S0", "B0", "BQO", "BQOGU", "BQOGUD", "S1"], "六臂定义不符"
+    assert [(p[2], p[3], p[4]) for p in plan] == [
+        (False, False, None), (False, False, None), (True, True, None),
+        (True, True, "gu"), (True, True, "gud"), (True, True, "gud")], "开关组合不符"
+    assert M.serial_qk_state()["active"] is False and M.serial_linear_state()["active"] is False
+    for fn in ("set_serial_linear", "serial_linear_for", "serial_linear_state", "serial_linear_calls"):
+        assert hasattr(M, fn), f"model_self 缺少 {fn}"
+    for fn in ("module_facts", "serial_linear_rows", "chain_persistence", "classify_h5_final"):
+        assert hasattr(SA, fn), f"serial_align 缺少 {fn}"
+    # 生产代码里三处 MLP 调用的分支必须都在（关闭时逐位等价由门与真机控制证明）
+    src = (ROOT / "specdec" / "engine" / "model_self.py").read_text(encoding="utf-8")
+    for pat in ("_serial_linear_branch(self.gate_proj, x)",
+                "_serial_linear_branch(self.up_proj, x)",
+                "_serial_linear_branch(self.down_proj, gp)",
+                "_serial_linear_branch(self.o_proj, out)"):
+        assert pat in src, f"model_self 缺少分支：{pat}"
+    # 上一轮（SLA）参考：本轮控制 3 依赖它
+    prev = torch.load(QT.PREV_PT, map_location="cpu")
+    pj = json.loads(Path(QT.PREV_JSON).read_text(encoding="utf-8"))
+    need = ("nodes_BQO", "rows_BQO", "final_row_BQO", "norm_row_BQO", "oproj_facts")
+    assert all(k in prev for k in need), f"上一轮 .pt 缺少 {need}"
+    assert pj["H3"]["n_diff"] == 21 and pj["H5"]["category"] == 2
+    print(f"  上一轮 BQO 参考：L0 输出 n_diff={pj['H3']['n_diff']}、token={pj['H5']['token_x']}、"
+          f"logits n_diff={pj['H5']['logits_n_diff']}、H2 o_proj exact={pj['H2']['o_proj_exact_equal']} ✔")
+    _mp = {d["op"]: d for d in pj["MLP_boundary"]["per_operator"]}
+    print(f"  上一轮遗留（本轮要消掉的）边界：gate_proj n_diff={_mp['gate_proj']['n_diff']}、"
+          f"up_proj={_mp['up_proj']['n_diff']}（均满足「输入逐位相同、输出不同」）")
+    l0ops = torch.load(QT.L0OPS_PT, map_location="cpu")
+    for k in ("final_row_S", "final_row_B", "L0_output_row_S", "L0_output_row_B"):
+        assert k in l0ops, f"历史 L0 算子 run 缺少 {k}"
+    cap = C._load_cap(Path(QT.CAP_H))
+    H, t = C._truncate(cap["snapshot_cpu"], QT.PRE, "H")
+    assert t["is_pure_slice"] and C._cache_len(H) == QT.PRE and len(H) == 28
+    print(f"  H：{Path(QT.CAP_H).name} {t['source_len']} → {t['pre']} 纯切片={t['is_pure_slice']}"
+          f"（{len(H)} 层）✔")
+    print("  [sml-preflight] 六臂定义/开关组合/默认关闭/API/四处生产分支/上一轮参考/历史行/H 全部符合预期 "
+          "⇒ 可进入 GPU 运行")
+
+
 def main() -> int:
     print(f"配置：PRE={C.PRE} TARGET={C.TARGET_POS} DEC_SLOT={C.DEC_SLOT} ROW_INDEX={C.ROW_INDEX} "
           f"CTX={C.CTX} FEED={C.FEED} CANDS={C.CANDS} WATCH={C.WATCH}")
@@ -430,6 +479,7 @@ def main() -> int:
     _qk2x2_section()
     _serial_qk_section()
     _serial_align_section()
+    _serial_mlp_section()
     return 0
 
 

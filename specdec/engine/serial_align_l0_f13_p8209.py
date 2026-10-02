@@ -889,6 +889,26 @@ def _run(rec: dict, run_id: str) -> int:
 
 
 # ------------------------------------------------------------------ CPU 自测（门）
+def _all_linear_call_site_ids(tgt) -> list:
+    """**所有**会被 `_serial_linear_branch` 拦截的 Linear 调用点（按模型结构推导，不用魔法常数）。
+
+    ⚠️ 2026-10-02（第三轮 L0 闭环）在 `MLP.forward` 又加了 gate/up/down **三处**同类分支，
+    因此调用点从"每层 1 个（o_proj）"变成"每层 4 个（o_proj + gate + up + down）"。
+    本函数把这件事写成**从模型结构推导**的形式：今后再加分支只需改这一处，
+    而不是让多个自测里的魔法常数悄悄过期（那时会表现为"假失败"，掩盖真实回归）。
+    """
+    ids = []
+    for lay in tgt.layers:
+        ids += [int(id(lay.self_attn.o_proj)), int(id(lay.mlp.gate_proj)),
+                int(id(lay.mlp.up_proj)), int(id(lay.mlp.down_proj))]
+    return sorted(ids)
+
+
+def _expected_call_sites(tgt) -> int:
+    """一次前向里进入 `_serial_linear_branch` 的**调用次数**（每层 4 个调用点各一次）。"""
+    return 4 * len(tgt.layers)
+
+
 def _selftest(rec: dict, run_id: str) -> int:
     """**不加载大模型**：微型模型上把整条链路走一遍（真实 `SelfAttention.forward`、真实 `nn.Linear`）。"""
     npass = nfail = 0
@@ -944,8 +964,10 @@ def _selftest(rec: dict, run_id: str) -> int:
           and st_qk["applied"][0]["module_id"] == id(sa0)
           and st_lin["applied"][0]["module_id"] == id(sa0.o_proj)
           and M.serial_qk_state()["active"] is False and M.serial_linear_state()["active"] is False)
-    check("★ 只作用于指定模块：进入分支但未注册的 layer-1 o_proj 被计数（其余层仍走原路径）",
-          st_lin["n_seen"] == 1 and st_lin["seen_module_ids"] == [int(id(tgt.layers[1].self_attn.o_proj))],
+    check("★ 只作用于指定模块：进入分支但未注册的调用点被计数（其余调用点仍走原路径）",
+          st_lin["n_seen"] == _expected_call_sites(tgt) - st_lin["n_applied"]
+          and sorted(st_lin["seen_module_ids"] + [a["module_id"] for a in st_lin["applied"]])
+          == sorted(_all_linear_call_site_ids(tgt)),
           st_lin)
     for bad_ctx in (M.serial_qk_for(sa0), M.serial_linear_for(sa0.o_proj)):
         try:
@@ -989,10 +1011,13 @@ def _selftest(rec: dict, run_id: str) -> int:
           and SA.module_facts(sa0.o_proj)["has_bias"] is False
           and all(r["input_layout"]["dtype"] == "torch.bfloat16" for r in sl[0]["rows"])
           and all(r["input_shape"] == [1, 1, 32] for r in sl[0]["rows"]))
-    check("★ 控制 10/11：o_proj 干预只作用于 L0（applied=1、seen=其余层）",
-          p1["BQO"]["sl_state"]["n_applied"] == 1 and p1["BQO"]["sl_state"]["n_seen"] == 1
+    check("★ 控制 10/11：o_proj 干预只作用于 L0（applied=1 且就是 L0 的 o_proj；其余调用点只被计数）",
+          p1["BQO"]["sl_state"]["n_applied"] == 1
           and p1["BQO"]["sl_state"]["applied"][0]["module_id"] == int(id(sa0.o_proj))
-          and p1["BQO"]["sl_state"]["seen_module_ids"] == [int(id(tgt.layers[1].self_attn.o_proj))])
+          and p1["BQO"]["sl_state"]["n_seen"] == _expected_call_sites(tgt) - 1
+          and sorted(p1["BQO"]["sl_state"]["seen_module_ids"]
+                     + [a["module_id"] for a in p1["BQO"]["sl_state"]["applied"]])
+          == sorted(_all_linear_call_site_ids(tgt)))
     # ---- ④ H1–H5 分类（真实微型数据）------------------------------------------
     heads_s0 = p1["S0"]["probes"]["records"]["heads_merged"]["tensor"][0, -1]
     heads_bqo = p1["BQO"]["probes"]["records"]["heads_merged"]["tensor"][0, 0]
