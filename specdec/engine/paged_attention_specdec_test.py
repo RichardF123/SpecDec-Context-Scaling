@@ -143,14 +143,15 @@ def _assert_route_contract(label: str, direct: dict) -> None:
     assert dphase.get("propose", 0) > 0, (
         f"{label}: propose did not use direct paged attention"
     )
-    assert dphase.get("verify", 0) == 0, (
-        f"{label}: verify must never use v1c direct paged attention"
+    # FINAL_PAGED_V2_Q1_Q4_VFP8: verify q_len=1..4 is now direct for BF16 and V-FP8.
+    assert dphase.get("verify", 0) > 0, (
+        f"{label}: verify did not use final direct paged attention"
     )
     assert dphase.get("prefill", 0) == 0, (
-        f"{label}: prefill must never use v1c direct paged attention"
+        f"{label}: prefill must remain outside the direct paged path"
     )
-    assert fphase.get("verify", 0) > 0, (
-        f"{label}: verify materialized/reference path was not observed"
+    assert fphase.get("verify", 0) == 0, (
+        f"{label}: verify unexpectedly fell back to materialization"
     )
     assert fphase.get("prefill", 0) > 0, (
         f"{label}: prefill materialized/reference path was not observed"
