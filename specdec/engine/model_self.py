@@ -41,16 +41,12 @@ class MLP(nn.Module):
 
 def Build_Rope_cache(head_dim: int, seq_len: int, theta:float, device: torch.device,dtype: torch.dtype,start_pos: int = 0) -> tuple[torch.Tensor, torch.Tensor]:
     calc_dtype = torch.float32
-    # Calculate the inverse frequencies
     exponents = torch.arange(0, head_dim, 2, device=device, dtype=calc_dtype) / head_dim
     inv_freq = 1.0 / (theta ** exponents)
-    # Create the position indices
     postitions = torch.arange(start_pos, start_pos + seq_len, device=device, dtype=calc_dtype)
-    # Compute the outer product to get the angles
-    freqs = torch.outer(postitions, inv_freq)  # (seq_len, head_dim/2)
-    # Compute the cosine and sine values
-    cos = torch.cat([torch.cos(freqs), torch.cos(freqs)], dim=-1).unsqueeze(0).unsqueeze(0)  # (1, 1, seq_len, head_dim)
-    sin = torch.cat([torch.sin(freqs), torch.sin(freqs)], dim=-1).unsqueeze(0).unsqueeze(0)  # (1, 1, seq_len, head_dim)
+    freqs = torch.outer(postitions, inv_freq)
+    cos = torch.cat([torch.cos(freqs), torch.cos(freqs)], dim=-1).unsqueeze(0).unsqueeze(0)
+    sin = torch.cat([torch.sin(freqs), torch.sin(freqs)], dim=-1).unsqueeze(0).unsqueeze(0)
     return cos.to(dtype), sin.to(dtype)
 
 def rotate_half(x: torch.Tensor) -> torch.Tensor:
@@ -68,20 +64,20 @@ def kv_repeat(x: torch.Tensor, n_rep: int) -> torch.Tensor:
     return x.unsqueeze(2).expand(b, kv, n_rep, s, d).reshape(b, kv * n_rep, s, d)
 
 E4M3_MAX = 448.0
-GROUP_SIZE = 32      # full-FP8 ablation 默认组粒度
-GROUP_V = 128        # 正式 Asymmetric V-only: V 的 group size(=1 group/head)
+GROUP_SIZE = 32
+GROUP_V = 128
 
 def quantize_kv_fp8(x: torch.Tensor, group_size: int = GROUP_SIZE):
     d = x.shape[-1]
     assert d % group_size == 0, f"head_dim {d} % group_size {group_size} != 0"
     g = d // group_size
-    xg = x.to(torch.float32).view(*x.shape[:-1], g, group_size)  
-    m = xg.abs().amax(dim=-1, keepdim=True)                     
+    xg = x.to(torch.float32).view(*x.shape[:-1], g, group_size)
+    m = xg.abs().amax(dim=-1, keepdim=True)
     s = m / E4M3_MAX
-    s = torch.where(s == 0, torch.ones_like(s), s)               
-    q = (xg / s).to(torch.float8_e4m3fn)                         
+    s = torch.where(s == 0, torch.ones_like(s), s)
+    q = (xg / s).to(torch.float8_e4m3fn)
     q = q.reshape_as(x)
-    return q, s.squeeze(-1)                                     
+    return q, s.squeeze(-1)
 
 def dequantize_kv_fp8(q: torch.Tensor, scale: torch.Tensor, dtype: torch.dtype = torch.float16):
     g = scale.shape[-1]
@@ -89,38 +85,16 @@ def dequantize_kv_fp8(q: torch.Tensor, scale: torch.Tensor, dtype: torch.dtype =
     hat = qg * scale.unsqueeze(-1)
     return hat.reshape_as(q).to(dtype)
 
-# ---------------------------------------------------------------- attention 后端策略（实验性分支）
-# 目的：**单独**验证"融合 attention 能否降低 prefill 的临时显存压力"。
-# 纪律（对应本次任务的硬要求）：
-#   ① 默认 `eager`，行为与历史完全一致；不把新后端宣布为正式冻结方案；
-#   ② **只允许 prefill 阶段**走融合路径 —— AR 单步 / draft 起草 / target 块验证 / 替换修复
-#      一律保持原路径；
-#   ③ 阶段由调用方**显式标注**。**不得**用 `q_len > 1` 判断 prefill：
-#      `spec_dec._verify` 的候选验证也是多 token（s = kp ∈ [1..k]）；
-#   ④ 不支持或短块 → **预先定义**的回退策略，并把**原因**记录进统计（不静默回退）；
-#   ⑤ **不吞异常**：融合路径的 OOM / "无可用 kernel" / 实现错误一律向上抛，
-#      绝不用笼统 `except Exception` 掩盖。
 ATTENTION_STRATEGIES = ("eager", "cudnn_prefill")
-PREFILL_FUSED_MIN_S = 2          # cuDNN SDPA 不支持 seq_len == 1（见台账 §4.17.x）
-SHORT_BLOCK_POLICY = "eager_fallback"   # 唯一预定义策略：短块回退 eager 并记录原因
+PREFILL_FUSED_MIN_S = 2
+SHORT_BLOCK_POLICY = "eager_fallback"
 FUSED_BACKEND_NAME = "CUDNN_ATTENTION"
 
 ATTENTION_STRATEGY = "eager"
-_ATTENTION_PHASE = "other"       # 调用方显式设置；默认**不是** prefill
+_ATTENTION_PHASE = "other"
 _ATTENTION_STATS: dict | None = None
 _MAX_FALLBACK_LOGGED = 32
 
-# ---------------------------------------------------------------------------
-# **仅用于诊断**的 eager 精度干预开关（两个可独立移除的舍入点，默认全部关闭）
-#   R1 = QK 分数被舍入成 bf16（matmul 输入 bf16 ⇒ 输出 bf16）
-#   R2 = softmax 概率被 `.to(dtype)` 转回 bf16
-# 第三个舍入点 R3（AV 输出被舍入成 bf16）**在整模型层面无法单独移除**：
-# 下游的 `o_proj` 是 bf16 权重，fp32 的 attention 输出喂不进去
-# （实测：`RuntimeError: expected mat1 and mat2 to have the same dtype, but got: float != BFloat16`）。
-# 因此整模型层面 `R3 缺失` 与 `R3 存在但立刻被 o_proj 的输入转换再舍入一次` 不可区分；
-# R3 只能靠 `g5_attn_real_tensor_forensics.py` 的**逐层张量**变体阶梯单独测量。
-# **默认 (False, False) 时，eager 分支执行的算子与顺序与历史完全一致**（逐位不变）；
-# 打开后只用于"在真实模型上逐项分离差异来源"，**不得**用于正式测量。
 DIAG_QK_FP32 = False
 DIAG_PROB_FP32 = False
 
@@ -130,7 +104,6 @@ def diag_precision() -> dict:
 
 
 def set_diag_precision(qk32=None, prob32=None) -> dict:
-    """设置诊断用精度干预开关；返回设置后的状态。**不改变默认行为。**"""
     global DIAG_QK_FP32, DIAG_PROB_FP32
     if qk32 is not None:
         DIAG_QK_FP32 = bool(qk32)
@@ -138,13 +111,11 @@ def set_diag_precision(qk32=None, prob32=None) -> dict:
         DIAG_PROB_FP32 = bool(prob32)
     return diag_precision()
 
-
-# 整模型层面可运行的预设（名字与逐层工具的变体一致；`out32` 只在逐层工具里有意义）
 DIAG_PRESETS = {
-    "eager": (False, False),      # R1 在、R2 在
-    "qk32": (True, False),        # 只移除 R1
-    "prob32": (False, True),      # 只移除 R2
-    "fp32": (True, True),         # R1、R2 都移除（R3 仍受 o_proj 约束）
+    "eager": (False, False),
+    "qk32": (True, False),
+    "prob32": (False, True),
+    "fp32": (True, True),
 }
 
 
@@ -158,15 +129,12 @@ def _fresh_stats() -> dict:
     return {"strategy": ATTENTION_STRATEGY, "requested_backend": FUSED_BACKEND_NAME,
             "calls": {"eager": 0, "fused": 0},
             "by_phase": {}, "fused_by_phase": {}, "eager_by_phase": {},
-            # 每阶段见过的最大 query 长度 —— 用来**正面证明**
-            # "候选验证的 s>1 也仍然是 eager"（而不是只靠"没有 fused"反证）
             "s_max_by_phase": {}, "fused_s_max_by_phase": {},
             "fallbacks": [], "fallback_count": 0, "eager_reason_kinds": {},
             "phases_seen": [], "errors": []}
 
 
 def set_attention_strategy(name: str) -> str:
-    """显式切换策略。返回切换后的策略名。"""
     global ATTENTION_STRATEGY
     if name not in ATTENTION_STRATEGIES:
         raise ValueError(f"未知 attention 策略 {name!r}（可选 {ATTENTION_STRATEGIES}）")
@@ -182,11 +150,6 @@ def attention_strategy() -> str:
 
 @contextlib.contextmanager
 def attention_phase(name: str):
-    """显式标注当前执行阶段。**唯一**决定"是否允许融合"的输入（除策略本身）。
-
-    合法阶段：`prefill` / `decode` / `propose` / `verify` / `repair` / `other`。
-    只有 `prefill` 允许融合；其余一律 eager —— 这正是"候选验证不被误用新路径"的机制保证。
-    """
     global _ATTENTION_PHASE
     prev = _ATTENTION_PHASE
     _ATTENTION_PHASE = name
@@ -216,7 +179,6 @@ def reset_attention_stats() -> None:
 
 
 def attention_stats() -> dict:
-    """返回统计（深拷贝），用于证明阶段分流与回退原因。"""
     import copy
     st = copy.deepcopy(_stats())
     st["strategy"] = ATTENTION_STRATEGY
@@ -224,10 +186,6 @@ def attention_stats() -> dict:
 
 
 def decide_attention_path(phase: str, s: int, strategy: str | None = None) -> tuple[str, str | None]:
-    """**纯函数**决定走哪条路径。返回 `(path, reason)`，`path ∈ {"eager","fused"}`。
-
-    可 CPU 测试；这是"阶段分流"的唯一裁决点。
-    """
     strat = ATTENTION_STRATEGY if strategy is None else strategy
     if strat != "cudnn_prefill":
         return "eager", f"strategy={strat}"
@@ -239,32 +197,15 @@ def decide_attention_path(phase: str, s: int, strategy: str | None = None) -> tu
 
 
 def _kv_keep_mask(s: int, T: int, device) -> torch.Tensor:
-    """偏移因果掩码的**保留**形式（SDPA 语义：True = 参与）。
-
-    语义必须与 eager 路径完全一致：**第 i 个 query 只能访问 key_position ≤ (T − s) + i**。
-    本式对三种情形统一成立：cache 为 None（T==s ⇒ j ≤ i）、s==1（j ≤ T−1，全允许）、
-    以及非方阵的分块情况（**此时 `is_causal=True` 不等价**，见台账 §4.17）。
-    """
     drop = torch.triu(torch.ones(s, T, device=device, dtype=torch.bool), diagonal=(T - s) + 1)
     return ~drop
 
 
 def _sdpa(q, k, v, **kw):
-    """`F.scaled_dot_product_attention` 的**一级间接**。
-
-    存在的理由：让测试可以**安全地** spy/替换（直接改 `F.scaled_dot_product_attention`
-    会污染全局 `torch.nn.functional`，那是不可接受的副作用）。
-    """
     return F.scaled_dot_product_attention(q, k, v, **kw)
 
 
 def _fused_prefill_attention(q, k, v, head_dim: int):
-    """强制 CUDNN_ATTENTION 后端的融合 prefill attention。
-
-    - GQA 用 `enable_gqa=True` 原生处理（**不做** `kv_repeat` 展开，这是省显存的一半来源）；
-    - 掩码用 **bool keep-mask**（不是 `is_causal`，非方阵时二者不等价）；
-    - **不捕获任何异常**：无可用 kernel / OOM 直接抛给调用方。
-    """
     import torch.nn.attention as A
     s, T = q.shape[2], k.shape[2]
     keep = _kv_keep_mask(s, T, q.device)
@@ -289,10 +230,6 @@ def _record_attention_call(path: str, phase: str, s: int, T: int, reason: str | 
         if s > fsmax.get(phase, 0):
             fsmax[phase] = s
     if path == "eager" and ATTENTION_STRATEGY == "cudnn_prefill":
-        # **口径**：`fallback_count` = 策略=cudnn_prefill 时的**全部非融合调用**，
-        # 它包含两大类，必须靠 `eager_reason_kinds` 分开读，否则会误读：
-        #   short_block_seq_len_lt_min —— **短块策略真的触发了**（prefill 里 s < 2）；
-        #   phase_not_prefill         —— 非 prefill 阶段**本就应该** eager（正常路径，不是回退）。
         st["fallback_count"] += 1
         kind = "other"
         if reason and "PREFILL_FUSED_MIN_S" in reason:
@@ -307,7 +244,6 @@ def _record_attention_call(path: str, phase: str, s: int, T: int, reason: str | 
 
 
 def assert_strategy_used() -> dict:
-    """**防止"忘了标注阶段"导致静默不融合**：策略已切到 cudnn_prefill 但一次都没融合 ⇒ 抛错。"""
     st = attention_stats()
     if ATTENTION_STRATEGY == "cudnn_prefill" and st["calls"]["fused"] == 0:
         raise RuntimeError(
@@ -318,11 +254,6 @@ def assert_strategy_used() -> dict:
 
 
 def chunked_prefill(model, ids, chunk: int = 1024, *, need_logits_last: bool = True):
-    """分块 prefill 的**规范实现**：把 attention 阶段显式标为 `'prefill'`。
-
-    与各处 harness 原有的循环语义一致：逐块 `model._run`，**仅最后一块**取 logits。
-    阶段标注是本函数存在的主要理由 —— 否则 `cudnn_prefill` 策略会静默不生效。
-    """
     with attention_phase("prefill"):
         cache, lg, n = None, None, ids.shape[1]
         for st in range(0, n, chunk):
@@ -344,7 +275,7 @@ class SelfAttention(nn.Module):
         self.kv_format = "fp16" 
         self.cache_backend = "contiguous"
         self.cache_page_size = paged_cache.DEFAULT_PAGE_SIZE
-        # 策略旋钮: 'fp8'(full K/V ablation) 时生效; 'v_fp8'(正式) 时 V 固定 GROUP_V
+        self.paged_attention_mode = "off"
         self.fp8_g_k = GROUP_SIZE
         self.fp8_g_v = GROUP_SIZE
         self.fp8_k = True
@@ -365,8 +296,6 @@ class SelfAttention(nn.Module):
         fmt = cache.get("fmt", self.kv_format) if cache is not None else self.kv_format
         if paged_mode and fmt == "fp8":
             raise ValueError("paged_v0 does not support full fp8 K/V")
-        # 模式语义: 'fp16'=base(bf16 KV 计算); 'v_fp8'=正式 V-only(K bf16 + V FP8 GROUP_V);
-        #           'fp8'=full FP8 K/V(negative ablation, 粒度经 fp8_g_*/fp8_k/v 旋钮)
         if fmt == 'v_fp8':
             k_on, v_on, gk, gv = False, True, GROUP_SIZE, GROUP_V
         elif fmt == 'fp8':
@@ -385,6 +314,7 @@ class SelfAttention(nn.Module):
             v_cur16 = dequantize_kv_fp8(qv_cur, vs_cur, x.dtype)
         else:
             v_cur16 = v
+        paged_cuda_decode = False
         if paged_mode:
             if cache_was_none:
                 cache = paged_cache.create_layer_cache(fmt, self.cache_page_size)
@@ -392,13 +322,30 @@ class SelfAttention(nn.Module):
                 paged_cache.append_current(cache, k, v)
             else:
                 paged_cache.append_current(cache, k_cur16, qv_cur, vs_cur)
-            materialized = paged_cache.materialize_layer(cache)
-            k_all = materialized["k"]
-            if fmt == "v_fp8":
-                v_all = dequantize_kv_fp8(
-                    materialized["v"], materialized["v_scale"], x.dtype)
+
+            # PagedAttention v1b: only an already-existing BF16 paged cache
+            # followed by a single-token decode may use the CUDA comparison paths.
+            # Unsupported cases retain the existing paged_v0 materialization path.
+            paged_cuda_decode = (
+                not cache_was_none
+                and fmt == "fp16"
+                and s == 1
+                and q.is_cuda
+                and self.paged_attention_mode in ("materialized_cuda", "direct_cuda")
+            )
+
+            if paged_cuda_decode and self.paged_attention_mode == "direct_cuda":
+                # Direct page-aware kernel: do not materialize full-history K/V.
+                k_all = None
+                v_all = None
             else:
-                v_all = materialized["v"]
+                materialized = paged_cache.materialize_layer(cache)
+                k_all = materialized["k"]
+                if fmt == "v_fp8":
+                    v_all = dequantize_kv_fp8(
+                        materialized["v"], materialized["v_scale"], x.dtype)
+                else:
+                    v_all = materialized["v"]
         elif cache is None:
             k_all, v_all = k_cur16, v_cur16
         elif fmt == 'fp16':
@@ -408,31 +355,37 @@ class SelfAttention(nn.Module):
             cache["v"] = v
             k_all, v_all = k, v
         else:
-            # fp8 混合缓存读取: 有 *_scale 键 = fp8 payload(反量化), 否则 = bf16 全长历史
             if "k_scale" in cache:
-                k_all = torch.cat([dequantize_kv_fp8(cache["k"], cache["k_scale"],
-                                                     x.dtype), k_cur16], dim=2)
+                k_all = torch.cat([dequantize_kv_fp8(cache["k"], cache["k_scale"], x.dtype), k_cur16], dim=2)
             else:
                 k_all = torch.cat([cache["k"], k_cur16], dim=2)
-                cache["k"] = k_all                      # bf16 全长写回
+                cache["k"] = k_all
             if "v_scale" in cache:
-                v_all = torch.cat([dequantize_kv_fp8(cache["v"], cache["v_scale"],
-                                                     x.dtype), v_cur16], dim=2)
+                v_all = torch.cat([dequantize_kv_fp8(cache["v"], cache["v_scale"], x.dtype), v_cur16], dim=2)
             else:
                 v_all = torch.cat([cache["v"], v_cur16], dim=2)
                 cache["v"] = v_all
-        T = k_all.shape[2] if cache is not None else s
-        # ---- 阶段分流（唯一裁决点；见文件头策略块）----
+        if paged_mode:
+            T = paged_cache.logical_length(cache)
+        else:
+            T = k_all.shape[2] if cache is not None else s
         path, reason = decide_attention_path(_ATTENTION_PHASE, s)
         _record_attention_call(path, _ATTENTION_PHASE, s, T, reason,
                                self.heads, self.kv_heads, self.head_dim)
         if path == "fused":
-            # 融合 prefill：不做 kv_repeat 展开；掩码为 bool keep-mask
             out = _fused_prefill_attention(q, k_all, v_all, self.head_dim)
+        elif paged_cuda_decode:
+            from specdec.kernels import ops as kernel_ops
+            if self.paged_attention_mode == "direct_cuda":
+                out = kernel_ops.paged_attention_decode(q, cache, backend="cuda")
+            elif self.paged_attention_mode == "materialized_cuda":
+                out = kernel_ops.attention(q, k_all, v_all, backend="cuda")
+            else:
+                raise RuntimeError(
+                    f"unexpected paged attention mode {self.paged_attention_mode!r}")
         else:
             k_rep = kv_repeat(k_all, self.heads // self.kv_heads)
             v_rep = kv_repeat(v_all, self.heads // self.kv_heads)
-            # ---- R1：QK 分数精度。默认（DIAG_QK_FP32=False）与历史**逐位一致** ----
             if DIAG_QK_FP32:
                 scores = torch.matmul(q.float(), k_rep.float().transpose(-2, -1)) / (self.head_dim ** 0.5)
             else:
@@ -447,13 +400,12 @@ class SelfAttention(nn.Module):
                 mask = torch.triu(torch.ones(s, T, device=x.device, dtype=torch.bool), diagonal=p + 1)
                 scores = scores.masked_fill(mask, float('-inf'))
             attn = torch.softmax(scores, dim=-1, dtype=torch.float32)
-            # ---- R2：概率是否回转 bf16（R3 见策略块说明：整模型层面无法单独移除）----
             if DIAG_PROB_FP32:
                 out = torch.matmul(attn, v_rep.float())
             else:
-                attn = attn.to(q.dtype)                              # 默认路径：与历史一致
+                attn = attn.to(q.dtype)
                 out = torch.matmul(attn, v_rep)
-            out = out.to(q.dtype)      # o_proj 是 bf16 ⇒ 这一步在默认路径是**无操作**（无拷贝）
+            out = out.to(q.dtype)
         out = out.transpose(1, 2).contiguous().view(b, s, self.heads * self.head_dim)
         if paged_mode:
             new_cache = cache
@@ -463,7 +415,7 @@ class SelfAttention(nn.Module):
                 if k_on:
                     nc["k"], nc["k_scale"] = qk_cur, ks_cur
                 else:
-                    nc["k"] = k_all                    # bf16(K 不量化)
+                    nc["k"] = k_all
                 if v_on:
                     nc["v"], nc["v_scale"] = qv_cur, vs_cur
                 else:
@@ -475,7 +427,6 @@ class SelfAttention(nn.Module):
             if k_on:
                 cache["k"] = torch.cat([cache["k"], qk_cur], dim=2)
                 cache["k_scale"] = torch.cat([cache["k_scale"], ks_cur], dim=2)
-            # else: K 已在读路径按 bf16 全长写回
             if v_on:
                 cache["v"] = torch.cat([cache["v"], qv_cur], dim=2)
                 cache["v_scale"] = torch.cat([cache["v_scale"], vs_cur], dim=2)
@@ -507,11 +458,12 @@ class QwenLM(nn.Module):
         self.norm = RMSNORM(hidden)
         self.head_dim = head_dim
         self.rope_theta = rope_theta
-        self.kv_format = "fp16"   
+        self.kv_format = "fp16"
         self.cache_backend = "contiguous"
         self.cache_page_size = paged_cache.DEFAULT_PAGE_SIZE
+        self.paged_attention_mode = "off"
 
-    def _run(self,x, cache_list = None, need_logits = True):  
+    def _run(self,x, cache_list = None, need_logits = True):
         start_pos = spec_cache.cache_length(cache_list)
         cos, sin = Build_Rope_cache(self.head_dim, seq_len=x.size(1), theta=self.rope_theta, device=x.device, dtype=x.dtype, start_pos=start_pos)
         new_cache_list = []
@@ -548,10 +500,8 @@ class QwenLM(nn.Module):
                 gen = torch.cat([gen, next_id.unsqueeze(1)], dim=1)
                 logits, cache_list = self._run(self.embed_tokens(next_id.unsqueeze(1)), cache_list)
         return gen
+
     def set_kv_format(self, fmt: str) -> None:
-        """缓存格式: 'fp16'=base(bf16 KV); 'v_fp8'=正式 Asymmetric V-only
-        (K bf16 不量化 + V FP8 E4M3 group=GROUP_V=128, 每 head 1 group);
-        'fp8'=full FP8 K/V(negative ablation; K/V 粒度可经 set_fp8_groups/matrices 调)。"""
         assert fmt in ("fp16", "fp8", "v_fp8"), fmt
         if self.cache_backend == "paged_v0" and fmt == "fp8":
             raise ValueError("paged_v0 does not support full fp8 K/V")
@@ -566,14 +516,8 @@ class QwenLM(nn.Module):
             elif fmt == "fp8":
                 a.fp8_k, a.fp8_v = True, True
                 a.fp8_g_k, a.fp8_g_v = GROUP_SIZE, GROUP_SIZE
-            # 'fp16': 仅记录格式; fp8 旋钮不影响 base 路径
 
     def set_cache_backend(self, backend: str, page_size: int = 16) -> None:
-        """Select cache storage; contiguous remains the default.
-
-        Backend changes apply to newly-created caches.  Callers must not pass a
-        cache created by a different backend after switching.
-        """
         if backend not in ("contiguous", "paged_v0"):
             raise ValueError(f"unknown cache backend {backend!r}")
         if backend == "paged_v0":
@@ -588,9 +532,32 @@ class QwenLM(nn.Module):
             layer.self_attn.cache_backend = backend
             layer.self_attn.cache_page_size = page_size
 
+    def set_paged_attention_mode(self, mode: str) -> None:
+        """Select the experimental paged decode attention path.
+
+        off:
+            Existing paged_v0 behavior. Full K/V is materialized and the
+            normal engine attention path is used.
+
+        materialized_cuda:
+            For BF16 q_len=1 decode with an existing paged cache, materialize
+            K/V and run the existing contiguous CUDA online-softmax attention.
+
+        direct_cuda:
+            For the same case, read paged K/V directly with the page-aware
+            CUDA kernel and do not materialize full-history K/V.
+
+        Unsupported cases keep the existing engine path.
+        """
+        allowed = ("off", "materialized_cuda", "direct_cuda")
+        if mode not in allowed:
+            raise ValueError(
+                f"unknown paged attention mode {mode!r}; choose from {allowed}")
+        self.paged_attention_mode = mode
+        for layer in self.layers:
+            layer.self_attn.paged_attention_mode = mode
+
     def set_fp8_groups(self, k_group: int | None = None, v_group: int | None = None) -> None:
-        """诊断开关: K/V 各自 FP8 scale 分组粒度(须整除 head_dim)。默认 None=不动。
-        group=1 => 逐元素(对 bf16 无损); 128 => per-head; 32 => 正式值。仅 fp8 模式生效。"""
         if k_group is not None:
             assert self.head_dim % k_group == 0
         if v_group is not None:
@@ -604,8 +571,6 @@ class QwenLM(nn.Module):
 
     def set_fp8_matrices(self, k_on: bool | None = None, v_on: bool | None = None,
                          k_group: int | None = None, v_group: int | None = None) -> None:
-        """非对称策略开关: 分别决定 K/V 是否量化进 FP8。None=不动。
-        正式默认 k_on=False(bf16 K), v_on=True(FP8 V, group32)。"""
         for layer in self.layers:
             a = layer.self_attn
             if k_on is not None:
@@ -621,9 +586,9 @@ class QwenLM(nn.Module):
 
 if __name__ == "__main__":
     ids = torch.randint(0, 151936, (1, 10))
-    full = model(ids)                                  # 全量 10 词
+    full = model(ids)
     x9 = model.embed_tokens(ids[:, :9])
-    _, caches = model._run(x9, None)                   # prefill 前 9
+    _, caches = model._run(x9, None)
     x10 = model.embed_tokens(ids[:, 9:])
-    step_logits, _ = model._run(x10, caches)           # 单独喂第 10 个
-    print((full[:, -1] - step_logits[:, -1]).abs().max().item())   # 应 0.0
+    step_logits, _ = model._run(x10, caches)
+    print((full[:, -1] - step_logits[:, -1]).abs().max().item())
