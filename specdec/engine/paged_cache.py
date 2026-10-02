@@ -1,9 +1,17 @@
-"""Paged KV cache v0 storage.
+"""Paged KV cache v0 storage plus lazy CUDA pointer-table metadata.
 
-This module deliberately stops at storage: callers append token-aligned K/V
-payloads into fixed-size pages and materialize them back to the legacy
-contiguous representation before attention.  It is not a page-aware attention
-implementation.
+The storage semantics are unchanged from paged_v0:
+- token-aligned K/V payloads live in fixed-size page tensors;
+- append never concatenates full history;
+- trim returns a non-mutating prefix and clones a partial tail page for COW;
+- materialize_layer recreates the legacy contiguous representation when needed.
+
+PagedAttention v1d adds *metadata-only* pointer-table caching for the direct
+CUDA decode kernel.  The page payload tensors remain exactly the same.  A
+pointer table is built lazily the first time direct attention needs it and is
+reused while the set of physical pages is unchanged.  It is invalidated only
+when a new page is allocated.  trim_layer() creates a fresh logical cache, so
+trimmed caches never inherit stale pointer metadata.
 """
 from __future__ import annotations
 
@@ -17,6 +25,21 @@ BACKEND = "paged_v0"
 DEFAULT_PAGE_SIZE = 16
 SUPPORTED_FORMATS = ("fp16", "v_fp8")
 
+_POINTER_TABLE_STATS = {
+    "builds": 0,
+    "hits": 0,
+    "invalidations": 0,
+}
+
+
+def reset_pointer_table_stats() -> None:
+    for key in _POINTER_TABLE_STATS:
+        _POINTER_TABLE_STATS[key] = 0
+
+
+def pointer_table_stats() -> dict:
+    return dict(_POINTER_TABLE_STATS)
+
 
 def is_paged_layer(layer: Any) -> bool:
     return isinstance(layer, dict) and layer.get("_cache_backend") == BACKEND
@@ -27,6 +50,18 @@ def _validate_page_size(page_size: int) -> int:
             or page_size <= 0):
         raise ValueError(f"page_size must be a positive int, got {page_size!r}")
     return page_size
+
+
+def _invalidate_pointer_tables(layer: dict) -> None:
+    had = any(
+        key in layer
+        for key in ("_k_ptrs_cuda", "_v_ptrs_cuda", "_ptr_page_count")
+    )
+    layer.pop("_k_ptrs_cuda", None)
+    layer.pop("_v_ptrs_cuda", None)
+    layer.pop("_ptr_page_count", None)
+    if had:
+        _POINTER_TABLE_STATS["invalidations"] += 1
 
 
 def create_layer_cache(fmt: str = "fp16", page_size: int = DEFAULT_PAGE_SIZE) -> dict:
@@ -114,6 +149,10 @@ def append_current(layer: dict, k: torch.Tensor, v: torch.Tensor,
     while offset < n:
         slot = layer["length"] % page_size
         if slot == 0:
+            # Existing device pointer tables describe the old physical page set.
+            # Invalidate before allocating the next page.  Within a page they stay
+            # valid across appends and can be reused by every decode call.
+            _invalidate_pointer_tables(layer)
             layer["k_pages"].append(_empty_page_like(k, page_size))
             layer["v_pages"].append(_empty_page_like(v, page_size))
             if layer["fmt"] == "v_fp8":
@@ -159,6 +198,73 @@ def materialize_layer(layer: dict) -> dict:
     return out
 
 
+def cuda_pointer_tables(layer: dict, *, validate: bool = True) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return cached device arrays of raw K/V page addresses for direct CUDA.
+
+    The returned tensors contain only int64 page addresses; no K/V payload is
+    copied or stacked.  Tables are rebuilt only when the physical page count
+    changes.  `validate=False` is intended for the model fast path immediately
+    after append_current(), which has already run the full consistency check.
+    """
+    if validate:
+        check_consistent(layer)
+    elif not is_paged_layer(layer):
+        raise TypeError("not a paged_v0 layer cache")
+
+    if layer.get("fmt") != "fp16":
+        raise ValueError("CUDA pointer tables v1d are only used for fp16/base cache")
+
+    k_pages = layer.get("k_pages")
+    v_pages = layer.get("v_pages")
+    if not k_pages or not v_pages:
+        raise ValueError("cannot build pointer tables for an empty paged cache")
+    if len(k_pages) != len(v_pages):
+        raise RuntimeError("paged K/V page count mismatch")
+
+    device = k_pages[0].device
+    if device.type != "cuda":
+        raise ValueError("CUDA pointer tables require CUDA page tensors")
+
+    count = len(k_pages)
+    k_cached = layer.get("_k_ptrs_cuda")
+    v_cached = layer.get("_v_ptrs_cuda")
+    cached_count = layer.get("_ptr_page_count")
+
+    cache_ok = (
+        cached_count == count
+        and isinstance(k_cached, torch.Tensor)
+        and isinstance(v_cached, torch.Tensor)
+        and k_cached.dtype == torch.int64
+        and v_cached.dtype == torch.int64
+        and k_cached.device == device
+        and v_cached.device == device
+        and k_cached.ndim == 1
+        and v_cached.ndim == 1
+        and k_cached.numel() == count
+        and v_cached.numel() == count
+    )
+    if cache_ok:
+        _POINTER_TABLE_STATS["hits"] += 1
+        return k_cached, v_cached
+
+    # Build only when first used or when a new physical page has appeared.
+    k_ptrs = torch.tensor(
+        [int(page.data_ptr()) for page in k_pages],
+        dtype=torch.int64,
+        device=device,
+    )
+    v_ptrs = torch.tensor(
+        [int(page.data_ptr()) for page in v_pages],
+        dtype=torch.int64,
+        device=device,
+    )
+    layer["_k_ptrs_cuda"] = k_ptrs
+    layer["_v_ptrs_cuda"] = v_ptrs
+    layer["_ptr_page_count"] = count
+    _POINTER_TABLE_STATS["builds"] += 1
+    return k_ptrs, v_ptrs
+
+
 def trim_layer(layer: dict, new_len: int) -> dict:
     """Return a non-mutating logical prefix with copy-on-write tail storage."""
     check_consistent(layer)
@@ -180,10 +286,12 @@ def trim_layer(layer: dict, new_len: int) -> dict:
         retained = list(layer[key][:keep_pages])
         if partial_tail:
             # This page may be shared with the source and will be written by a
-            # later append.  Clone the whole fixed-capacity page before that can
+            # later append. Clone the whole fixed-capacity page before that can
             # happen; completed retained pages remain safely shared.
             retained[-1] = retained[-1].clone()
         out[key] = retained
+    # `out` intentionally starts without any pointer-table metadata.  A partial
+    # tail may have been cloned, so inheriting source addresses would be wrong.
     check_consistent(out)
     return out
 
@@ -261,6 +369,8 @@ def check_consistent(layer: dict) -> None:
 
 __all__ = [
     "BACKEND", "DEFAULT_PAGE_SIZE", "SUPPORTED_FORMATS", "append_current",
-    "check_consistent", "create_layer_cache", "is_paged_layer", "layer_device",
-    "logical_length", "materialize_layer", "trim_layer", "truncate_layer",
+    "check_consistent", "create_layer_cache", "cuda_pointer_tables",
+    "is_paged_layer", "layer_device", "logical_length", "materialize_layer",
+    "pointer_table_stats", "reset_pointer_table_stats", "trim_layer",
+    "truncate_layer",
 ]
