@@ -46,6 +46,12 @@ os.environ.update(dict(
 ))
 
 from specdec.engine import f13_i50_cells as C                     # noqa: E402
+from specdec.engine import sb_align as _A                         # noqa: E402
+
+
+def stable(t) -> str:
+    """张量摘要（跨进程约定，与其它工具一致）。"""
+    return _A.stable_sha(t)
 
 # 期望的锚点（真实运行记录里的 argmax；由运行记录本身提供，不硬编码结论）
 EXPECT = dict(H_AR_S=323, H_AR_B=659, H_SP_B=323)
@@ -196,6 +202,42 @@ def _chain_section() -> None:
     print("  [chain-preflight] H/截断/历史一致/已保存行/L27 跨工具参考/锚点 全部符合预期 ⇒ 可进入 GPU 运行")
 
 
+def _l0op_section() -> None:
+    """L0 算子边界工具（`l0_operator_f13_p8209`）的飞行前检查（纯 CPU、只读）。"""
+    from specdec.engine import l0_operator_f13_p8209 as L0T
+    from specdec.engine import op_probe as OP
+    from specdec.engine import model_self as M
+    print("\n================ L0 算子边界工具（位置 8209）================")
+    print(f"  配置：LAYER={L0T.LAYER} PRE={L0T.PRE} TARGET={L0T.TARGET_POS} VIS={L0T.VIS} "
+          f"REPEAT={L0T.REPEAT} ROPE={L0T.TARGET_ROPE}")
+    assert L0T.LAYER == 0 and L0T.VIS == L0T.PRE + 1 == L0T.TARGET_POS
+    assert len(L0T.FEED) == 1
+    print(f"  探针状态（应为关闭）：{M.attn_probe_state()}")
+    assert M.attn_probe_state()["active"] is False, "进入实验前探针必须是关闭的"
+    print(f"  链定义：{len(OP.CHAIN)} 个算子、{len(OP.SPECS)} 个探针名"
+          f"（其中 shape_only={sorted(k for k in OP.SPECS if OP.SPECS[k][1] == 'shape_only')}）")
+    assert len(OP.CHAIN) == len(OP.CHAIN_NODE_OUT)
+    for (op, ins), outn in zip(OP.CHAIN, OP.CHAIN_NODE_OUT):
+        assert outn in OP.SPECS, (op, outn)
+    cap = C._load_cap(Path(L0T.CAP_H))
+    H, t = C._truncate(cap["snapshot_cpu"], L0T.PRE, "H")
+    print(f"  H：{Path(L0T.CAP_H).name} {t['source_len']} → {t['pre']} 纯切片={t['is_pure_slice']}")
+    assert t["is_pure_slice"] and C._cache_len(H) == L0T.PRE
+    ch = torch.load(L0T.CHAIN_PT, map_location="cpu")
+    assert "rows_S_raw" in ch and "rows_B_raw" in ch, "缺少上一轮全层捕获的 L0 参考行"
+    l0_in_s = ch["rows_S_raw"][0]["input"]
+    l0_out_s = ch["rows_S_raw"][0]["output"]
+    print(f"  上一轮 L0 参考：input sha16={stable(ch['rows_S_raw'][0]['input'])}、"
+          f"output sha16={stable(l0_out_s)}；L0 输出 S/B n_diff="
+          f"{int((l0_out_s.reshape(-1) != ch['rows_B_raw'][0]['output'].reshape(-1)).sum())}")
+    assert int((l0_out_s.reshape(-1) != ch["rows_B_raw"][0]["output"].reshape(-1)).sum()) == 111
+    a_s = C._anchor_ar(L0T.REF_RUN_AR, L0T.TARGET_POS)
+    a_b = C._anchor_specdec(L0T.REF_RUN_RB, L0T.PRE, L0T.TARGET_POS - L0T.PRE, L0T.TARGET_POS)
+    print(f"  锚点：S={a_s.get('token')} / B={a_b.get('token')}")
+    assert a_s["token"] == 323 and a_b["token"] == 659
+    print("  [l0op-preflight] H/截断/历史一致/上一轮 L0 参考/锚点/链与探针表 全部符合预期 ⇒ 可进入 GPU 运行")
+
+
 def main() -> int:
     print(f"配置：PRE={C.PRE} TARGET={C.TARGET_POS} DEC_SLOT={C.DEC_SLOT} ROW_INDEX={C.ROW_INDEX} "
           f"CTX={C.CTX} FEED={C.FEED} CANDS={C.CANDS} WATCH={C.WATCH}")
@@ -259,6 +301,7 @@ def main() -> int:
     _norm_section()
     _layer_section()
     _chain_section()
+    _l0op_section()
     return 0
 
 

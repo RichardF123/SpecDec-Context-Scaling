@@ -3,6 +3,45 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 import contextlib
+
+# ---------------------------------------------------------------------------
+# 诊断探针（**默认 None ⇒ 完全不介入**；仅用于只读捕获，不改任何计算）
+#
+# 为什么需要它：Q/K/V 的 reshape、RoPE、KV 拼接、QK^T、mask、softmax、AV、head merge
+# 都是**函数式算子**（没有对应的 nn.Module），普通 module hook 抓不到。
+# 这里提供最小侵入的探针点：`_probe(name, tensor, who)` 只在**安装时**回调一次，
+# 回调只做 `detach().clone()`（只读），**不**改张量、不改顺序、不改 dtype。
+# 关闭（`clear_attn_probe()`）后 `_ATTN_PROBE is None` ⇒ 每个探针点只做一次身份判断，
+# 不构造参数、不碰张量 ⇒ 与改动前**逐位等价**（由开启/关闭逐位控制与跨轮复现控制证明）。
+# ---------------------------------------------------------------------------
+_ATTN_PROBE = None
+
+
+def set_attn_probe(fn) -> dict:
+    """安装只读诊断探针；返回安装前的状态（供调用方核对）。"""
+    global _ATTN_PROBE
+    prev_active = _ATTN_PROBE is not None
+    _ATTN_PROBE = fn
+    return dict(installed=_ATTN_PROBE is not None, had_previous=prev_active)
+
+
+def clear_attn_probe() -> dict:
+    """移除探针（幂等）。"""
+    global _ATTN_PROBE
+    _ATTN_PROBE = None
+    return dict(probe_is_none=_ATTN_PROBE is None)
+
+
+def attn_probe_state() -> dict:
+    return dict(active=_ATTN_PROBE is not None)
+
+
+def _probe(name: str, t, who) -> None:
+    """探针点：**关闭时零副作用**（只做一次身份判断）。"""
+    if _ATTN_PROBE is not None:
+        _ATTN_PROBE(name, t, who)
+
+
 class RMSNORM(nn.Module):
     def __init__(self, hidden: int, eps: float = 1e-6):
         super().__init__()
@@ -32,9 +71,17 @@ class MLP(nn.Module):
         self.down_proj = nn.Linear(intermediate, hidden, bias=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        gate = F.silu(self.gate_proj(x))
+        _probe("mlp_input", x, self)                       # 诊断（默认关闭）
+        g = self.gate_proj(x)
+        _probe("mlp_gate_proj", g, self)                   # 诊断（默认关闭）
+        gate = F.silu(g)
+        _probe("mlp_activation", gate, self)               # 诊断（默认关闭）
         up = self.up_proj(x)
-        down = self.down_proj(gate * up)
+        _probe("mlp_up_proj", up, self)                    # 诊断（默认关闭）
+        gp = gate * up
+        _probe("mlp_gated_product", gp, self)              # 诊断（默认关闭）
+        down = self.down_proj(gp)
+        _probe("mlp_down_proj", down, self)                # 诊断（默认关闭）
         return down
 
 def Build_Rope_cache(head_dim: int, seq_len: int, theta:float, device: torch.device,dtype: torch.dtype,start_pos: int = 0) -> tuple[torch.Tensor, torch.Tensor]:
@@ -348,11 +395,22 @@ class SelfAttention(nn.Module):
 
     def forward(self, x: torch.Tensor, cos, sin, cache = None) -> torch.Tensor:
         b, s, _ = x.shape
-        q = self.q_proj(x).view(b, s, self.heads, self.head_dim).transpose(1, 2)
-        k = self.k_proj(x).view(b, s, self.kv_heads, self.head_dim).transpose(1, 2)
-        v = self.v_proj(x).view(b, s, self.kv_heads, self.head_dim).transpose(1, 2)
+        ql = self.q_proj(x)
+        _probe("q_linear", ql, self)                       # 诊断（默认关闭）
+        q = ql.view(b, s, self.heads, self.head_dim).transpose(1, 2)
+        _probe("q_reshaped", q, self)                      # 诊断（默认关闭）
+        kl = self.k_proj(x)
+        _probe("k_linear", kl, self)                       # 诊断（默认关闭）
+        k = kl.view(b, s, self.kv_heads, self.head_dim).transpose(1, 2)
+        _probe("k_reshaped", k, self)                      # 诊断（默认关闭）
+        vl = self.v_proj(x)
+        _probe("v_linear", vl, self)                       # 诊断（默认关闭）
+        v = vl.view(b, s, self.kv_heads, self.head_dim).transpose(1, 2)
+        _probe("v_reshaped", v, self)                      # 诊断（默认关闭）
         q = apply_rope(q, cos, sin)
+        _probe("q_rope", q, self)                          # 诊断（默认关闭）
         k = apply_rope(k, cos, sin)
+        _probe("k_rope", k, self)                          # 诊断（默认关闭）
         fmt = cache.get("fmt", self.kv_format) if cache is not None else self.kv_format
         # 模式语义: 'fp16'=base(bf16 KV 计算); 'v_fp8'=正式 V-only(K bf16 + V FP8 GROUP_V);
         #           'fp8'=full FP8 K/V(negative ablation, 粒度经 fp8_g_*/fp8_k/v 旋钮)
@@ -397,6 +455,8 @@ class SelfAttention(nn.Module):
                 v_all = torch.cat([cache["v"], v_cur16], dim=2)
                 cache["v"] = v_all
         T = k_all.shape[2] if cache is not None else s
+        _probe("k_visible", k_all, self)                   # 诊断（默认关闭）
+        _probe("v_visible", v_all, self)                   # 诊断（默认关闭）
         # ---- 阶段分流（唯一裁决点；见文件头策略块）----
         path, reason = decide_attention_path(_ATTENTION_PHASE, s)
         _record_attention_call(path, _ATTENTION_PHASE, s, T, reason,
@@ -407,12 +467,15 @@ class SelfAttention(nn.Module):
         else:
             k_rep = kv_repeat(k_all, self.heads // self.kv_heads)
             v_rep = kv_repeat(v_all, self.heads // self.kv_heads)
+            _probe("k_repeated", k_rep, self)              # 诊断（默认关闭；只记 shape）
+            _probe("v_repeated", v_rep, self)              # 诊断（默认关闭；只记 shape）
             # ---- R1：QK 分数精度。默认（DIAG_QK_FP32=False）与历史**逐位一致** ----
             if DIAG_QK_FP32:
                 scores = torch.matmul(q.float(), k_rep.float().transpose(-2, -1)) / (self.head_dim ** 0.5)
             else:
                 scores = torch.matmul(q, k_rep.transpose(-2, -1)) / (self.head_dim ** 0.5)
             p = T - s
+            _probe("qk_scores_pre_mask", scores, self)     # 诊断（默认关闭）
             if cache is None:
                 mask = torch.triu(torch.ones(s, T, device=x.device, dtype=torch.bool), diagonal=1)
                 scores = scores.masked_fill(mask, float('-inf'))
@@ -421,15 +484,19 @@ class SelfAttention(nn.Module):
             else:
                 mask = torch.triu(torch.ones(s, T, device=x.device, dtype=torch.bool), diagonal=p + 1)
                 scores = scores.masked_fill(mask, float('-inf'))
+            _probe("qk_scores_post_mask", scores, self)    # 诊断（默认关闭）
             attn = torch.softmax(scores, dim=-1, dtype=torch.float32)
+            _probe("attention_prob", attn, self)           # 诊断（默认关闭；**fp32** 保持原 dtype）
             # ---- R2：概率是否回转 bf16（R3 见策略块说明：整模型层面无法单独移除）----
             if DIAG_PROB_FP32:
                 out = torch.matmul(attn, v_rep.float())
             else:
                 attn = attn.to(q.dtype)                              # 默认路径：与历史一致
                 out = torch.matmul(attn, v_rep)
+            _probe("attention_times_v", out, self)         # 诊断（默认关闭）
             out = out.to(q.dtype)      # o_proj 是 bf16 ⇒ 这一步在默认路径是**无操作**（无拷贝）
         out = out.transpose(1, 2).contiguous().view(b, s, self.heads * self.head_dim)
+        _probe("heads_merged", out, self)                  # 诊断（默认关闭）
         if cache is None:
             if fmt in ('fp8', 'v_fp8'):
                 nc = {"fmt": fmt}
@@ -455,7 +522,9 @@ class SelfAttention(nn.Module):
             new_cache = cache
         else:
             new_cache = cache
-        return self.o_proj(out), new_cache
+        op = self.o_proj(out)
+        _probe("o_proj", op, self)                         # 诊断（默认关闭）
+        return op, new_cache
     
     
 class DecoderLayer(nn.Module):
@@ -467,10 +536,20 @@ class DecoderLayer(nn.Module):
         self.post_attention_layernorm = RMSNORM(hidden)
 
     def forward(self, x: torch.Tensor, cos, sin, cache = None) -> torch.Tensor:
-        atten_out, new_attn_cache = self.self_attn(self.input_layernorm(x), cos, sin, cache)
-        x = x + atten_out
-        x = x + self.mlp(self.post_attention_layernorm(x))
-        return x, new_attn_cache
+        _probe("x0", x, self)                              # 诊断（默认关闭）
+        n1 = self.input_layernorm(x)
+        _probe("input_rmsnorm", n1, self)                  # 诊断（默认关闭）
+        atten_out, new_attn_cache = self.self_attn(n1, cos, sin, cache)
+        _probe("attn_out", atten_out, self)                # 诊断（默认关闭；= o_proj 输出）
+        xr = x + atten_out
+        _probe("attention_residual", xr, self)             # 诊断（默认关闭）
+        n2 = self.post_attention_layernorm(xr)
+        _probe("post_attention_rmsnorm", n2, self)         # 诊断（默认关闭）
+        mo = self.mlp(n2)
+        _probe("mlp_out", mo, self)                        # 诊断（默认关闭；= down_proj 输出）
+        z = xr + mo
+        _probe("layer_output", z, self)                    # 诊断（默认关闭）
+        return z, new_attn_cache
 
 class QwenLM(nn.Module):
     def __init__(self, vocab_size: int, hidden: int, heads: int, kv_heads: int, head_dim: int, intermediate: int, num_layers: int, rope_theta: float = 1_000_000.0, rms_eps: float = 1e-6, attn_bias: bool = False):
