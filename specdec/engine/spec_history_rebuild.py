@@ -31,11 +31,13 @@ F13 首个分歧（位置 8239：AR=6702 / Spec=6652）是否由**既有 KV 历�
 from __future__ import annotations
 
 import copy
+import hashlib
 
 import torch
 
 from . import cache_clone as CC
 from . import model_self as M
+from . import sb_align as A
 from . import spec_cache
 from . import spec_dec
 
@@ -46,6 +48,31 @@ class RebuildError(RuntimeError):
 
 _S: dict = dict(installed=False, orig=None, rebuild=False, capture_len=None, capture_row_at=None,
                 diag=None, last=None)
+
+
+def _row_argmax(lg) -> int:
+    """取**最后一行**在**词表维**上的 argmax（诊断字段用）。
+
+    ⚠️ **已修缺陷（2026-10-02）**：这里原先写成 `lg.reshape(-1)[-1].argmax()`。
+    `reshape(-1)` 会把 `(1,1,V)` 的 logits 压成**一维 V 个元素**，`[-1]` 取到的是
+    **最后一个词表的 logit 标量**，再对标量求 argmax ⇒ **恒为 0**。
+    影响范围：只影响诊断字段 `replay_saved_next_argmax`（旧 JSON 里那一列全是 0，**已标注作废**）；
+    **不影响** `saved_next = lg_last` 的实际赋值，也不影响任何生成/判定结果。
+    正确写法必须先把最后一行取出来：`lg.reshape(-1, lg.shape[-1])[-1].argmax()`。
+    """
+    return int(lg.reshape(-1, lg.shape[-1])[-1].argmax())
+
+
+def _cache_sha(cache) -> dict:
+    """整份缓存的**内容**摘要（逐层 K/V 的 sha16 串起来再 sha16）。
+
+    为什么需要：只比对**长度**不足以说明"轮前快照没被改写"——长度不变而内容被就地改掉同样危险。
+    代价（诚实说明）：每层每张量都要 `.float().cpu()` 一次再哈希 ⇒ 单次摘要有几十 MB 的搬运，
+    本诊断路径（`rebuild=True`）每轮算两次；这是诊断成本，**不作为**性能结论。
+    """
+    parts = [A.stable_sha(d[kk]) for d in cache for kk in ("k", "v") if torch.is_tensor(d[kk])]
+    return dict(n_tensors=len(parts),
+                digest=hashlib.sha256("|".join(parts).encode("ascii")).hexdigest()[:16])
 
 
 def _feed_one(target, token: int, cache):
@@ -104,6 +131,8 @@ def rebuilt_spec_decode_greedy(target, draft, prompt_ids, max_new_tokens, *, k=s
         pre = spec_cache.cache_length(tgt_cache)
         # ★★ 关键：`_verify` 会就地改写 tgt_cache ⇒ 轮前快照必须在它之前克隆
         H_pre = CC.clone_list_cache_full(tgt_cache) if rebuild else None
+        # 2026-10-02：快照的**内容**摘要（轮前），用于重放后做**内容**级核对（只查长度不够）
+        hp_before = _cache_sha(H_pre) if rebuild else None
 
         cands, drf_cache, prop_lg = spec_dec._propose(draft, drf_cache, drf_lg, k_eff, eos_id)
         kp = len(cands)
@@ -181,10 +210,19 @@ def rebuilt_spec_decode_greedy(target, draft, prompt_ids, max_new_tokens, *, k=s
             hp_after = spec_cache.cache_length(H_pre)
             if hp_after != pre:
                 raise RebuildError(f"H_pre 被改写：{hp_after} != {pre}")
+            # 内容级核对（比长度强）：整份 H_pre 的逐层 K/V 摘要必须**逐位**不变
+            hp_now = _cache_sha(H_pre)
+            if hp_now["digest"] != hp_before["digest"]:
+                raise RebuildError(f"H_pre 的**内容**被改写：{hp_before} -> {hp_now}")
             rec_r.update(rebuilt=True, n_replay_feeds=len(feeds), feeds=feeds, rebuilt_len=L,
                          per_layer_len_ok=True, H_pre_len_after_replay=hp_after,
+                         H_pre_content_unchanged=True, H_pre_sha=dict(before=hp_before["digest"],
+                                                                     after=hp_now["digest"],
+                                                                     n_tensors=hp_before["n_tensors"]),
                          # 重建后的数值与**原始块验证值**分字段，互不冒充
-                         replay_saved_next_argmax=int(saved_next.reshape(-1)[-1].argmax()),
+                         replay_saved_next_argmax=_row_argmax(saved_next),
+                         replay_saved_next_sha=A.stable_sha(saved_next),
+                         replay_saved_next_shape=list(saved_next.shape),
                          replay_lens=dict(pre=pre, after=spec_cache.cache_length(tgt_cache)))
 
         gen += emitted
@@ -460,7 +498,40 @@ def _selftest() -> int:
     check("★ 重建后长度与生产一致（同 token 序列下应为同长）",
           abs(len(got["gen"]) - len(ref2["gen"])) <= 4, (len(got["gen"]), len(ref2["gen"])))
 
-    print("== 5) 包装安装 / 异常恢复 / 无全局残留 ==")
+    print("== 5) 诊断字段正确性：`replay_saved_next_argmax` 与 `H_pre` 内容摘要 ==")
+    # 缺陷回归（2026-10-02）：旧写法 `lg.reshape(-1)[-1].argmax()` 对**标量**求 argmax ⇒ 恒为 0
+    _lg = torch.full((1, 1, 64), -10.0)
+    _lg[0, 0, 37] = 0.0
+    check("★ 旧写法确实恒为 0（把缺陷本身钉在测试里，不是当借口）",
+          int(_lg.reshape(-1)[-1].argmax()) == 0, int(_lg.reshape(-1)[-1].argmax()))
+    check("★ 新写法 `_row_argmax` 取到**词表维**真实 argmax（索引非 0）", _row_argmax(_lg) == 37,
+          _row_argmax(_lg))
+    _multi = torch.full((1, 3, 64), -10.0)
+    _multi[0, 0, 11] = 0.0
+    _multi[0, 1, 22] = 0.0
+    _multi[0, 2, 37] = 0.0
+    check("★ 多行输入时只取**最后一行**", _row_argmax(_multi) == 37, _row_argmax(_multi))
+    # 端到端：让重放末行的 argmax 明确非 0（脚本把位置 2..39 都映射到 token 63）
+    _D63 = {p: 63 for p in range(2, 40)}
+    out_nz, _diag_nz = _run_case("nonzero_argmax", dscript=_D63, tscript=_D63, k=2, max_new=4,
+                                 eos=None, rebuild=True)
+    _rn = out_nz["diag"]["rounds"]
+    check("★ 逐轮字段：所有轮 `replay_saved_next_argmax` == 重放末行的真实 argmax（=63，非 0）",
+          bool(_rn) and all(r["replay_saved_next_argmax"] == 63 for r in _rn),
+          [r.get("replay_saved_next_argmax") for r in _rn])
+    check("★ 逐轮字段：`replay_saved_next_sha`/`shape` 一并记录（可事后核对行身份）",
+          all(isinstance(r.get("replay_saved_next_sha"), str) and len(r["replay_saved_next_sha"]) == 16
+              and r.get("replay_saved_next_shape") == [1, 1, 64] for r in _rn), _rn[:1])
+    check("★ 逐轮 `H_pre` **内容**摘要（不是长度）在重放前后相同",
+          all(r.get("H_pre_content_unchanged") and r["H_pre_sha"]["before"] == r["H_pre_sha"]["after"]
+              for r in ra), ra[:1])
+    _c1 = CC.clone_list_cache_full(diag_a["snap"])
+    _h1 = _cache_sha(_c1)
+    _c1[0]["v"][0, 0, 0, 0] = _c1[0]["v"][0, 0, 0, 0] + 1.0
+    check("★ 内容摘要的**阳性对照**：改一个元素就让摘要改变（否则该检查是空证据）",
+          _cache_sha(_c1)["digest"] != _h1["digest"] and _h1["n_tensors"] == 2, _h1)
+
+    print("== 6) 包装安装 / 异常恢复 / 无全局残留 ==")
     orig = spec_dec.spec_decode_greedy
     meta = install(rebuild=True, capture_len=8, capture_row_at=10)
     check("★ 安装后模块属性被替换，且元数据写明语义", spec_dec.spec_decode_greedy is not orig
