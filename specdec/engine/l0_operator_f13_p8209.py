@@ -192,6 +192,40 @@ def _probe_payload(probes: dict) -> dict:
     return raw, slices
 
 
+def _build_payload(S_p: dict, B_p: dict, *, row_s, row_b, x0_s, x0_b, z_s, z_b) -> dict:
+    """构造落盘 payload（`_run` 与 CPU 自测**共用同一代码路径**，避免"自测没覆盖到 payload"）。
+
+    ⚠️ 首跑/次跑/三跑的教训：这一段的**索引与字段口径**必须由 CPU 门覆盖
+    （`raw_*` 的值是**张量**，不是记录字典；`shape` 要自己取；`exact_equal` 是 bool 不能用 `:<s`）。
+    """
+    raw_s = {k: v["tensor"] for k, v in S_p["probes"]["records"].items() if not v.get("shape_only")}
+    raw_b = {k: v["tensor"] for k, v in B_p["probes"]["records"].items() if not v.get("shape_only")}
+    slices = {}
+    for name, (who, kind) in OP.SPECS.items():
+        if kind == "shape_only":
+            continue
+        a, b, _r = OP.slice_pair(kind, S_p["probes"]["records"][name]["tensor"],
+                                 B_p["probes"]["records"][name]["tensor"], vis=VIS)
+        slices[f"{name}_S"] = a
+        slices[f"{name}_B"] = b
+    return dict(
+        raw_S={k: v.detach().cpu() for k, v in raw_s.items()},
+        raw_B={k: v.detach().cpu() for k, v in raw_b.items()},
+        slices={k: v.detach().cpu() for k, v in slices.items()},
+        cache_pre_S=dict(k=S_p["cache_pre"]["k"].detach().cpu(), v=S_p["cache_pre"]["v"].detach().cpu()),
+        cache_pre_B=dict(k=B_p["cache_pre"]["k"].detach().cpu(), v=B_p["cache_pre"]["v"].detach().cpu()),
+        x0_row_S=x0_s.detach().cpu(), x0_row_B=x0_b.detach().cpu(),
+        L0_output_row_S=z_s.detach().cpu(), L0_output_row_B=z_b.detach().cpu(),
+        final_row_S=row_s.detach().cpu(), final_row_B=row_b.detach().cpu(),
+        cos_row_S=S_p["cos"][0, 0, -1].detach().cpu(), cos_row_B=B_p["cos"][0, 0, 0].detach().cpu(),
+        sin_row_S=S_p["sin"][0, 0, -1].detach().cpu(), sin_row_B=B_p["sin"][0, 0, 0].detach().cpu(),
+        meta=dict(vis=VIS, layer=LAYER, n_raw_S=len(raw_s), n_raw_B=len(raw_b),
+                  shapes={k: [int(x) for x in v.shape] for k, v in raw_s.items()},
+                  shapes_B={k: [int(x) for x in v.shape] for k, v in raw_b.items()}),
+        note="`raw_*` = 探针捕获的完整张量（原始 dtype）；`slices` = 实际比较的语义切片；"
+             "fp32 的 softmax 概率保持 fp32，未强制转 bf16")
+
+
 def _cmp_all(S_p: dict, B_p: dict) -> dict:
     """按口径比较**全部**可比较节点（只比语义对应的决策数据）。"""
     out = {}
@@ -440,31 +474,9 @@ def _run(rec: dict, run_id: str) -> int:
         cls = OP.classify(OP.CHAIN, node_cmp, OP.CHAIN_NODE_OUT)
         rec["first_divergence"] = cls
         # ★ 先把**计算完的比较结果与原始张量落盘**，再做打印/收尾：
-        #   这样即使后续打印或收尾出现缺陷，昂贵的数据也不会丢（两次白付加载的教训）。
-        raw_s, _ = _probe_payload(S["probes"])
-        raw_b, _ = _probe_payload(B["probes"])
-        slices = {}
-        for name, (who, kind) in OP.SPECS.items():
-            if kind == "shape_only":
-                continue
-            a, b, _r = OP.slice_pair(kind, S["probes"]["records"][name]["tensor"],
-                                     B["probes"]["records"][name]["tensor"], vis=VIS)
-            slices[f"{name}_S"] = a.detach().cpu()
-            slices[f"{name}_B"] = b.detach().cpu()
-        payload = dict(
-            raw_S={k: v.detach().cpu() for k, v in raw_s.items()},
-            raw_B={k: v.detach().cpu() for k, v in raw_b.items()},
-            slices=slices,
-            cache_pre_S=dict(k=S["cache_pre"]["k"].detach().cpu(), v=S["cache_pre"]["v"].detach().cpu()),
-            cache_pre_B=dict(k=B["cache_pre"]["k"].detach().cpu(), v=B["cache_pre"]["v"].detach().cpu()),
-            x0_row_S=x0_s.detach().cpu(), x0_row_B=x0_b.detach().cpu(),
-            L0_output_row_S=z_s.detach().cpu(), L0_output_row_B=z_b.detach().cpu(),
-            final_row_S=row_s.detach().cpu(), final_row_B=row_b.detach().cpu(),
-            cos_row_S=S["cos"][0, 0, -1].detach().cpu(), cos_row_B=B["cos"][0, 0, 0].detach().cpu(),
-            sin_row_S=S["sin"][0, 0, -1].detach().cpu(), sin_row_B=B["sin"][0, 0, 0].detach().cpu(),
-            meta=dict(vis=VIS, layer=LAYER, shapes={k: v["layout"]["shape"] for k, v in raw_s.items()}),
-            note="`raw_*` = 探针捕获的完整张量（原始 dtype）；`slices` = 实际比较的语义切片；"
-                 "fp32 的 softmax 概率保持 fp32，未强制转 bf16")
+        #   这样即使后续打印或收尾出现缺陷，昂贵的数据也不会丢（三次白付加载的教训）。
+        payload = _build_payload(S, B, row_s=row_s, row_b=row_b, x0_s=x0_s, x0_b=x0_b,
+                                 z_s=z_s, z_b=z_b)
         tp = _save_pt(payload, run_id)
         rec["artifacts"] = dict(json=str(_write(rec, run_id)), pt=str(tp))
         print("== L0 内部逐算子比较（S/B 对应决策切片）==")
@@ -644,12 +656,15 @@ def _selftest(rec: dict, run_id: str) -> int:
                              p1["B"]["probes"]["records"]["x0"]["tensor"], vis=VIS)
     check("★ 决策行切片：S 取末位行、B 取第 0 行（(hidden,)）",
           list(a.shape) == [32] and list(b.shape) == [32])
-    tp = _save_pt(dict(raw_S={k: v["tensor"] for k, v in p1["S"]["probes"]["records"].items()
-                              if not v.get("shape_only")},
-                       raw_B={k: v["tensor"] for k, v in p1["B"]["probes"]["records"].items()
-                              if not v.get("shape_only")}),
+    tp = _save_pt(_build_payload(p1["S"], p1["B"],
+                                 row_s=p1["S"]["final_row"], row_b=p1["B"]["final_row"],
+                                 x0_s=p1["S"]["probes"]["records"]["x0"]["tensor"][0, -1],
+                                 x0_b=p1["B"]["probes"]["records"]["x0"]["tensor"][0, 0],
+                                 z_s=p1["S"]["probes"]["records"]["layer_output"]["tensor"][0, -1],
+                                 z_b=p1["B"]["probes"]["records"]["layer_output"]["tensor"][0, 0]),
                   run_id, selftest=True)
-    check("★ 落盘流程可跑通（原始 dtype 张量写入 .pt）", tp.exists() and tp.stat().st_size > 0, str(tp))
+    check("★ 落盘 payload 构造与写入可跑通（`_build_payload` 与正式 run 同一代码路径）",
+          tp.exists() and tp.stat().st_size > 0, str(tp))
     print(f"\nL0 算子边界（CPU 门）：PASS {npass} / FAIL {nfail}")
     rec["selftest"] = dict(npass=npass, nfail=nfail,
                            semantics="非真实运行：只验证机制（探针捕获/切片比较/首次分歧分类/开关等价/移除/落盘）",
