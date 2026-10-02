@@ -282,3 +282,11 @@ B6（`SpecDec ids == target-only greedy ids` 且全有限、多轮确定）**仍
 > 而 **N 在 M=4 下效应为 0、在 M=1 下有效** ⇒ **交互成立（双向）**；`raw` 已不同 ⇒ 边界在 **`matmul`** 本身。
 > 该轮**未**研究/修复 `q_proj`（本文档的 `first_divergence_operator` 结论**不变**），
 > 也**未**做 profiler / 未切后端 / 未做 FP32 / 未跑 B6。**B6 状态仍未改变。**
+
+再下一轮做了**因果干预闭环**（把 QK 几何恢复成逐行 `M=1` + 真实 causal 前缀）：
+> `docs/div8209_serial_qk_causal_2026-10-02.md`（报告 §9.57 / 台账 §4.72）——
+> **H1 通过**（QK 第 0 行与 S 路径逐位一致）、**H2 未通过**（L0 输出差异 111 → 61）
+> ⇒ 本文档第 0 节的 **`q_proj` 仍是"最早观测到的边界"**（其差异被 RoPE 吸收，本轮再次实测确认），
+> 而 **L0 内真正"持续到出口"的 shape-sensitive 边界是 `o_proj`**（输入 `heads_merged` 逐位相同、输出 2 个坐标不同）；
+> `softmax` 也有差异但被 `attn.to(bf16)`/AV 那一段吸收。最终 **token 恢复（323=323）但 logits 未逐位一致**
+> ⇒ **token 恢复 ≠ B6 通过**。该轮**未**修 `q_proj`、未做 profiler/FP32、未切后端、未跑 B6。**B6 状态仍未改变。**
