@@ -1,4 +1,4 @@
-"""Dispatch Torch, CUDA C++, and Triton implementations of the four kernels."""
+"""Dispatch Torch, CUDA C++, and Triton kernel implementations."""
 
 from __future__ import annotations
 
@@ -75,94 +75,67 @@ def attention(q, k, v, backend: str = "cuda"):
         return load().attention(q.contiguous(), k.contiguous(), v.contiguous())
     raise ValueError(backend)
 
+
 def paged_attention_decode(
     q,
     layer,
     *,
     backend: str = "cuda",
+    validate: bool = True,
 ):
-    """Direct paged-KV decode attention.
+    """Direct paged-KV q_len=1 CUDA attention.
 
-    v1 scope:
-    - paged_v0 cache only
-    - fp16/base cache only
-    - q_len == 1
-    - CUDA backend only
-    - no K/V materialization
+    v1d keeps the numerical/kernel scope of v1c unchanged but reuses lazily
+    cached device pointer tables.  `validate=False` is a fast-path option for
+    model_self immediately after append_current(), which has already checked
+    the cache; direct external callers should keep the default `True`.
     """
     import torch
 
     from specdec.engine import paged_cache
 
     if backend != "cuda":
-        raise ValueError(
-            "paged_attention_decode v1 supports backend='cuda' only"
-        )
+        raise ValueError("paged_attention_decode v1d supports backend='cuda' only")
 
     if not paged_cache.is_paged_layer(layer):
-        raise TypeError(
-            "paged_attention_decode requires a paged_v0 layer"
-        )
+        raise TypeError("paged_attention_decode requires a paged_v0 layer")
 
-    paged_cache.check_consistent(layer)
+    if validate:
+        paged_cache.check_consistent(layer)
 
     if layer["fmt"] != "fp16":
-        raise ValueError(
-            "paged_attention_decode v1 supports fp16/base cache only"
-        )
+        raise ValueError("paged_attention_decode v1d supports fp16/base cache only")
 
     if not torch.is_tensor(q):
         raise TypeError("q must be a tensor")
-
     if not q.is_cuda:
         raise ValueError("q must be on CUDA")
-
     if q.ndim != 4 or q.shape[2] != 1:
         raise ValueError(
-            f"decode-only q shape must be [B,H,1,D], got {tuple(q.shape)}"
-        )
+            f"decode-only q shape must be [B,H,1,D], got {tuple(q.shape)}")
 
     length = paged_cache.logical_length(layer)
     page_size = int(layer["page_size"])
-
     if length <= 0:
         raise ValueError("paged cache must be non-empty")
 
     k_pages = layer["k_pages"]
     v_pages = layer["v_pages"]
-
     if not k_pages:
         raise ValueError("paged cache has no pages")
 
     first_k = k_pages[0]
     first_v = v_pages[0]
-
     if first_k.dtype != q.dtype or first_v.dtype != q.dtype:
         raise ValueError(
-            f"q/K/V dtype mismatch: {q.dtype}, "
-            f"{first_k.dtype}, {first_v.dtype}"
-        )
-
+            f"q/K/V dtype mismatch: {q.dtype}, {first_k.dtype}, {first_v.dtype}")
     if first_k.device != q.device or first_v.device != q.device:
-        raise ValueError(
-            "q and paged K/V must be on the same CUDA device"
-        )
+        raise ValueError("q and paged K/V must be on the same CUDA device")
 
     kv_heads = int(first_k.shape[1])
-
-    # The CUDA kernel dereferences these device addresses directly.
-    # This is tiny O(number_of_pages) metadata only; K/V payloads
-    # themselves are NOT stacked or materialized.
-    k_ptrs = torch.tensor(
-        [int(page.data_ptr()) for page in k_pages],
-        dtype=torch.int64,
-        device=q.device,
-    )
-
-    v_ptrs = torch.tensor(
-        [int(page.data_ptr()) for page in v_pages],
-        dtype=torch.int64,
-        device=q.device,
+    k_ptrs, v_ptrs = paged_cache.cuda_pointer_tables(
+        layer,
+        validate=False,
     )
 
     from .build import load
