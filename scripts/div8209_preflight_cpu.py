@@ -96,6 +96,40 @@ def _lmhead_section() -> None:
     print("  [lmh-preflight] H/截断/历史一致性/已保存行/锚点/边界事实 全部符合预期 ⇒ 可进入 GPU 运行")
 
 
+def _norm_section() -> None:
+    """最终 Norm 边界工具（`norm_boundary_f13_p8209`）的飞行前检查（纯 CPU、只读）。"""
+    from specdec.engine import norm_boundary_f13_p8209 as N
+    from specdec.engine import lmhead_boundary as LB
+    print("\n================ 最终 Norm 边界工具（位置 8209）================")
+    print(f"  配置：PRE={N.PRE} TARGET={N.TARGET_POS} FEED={N.FEED} CANDS={N.CANDS} "
+          f"REPEAT={N.REPEAT} ROPE={N.TARGET_ROPE}")
+    assert N.DEC_SLOT == 1 and N.ROW_INDEX == 0 and len(N.FEED) == 1
+    assert N.PRE + N.DEC_SLOT == N.TARGET_POS
+    cap = C._load_cap(Path(N.CAP_H))
+    H, t = C._truncate(cap["snapshot_cpu"], N.PRE, "H")
+    print(f"  H：{Path(N.CAP_H).name} {t['source_len']} → {t['pre']} 纯切片={t['is_pure_slice']}")
+    assert t["is_pure_slice"] and C._cache_len(H) == N.PRE
+    if Path(N.CAP_H2).exists():
+        H2, _t2 = C._truncate(C._load_cap(Path(N.CAP_H2))["snapshot_cpu"], N.PRE, "H2")
+        eq = C._cache_bitequal(H, H2, "H_vs_H2")
+        print(f"  H vs 第二份捕获：{eq['n_bitequal']}/{eq['n_tensors']} 逐位相同")
+        assert eq["all_equal"]
+    saved = torch.load(N.SAVED_PT, map_location="cpu")
+    assert "H_AR-S" in saved and "H_AR-B" in saved
+    prev = torch.load(N.LMH_PT, map_location="cpu")
+    keys = sorted(prev.get("rows", {}).keys())
+    print(f"  上一轮 LM head run：{Path(N.LMH_PT).name} rows keys={keys}")
+    assert "HS_1" in keys and "HB_4" in keys, "缺少跨 run 交叉核对所需的行"
+    a_s = C._anchor_ar(N.REF_RUN_AR, N.TARGET_POS)
+    a_b = C._anchor_specdec(N.REF_RUN_RB, N.PRE, N.DEC_SLOT, N.TARGET_POS)
+    print(f"  锚点：S={a_s.get('token')} / B={a_b.get('token')}")
+    assert a_s["token"] == 323 and a_b["token"] == 659
+    ni = LB.code_facts()
+    print(f"  Norm 边界：{ni['boundary']}；表达式 `{ni['projection_expression']}`（源码内确认）")
+    assert ni["source_has_expression"] and ni["source_has_norm_call"]
+    print("  [nb-preflight] H/截断/历史一致/已保存行/跨 run 参考行/锚点/边界事实 全部符合预期 ⇒ 可进入 GPU 运行")
+
+
 def main() -> int:
     print(f"配置：PRE={C.PRE} TARGET={C.TARGET_POS} DEC_SLOT={C.DEC_SLOT} ROW_INDEX={C.ROW_INDEX} "
           f"CTX={C.CTX} FEED={C.FEED} CANDS={C.CANDS} WATCH={C.WATCH}")
@@ -156,6 +190,7 @@ def main() -> int:
         print(f"  {tag}: 真实={a['token']}（{a['source']}）")
     print("[preflight] 四格工具：配置、捕获读取、截断、历史关系、参考适用性、三个锚点全部符合预期")
     _lmhead_section()
+    _norm_section()
     return 0
 
 

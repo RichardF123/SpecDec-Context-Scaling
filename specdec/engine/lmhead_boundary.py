@@ -107,6 +107,60 @@ def _normal_clone(t):
         return t.detach().clone()
 
 
+def norm_info(model) -> dict:
+    """最终 RMSNorm 的实际参数与代码路径（**不复用任何"应该怎样"的假设**）。
+
+    `model_self.RMSNORM.forward`：`orig=x.dtype` → `x32=x.float()` →
+    `mean(x32*x32, dim=-1)` → `x32*rsqrt(var+eps)` → `.to(orig_dtype)` → `weight * normed`
+    ⇒ **fp32 内部归约 + 输出回到输入 dtype**，且是**逐行**运算（归约维是最后一维 hidden）。
+    """
+    n = model.norm
+    w = getattr(n, "weight", None)
+    from . import sb_align as A
+    d = dict(module_class=type(n).__name__, is_model_norm=bool(n is model.norm),
+             eps=(None if getattr(n, "eps", None) is None else float(n.eps)),
+             weight=None if w is None else dict(
+                 shape=[int(x) for x in w.shape], dtype=str(w.dtype), device=str(w.device),
+                 stride=[int(x) for x in w.stride()], is_contiguous=bool(w.is_contiguous()),
+                 id=id(w), data_ptr=int(w.data_ptr()), n_params=int(w.numel()),
+                 digest_subsample=A.stable_sha(w[::7])),
+             code_path=("orig_dtype=x.dtype; x32=x.float(); var=mean(x32*x32,dim=-1,keepdim=True); "
+                        "normed=x32*rsqrt(var+eps); return weight*normed.to(orig_dtype)"),
+             row_wise="归约维是最后一维（hidden）⇒ 每一行的输出只依赖该行输入",
+             note="本模块就是**最终** RMSNorm（`_run` 里 `x = self.norm(x)`）；它同时是权重乘法的输入边")
+    return d
+
+
+def norm_forward(model, x, *, phase: str | None = None) -> tuple:
+    """用**模型现有的** `model.norm` 模块实例计算最终 RMSNorm（**不重写公式**）。
+
+    * 输入 `x` 必须是**原生 dtype**（bf16）且形状 `(1,T,hidden)` 或 `(1,hidden)`；
+      dtype 不一致会**报错**（历史上踩过"拿 fp32 统计副本去投影/Norm"的坑）；
+    * 在 `torch.inference_mode()` 内调用（与 `_run` 的调用环境一致）；
+    * 返回 `(y, meta)`，`y` 是**普通张量**克隆（原始 dtype），`meta` 含输入/输出的 layout。
+    """
+    if not torch.is_tensor(x):
+        raise BoundaryError("norm_forward 只接受张量")
+    w = getattr(model.norm, "weight", None)
+    if w is not None and x.dtype != w.dtype:
+        raise BoundaryError(f"输入 dtype={x.dtype} 与 Norm 权重 dtype={w.dtype} 不一致"
+                            f"（不要拿 fp32 统计副本做 Norm/投影）")
+    if x.dim() not in (2, 3):
+        raise BoundaryError(f"输入维度应为 2 或 3，得到 {list(x.shape)}")
+    ctx = M.attention_phase(phase) if phase else contextlib.nullcontext()
+    with torch.inference_mode(), ctx:
+        y = model.norm(x)
+    if not torch.is_tensor(y):
+        raise BoundaryError("model.norm 未返回张量")
+    if tuple(y.shape) != tuple(x.shape):
+        raise BoundaryError(f"Norm 输出形状与输入不同：{list(y.shape)} vs {list(x.shape)}")
+    meta = dict(input=_layout(x), output=_layout(y), dtype_in=str(x.dtype), dtype_out=str(y.dtype),
+                dtype_preserved=bool(y.dtype == x.dtype),
+                module_class=type(model.norm).__name__,
+                note="调用的是模型**现有** Norm 模块；未改公式、未改 dtype 规则")
+    return _normal_clone(y), meta
+
+
 def install(model, *, enabled: bool = True, tag: str = "cap") -> dict:
     """挂/不挂捕获钩子。**必须在 `finally` / `remove()` 里移除**。
 
@@ -330,6 +384,29 @@ def _selftest() -> int:
     except BoundaryError:
         bad += 1
     check("★ 三维输入不给 `take_row` 时**报错**（而不是猜最后一行）", bad == 1)
+    print("== 5) Norm 边界原语（`norm_info` / `norm_forward`）==")
+    ni = norm_info(m)
+    check("★ `norm_info` 记录实际 weight/eps/dtype/布局，并写明**逐行**与 fp32 内部归约",
+          ni["module_class"] == "RMSNORM" and ni["weight"]["dtype"] == "torch.bfloat16"
+          and ni["weight"]["shape"] == [32] and ni["eps"] is not None
+          and "dim=-1" in ni["code_path"], ni)
+    y2, meta2 = norm_forward(m, y)                       # ★ 用**原始 bf16** 捕获张量
+    check("★ `norm_forward` 用现有模块复算 ⇒ 与捕获的 y **逐位相同**（重放忠实）",
+          bool(torch.equal(y2, y)), meta2)
+    check("★ `norm_forward` 保持原始 dtype（输出 bf16）并记录输入/输出 layout",
+          meta2["dtype_preserved"] and y2.dtype == torch.bfloat16
+          and meta2["output"]["shape"] == [1, 5, 32], meta2)
+    bad = 0
+    try:
+        norm_forward(m, y.float())                       # fp32 统计副本 ⇒ 必须报错
+    except BoundaryError:
+        bad += 1
+    check("★ 传入 fp32（统计副本）时**报错**（不允许悄悄换 dtype 做 Norm）", bad == 1)
+    y4, _m4 = norm_forward(m, torch.cat([y[:, 0:1, :], y[:, 1:4, :]], dim=1))
+    row_wise_obs = bool(torch.equal(y4[0, 0], y[0, 0]))
+    print(f"  [obs] 逐行性（CPU 小模型）：4 行与 1 行两种形状下第 0 行输出逐位相同={row_wise_obs}")
+    check("★ `norm_forward` 对多行输入形状保持 (1,4,32) 且有限",
+          list(y4.shape) == [1, 4, 32] and bool(torch.isfinite(y4).all()))
     print(f"\nLM head 边界捕获（CPU 门）：PASS {np_} / FAIL {nf}")
     return 0 if nf == 0 else 1
 
