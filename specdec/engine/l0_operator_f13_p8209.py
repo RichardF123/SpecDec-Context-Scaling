@@ -137,6 +137,19 @@ def _capture_arm(tgt, H, dev, arm: str, mode: str, tag: str) -> dict:
                 cache_pre=lc["pre"]["cache_pre"], cache_len_before=lc["pre"]["cache_len_before"])
 
 
+def _layer_weight_ptrs(tgt, layer_index: int) -> dict:
+    """L0 七个权重张量的 `data_ptr`（用于证明两条路径用同一批权重、且诊断未替换权重）。"""
+    sa = tgt.layers[layer_index].self_attn
+    mlp = tgt.layers[layer_index].mlp
+    return dict(q_proj_data_ptr=int(sa.q_proj.weight.data_ptr()),
+                k_proj_data_ptr=int(sa.k_proj.weight.data_ptr()),
+                v_proj_data_ptr=int(sa.v_proj.weight.data_ptr()),
+                o_proj_data_ptr=int(sa.o_proj.weight.data_ptr()),
+                gate_data_ptr=int(mlp.gate_proj.weight.data_ptr()),
+                up_data_ptr=int(mlp.up_proj.weight.data_ptr()),
+                down_data_ptr=int(mlp.down_proj.weight.data_ptr()))
+
+
 def main() -> int:
     run_id = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
     rec = dict(run_id=run_id, tool="l0_operator_f13_p8209", family="F13", kv=KV, arm=ARM,
@@ -384,13 +397,7 @@ def _run(rec: dict, run_id: str) -> int:
                 B=(_row_cmp(z_b, chain["rows_B_raw"][0]["output"], "L0out_B_vs_prev")
                    if chain else None)),
             c4_same_L0_weights=dict(
-                q_proj_data_ptr=int(tgt.layers[LAYER].self_attn.q_proj.weight.data_ptr()),
-                k_proj_data_ptr=int(tgt.layers[LAYER].self_attn.k_proj.weight.data_ptr()),
-                v_proj_data_ptr=int(tgt.layers[LAYER].self_attn.v_proj.weight.data_ptr()),
-                o_proj_data_ptr=int(tgt.layers[LAYER].self_attn.o_proj.weight.data_ptr()),
-                gate_data_ptr=int(tgt.layers[LAYER].mlp.gate_proj.weight.data_ptr()),
-                up_data_ptr=int(tgt.layers[LAYER].mlp.up_proj.weight.data_ptr()),
-                down_data_ptr=int(tgt.layers[LAYER].mlp.down_proj.weight.data_ptr()),
+                **_layer_weight_ptrs(tgt, LAYER),
                 note="两条路径用的是**同一个模型实例**的同一批权重张量（data_ptr 相同）"),
             c5_L0_cache_pre_S_vs_B=_row_cmp(cache_s[:, :, :VIS].reshape(-1),
                                             cache_b[:, :, :VIS].reshape(-1), "cacheK_pre_S_vs_B"),
@@ -514,10 +521,10 @@ def _run(rec: dict, run_id: str) -> int:
                                  == rec["W_before"]["digest_subsample"]),
             norm_weight_stable=bool(LB.norm_info(tgt)["weight"]["data_ptr"]
                                     == rec["norm"]["weight"]["data_ptr"]),
-            layer_weights_stable=bool(all(
-                r == controls["c4_same_L0_weights"][r] for r in (
-                    "q_proj_data_ptr", "k_proj_data_ptr", "v_proj_data_ptr", "o_proj_data_ptr",
-                    "gate_data_ptr", "up_data_ptr", "down_data_ptr"))),
+            # ⚠️ 必须**重新读取当前 data_ptr** 再与之前记录的比较；
+            #    首版写成 `all(r == controls[...][r] for r in keys)`（拿**键名**当数据比）⇒ 恒 False 假失败。
+            layer_weights_stable=bool(_layer_weight_ptrs(tgt, LAYER) == {
+                k: v for k, v in controls["c4_same_L0_weights"].items() if k.endswith("data_ptr")}),
             x0_row_unchanged=bool(torch.equal(x0_s,
                                               S["probes"]["records"]["x0"]["tensor"][0, -1])),
             probe_state_now=M.attn_probe_state(),
