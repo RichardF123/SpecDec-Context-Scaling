@@ -1,10 +1,24 @@
 from __future__ import annotations
 import torch
 
+from . import paged_cache
+
 def cache_length(cache):
     if cache is None:
         return 0
+    if not cache:
+        raise RuntimeError("cache must contain at least one layer")
+    if paged_cache.is_paged_layer(cache[0]):
+        return paged_cache.logical_length(cache[0])
     return int(cache[0]["k"].shape[2])
+
+
+def cache_device(cache):
+    if cache is None or not cache:
+        raise ValueError("cache has no device")
+    if paged_cache.is_paged_layer(cache[0]):
+        return paged_cache.layer_device(cache[0])
+    return cache[0]["k"].device
 
 
 def trim_cache(cache, new_len: int):
@@ -20,6 +34,9 @@ def trim_cache(cache, new_len: int):
 
     out = []
     for i, layer in enumerate(cache):
+        if paged_cache.is_paged_layer(layer):
+            out.append(paged_cache.trim_layer(layer, new_len))
+            continue
         nl = {}
         for key, val in layer.items():
             if isinstance(val, torch.Tensor):
@@ -34,6 +51,10 @@ def check_consistent(cache):
         return
     lens = []
     for i, layer in enumerate(cache):
+        if paged_cache.is_paged_layer(layer):
+            paged_cache.check_consistent(layer)
+            lens.append(paged_cache.logical_length(layer))
+            continue
         cur = []
         for key, val in layer.items():
             if isinstance(val, torch.Tensor) and val.dim() >= 3:
