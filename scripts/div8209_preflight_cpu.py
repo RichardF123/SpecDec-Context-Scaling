@@ -20,6 +20,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import sys
 from pathlib import Path
@@ -242,6 +243,40 @@ def _l0op_section() -> None:
     print("  [l0op-preflight] H/截断/历史一致/上一轮 L0 参考/锚点/链与探针表 全部符合预期 ⇒ 可进入 GPU 运行")
 
 
+def _qk2x2_section() -> None:
+    """QKᵀ 2×2 工具（`qk_shape_f13_p8209`）的飞行前检查（纯 CPU、只读）。"""
+    from specdec.engine import qk_shape_f13_p8209 as QT
+    from specdec.engine import qk_shape_2x2 as QK
+    from specdec.engine import model_self as M
+    print("\n================ QKᵀ 2×2 工具（位置 8209）================")
+    print(f"  配置：LAYER={QT.LAYER} PRE={QT.PRE} VIS={QT.VIS} REPEAT={QT.REPEAT} "
+          f"ROPE={QT.TARGET_ROPE}；GQA heads={QK.HEADS} kv_heads={QK.KV_HEADS} "
+          f"head_dim={QK.HEAD_DIM} repeat={QK.HEADS // QK.KV_HEADS}")
+    assert QT.LAYER == 0 and QT.VIS == QK.N_COMMON == QT.PRE + 1
+    assert len(QT.FEED) == 1
+    assert M.attn_probe_state()["active"] is False
+    print(f"  六格：{[list(c) for c in QK.CELLS]}")
+    assert [c[0] for c in QK.CELLS] == ["A", "B", "C", "D", "E", "F"]
+    assert [(c[1], c[2]) for c in QK.CELLS] == [(1, 8209), (1, 8212), (4, 8209), (4, 8212),
+                                                (4, 8209), (4, 8212)]
+    assert (QK.HEAD_DIM ** 0.5) == math.sqrt(QK.HEAD_DIM), "幂与 sqrt 取值不同（需记录）"
+    p = torch.load(QT.L0OPS_PT, map_location="cpu")
+    need = ["q_rope", "k_visible", "qk_scores_pre_mask"]
+    print(f"  上一轮 L0 算子 run：{Path(QT.L0OPS_PT).name}；raw_S 节点数={len(p['raw_S'])}")
+    assert all(k in p["raw_S"] and k in p["raw_B"] for k in need), "缺少固定数据所需的 live 张量"
+    print(f"    q_rope S={tuple(p['raw_S']['q_rope'].shape)} B={tuple(p['raw_B']['q_rope'].shape)}；"
+          f"k_visible S={tuple(p['raw_S']['k_visible'].shape)} B={tuple(p['raw_B']['k_visible'].shape)}")
+    assert tuple(p["raw_S"]["q_rope"].shape) == (1, QK.HEADS, 1, QK.HEAD_DIM)
+    assert tuple(p["raw_B"]["q_rope"].shape) == (1, QK.HEADS, 4, QK.HEAD_DIM)
+    assert tuple(p["raw_S"]["k_visible"].shape) == (1, QK.KV_HEADS, 8209, QK.HEAD_DIM)
+    assert tuple(p["raw_B"]["k_visible"].shape) == (1, QK.KV_HEADS, 8212, QK.HEAD_DIM)
+    cap = C._load_cap(Path(QT.CAP_H))
+    H, t = C._truncate(cap["snapshot_cpu"], QT.PRE, "H")
+    print(f"  H：{Path(QT.CAP_H).name} {t['source_len']} → {t['pre']} 纯切片={t['is_pure_slice']}")
+    assert t["is_pure_slice"] and C._cache_len(H) == QT.PRE
+    print("  [qk2x2-preflight] 配置/六格/幂与 sqrt/上一轮固定数据形状/H 全部符合预期 ⇒ 可进入 GPU 运行")
+
+
 def main() -> int:
     print(f"配置：PRE={C.PRE} TARGET={C.TARGET_POS} DEC_SLOT={C.DEC_SLOT} ROW_INDEX={C.ROW_INDEX} "
           f"CTX={C.CTX} FEED={C.FEED} CANDS={C.CANDS} WATCH={C.WATCH}")
@@ -306,6 +341,7 @@ def main() -> int:
     _layer_section()
     _chain_section()
     _l0op_section()
+    _qk2x2_section()
     return 0
 
 
