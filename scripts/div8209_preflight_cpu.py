@@ -277,6 +277,49 @@ def _qk2x2_section() -> None:
     print("  [qk2x2-preflight] 配置/六格/幂与 sqrt/上一轮固定数据形状/H 全部符合预期 ⇒ 可进入 GPU 运行")
 
 
+def _serial_qk_section() -> None:
+    """QK 逐行 M=1 causal-prefix 因果干预工具（`serial_qk_l0_f13_p8209`）的飞行前检查（纯 CPU、只读）。"""
+    from specdec.engine import serial_qk_l0_f13_p8209 as QT
+    from specdec.engine import serial_causal_qk as SQ
+    from specdec.engine import model_self as M
+    print("\n================ QK 逐行 M=1 因果干预（位置 8209）================")
+    print(f"  配置：LAYER={QT.LAYER} PRE={QT.PRE} VIS={QT.VIS} REPEAT={QT.REPEAT} "
+          f"ROPE={QT.TARGET_ROPE} POISON={QT.POISON_CHECK}；四臂={'S0,B0,B1,S1'}")
+    assert QT.LAYER == 0 and QT.VIS == QT.PRE + 1 and QT.REPEAT >= 2, "四臂与重复次数必须满足判据"
+    assert len(QT.FEED) == 1 and len(QT.CANDS) == 4
+    # 诊断分支必须**默认关闭**，且 API 齐全
+    assert M.serial_qk_state()["active"] is False, "进入实验前诊断分支必须关闭"
+    assert hasattr(M, "serial_qk_for") and hasattr(M, "serial_qk_calls") and hasattr(M, "clear_serial_qk")
+    for fn in ("row_visible", "row_scores", "serial_causal_scores", "classify_h1", "classify_h2",
+               "classify_h3", "classify_h4", "causal_mask"):
+        assert hasattr(SQ, fn), f"serial_causal_qk 缺少 {fn}"
+    # 纯逻辑口径（不加载模型）：p+i+1、占位值有限、mask 恰好覆盖占位列
+    p, s, T = 8208, 4, 8212
+    assert [SQ.row_visible(p, i, T) for i in range(s)] == [8209, 8210, 8211, 8212]
+    m = SQ.causal_mask(s, T, device=torch.device("cpu"))
+    assert all(bool(m[i, SQ.row_visible(p, i, T):].all())
+               and not bool(m[i, :SQ.row_visible(p, i, T)].any()) for i in range(s))
+    print(f"  逐行 causal 口径：visible={[SQ.row_visible(p, i, T) for i in range(s)]}"
+          f"（p={p} s={s} T={T}）✔；mask 恰好覆盖占位列 ✔")
+    # 参考产物齐全（本轮所有"必须复现"控制都依赖它们）
+    qk2x2 = json.loads(Path(QT.QK2X2_JSON).read_text(encoding="utf-8"))
+    coords = qk2x2["attribution"]["observed_A_vs_D"]["coords"]
+    assert len(coords) == 3, f"QK 2×2 结论里的差异坐标数不是 3：{coords}"
+    l0ops = torch.load(QT.L0OPS_PT, map_location="cpu")
+    for k in ("final_row_S", "final_row_B", "L0_output_row_S", "L0_output_row_B", "x0_row_S", "x0_row_B"):
+        assert k in l0ops, f"上一轮 L0 算子 run 缺少 {k}"
+    assert "qk_scores_pre_mask" in l0ops["raw_S"] and "qk_scores_pre_mask" in l0ops["raw_B"]
+    print(f"  参考产物：{Path(QT.L0OPS_PT).name}（S/B 的 final/L0out/x0/QK）+ "
+          f"{Path(QT.QK2X2_JSON).name}（3 坐标 {coords}）✔")
+    cap = C._load_cap(Path(QT.CAP_H))
+    H, t = C._truncate(cap["snapshot_cpu"], QT.PRE, "H")
+    assert t["is_pure_slice"] and C._cache_len(H) == QT.PRE and len(H) == 28
+    print(f"  H：{Path(QT.CAP_H).name} {t['source_len']} → {t['pre']} 纯切片={t['is_pure_slice']}"
+          f"（{len(H)} 层）✔")
+    print("  [sqk-preflight] 配置/默认关闭/API/逐行 causal 口径/mask 覆盖/参考产物/H 全部符合预期 "
+          "⇒ 可进入 GPU 运行")
+
+
 def main() -> int:
     print(f"配置：PRE={C.PRE} TARGET={C.TARGET_POS} DEC_SLOT={C.DEC_SLOT} ROW_INDEX={C.ROW_INDEX} "
           f"CTX={C.CTX} FEED={C.FEED} CANDS={C.CANDS} WATCH={C.WATCH}")
@@ -342,6 +385,7 @@ def main() -> int:
     _chain_section()
     _l0op_section()
     _qk2x2_section()
+    _serial_qk_section()
     return 0
 
 

@@ -42,6 +42,95 @@ def _probe(name: str, t, who) -> None:
         _ATTN_PROBE(name, t, who)
 
 
+# ---------------------------------------------------------------------------
+# 诊断性**因果干预**：QKᵀ 的逐行 M=1 causal-prefix（**默认关闭 = `None`**）
+#
+# 为什么需要它：已证明位置 8209 的 L0 里，`q_proj` 的瞬时差异被 RoPE 吸收，
+# 而 QKᵀ 在 Q/K 输入逐位一致时**重新**产生差异（M=1/N=8209 与 M=4/N=8212 的执行几何不同）。
+# 本轮要判定"把 QK 几何恢复成逐行 M=1 + 真实 causal 前缀"是否足以消除 L0/全层/token 的分歧。
+#
+# 纪律（与探针一致）：
+#   * **默认关闭**：`_SERIAL_QK is None` ⇒ 分支只做两次身份判断，不碰张量 ⇒ 与改动前**逐位等价**；
+#   * 只作用于**显式注册的模块实例**（`id(self)` 命中且同一对象）；
+#   * 注册期间**强引用**这些模块（避免 `id` 复用），退出时（含异常）清空；
+#   * 记录 `seen`（**所有**进入分支的 self_attn，含未注册的）与 `calls`（真正被替换的），
+#     用来证明"干预只作用于 L0、其余 27 层仍走原 block 路径"；
+#   * **不**改公式/dtype/精度/mask/softmax/AV/cache/argmax，**不**先算完整 M=4 再切片。
+# ---------------------------------------------------------------------------
+_SERIAL_QK = None
+
+
+def set_serial_qk(*modules, label: str = "serial_qk") -> dict:
+    """开启逐行 M=1 causal-prefix QK，**只**对给定 `SelfAttention` 模块实例生效。"""
+    global _SERIAL_QK
+    DC_REQ = [m for m in modules]
+    if not DC_REQ:
+        raise ValueError("必须显式给出至少一个 SelfAttention 模块实例")
+    _SERIAL_QK = dict(label=str(label), mods={id(m): m for m in DC_REQ},
+                      seen=[], calls=[])
+    return serial_qk_state()
+
+
+def clear_serial_qk() -> dict:
+    """关闭干预（幂等）。"""
+    global _SERIAL_QK
+    _SERIAL_QK = None
+    return dict(serial_qk_is_none=_SERIAL_QK is None)
+
+
+def serial_qk_state() -> dict:
+    """当前干预状态：是否开启、注册了哪些模块、进入分支/被替换的调用记录。"""
+    if _SERIAL_QK is None:
+        return dict(active=False, n_mods=0, seen_module_ids=[], applied=[],
+                    note="默认关闭 ⇒ QK 走生产原式")
+    calls = _SERIAL_QK["calls"]
+    return dict(active=True, label=_SERIAL_QK["label"], n_mods=len(_SERIAL_QK["mods"]),
+                mods=[dict(module_id=int(k), label=_label_of(v)) for k, v in _SERIAL_QK["mods"].items()],
+                n_seen=len(_SERIAL_QK["seen"]), seen_module_ids=sorted(set(_SERIAL_QK["seen"])),
+                n_applied=len(calls),
+                applied=[dict(module_id=int(id(c["module"])), s=int(c["s"]), T=int(c["T"]),
+                              p=int(c["p"]), visible=list(c["meta"]["visible"]),
+                              contiguous_rows=bool(c["meta"]["contiguous_rows"]))
+                         for c in calls],
+                note="`seen` = 进入该分支的**所有** self_attn（含未注册的，只计数不改计算）；"
+                     "`applied` = 真正被替换为逐行 M=1 的调用")
+
+
+def _label_of(m) -> str:
+    return f"{type(m).__name__}@{hex(id(m))}"
+
+
+@contextlib.contextmanager
+def serial_qk_for(*modules, label: str = "serial_qk"):
+    """`with serial_qk_for(target.layers[0].self_attn): ...` —— 退出（含异常）必定关闭。"""
+    info = set_serial_qk(*modules, label=label)
+    try:
+        yield info
+    finally:
+        clear_serial_qk()
+
+
+def _serial_qk_branch(self, q, k_rep, s: int, T: int):
+    """诊断分支：命中注册模块 ⇒ 逐行 M=1 causal-prefix；否则记为 `seen` 并返回 `None`。"""
+    ent = _SERIAL_QK["mods"].get(id(self))
+    if ent is self:                                   # 同一个对象（防 `id` 复用）
+        from . import serial_causal_qk as SCQ
+        scores, meta = SCQ.serial_causal_scores(q, k_rep, p=T - s, head_dim=self.head_dim)
+        _SERIAL_QK["calls"].append(dict(module=self, s=int(s), T=int(T), p=int(T - s),
+                                        meta=meta, scaled=scores))
+        return scores
+    _SERIAL_QK["seen"].append(int(id(self)))          # 只计数：这些层仍走原 block QK
+    return None
+
+
+def serial_qk_calls() -> list:
+    """诊断用：返回本次注册期间的**原始**调用记录（含每行 raw/scaled 与布局，仍在原设备）。
+
+    ⚠️ 必须在 `with serial_qk_for(...)` **体内**调用（退出后注册表被清空）。
+    """
+    return [] if _SERIAL_QK is None else list(_SERIAL_QK["calls"])
+
+
 class RMSNORM(nn.Module):
     def __init__(self, hidden: int, eps: float = 1e-6):
         super().__init__()
@@ -470,7 +559,13 @@ class SelfAttention(nn.Module):
             _probe("k_repeated", k_rep, self)              # 诊断（默认关闭；只记 shape）
             _probe("v_repeated", v_rep, self)              # 诊断（默认关闭；只记 shape）
             # ---- R1：QK 分数精度。默认（DIAG_QK_FP32=False）与历史**逐位一致** ----
-            if DIAG_QK_FP32:
+            # 诊断性因果干预（**默认关闭**）：`_SERIAL_QK is None` ⇒ `_sq is None`，
+            # 只多一次全局身份判断，下面走的就是**原样的生产表达式**（逐位等价）。
+            _sq = (_serial_qk_branch(self, q, k_rep, s, T)
+                   if (_SERIAL_QK is not None and not DIAG_QK_FP32) else None)
+            if _sq is not None:
+                scores = _sq                                                # 诊断：逐行 M=1 causal-prefix
+            elif DIAG_QK_FP32:
                 scores = torch.matmul(q.float(), k_rep.float().transpose(-2, -1)) / (self.head_dim ** 0.5)
             else:
                 scores = torch.matmul(q, k_rep.transpose(-2, -1)) / (self.head_dim ** 0.5)
