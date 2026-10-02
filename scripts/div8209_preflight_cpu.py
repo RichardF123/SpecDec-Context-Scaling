@@ -167,6 +167,35 @@ def _layer_section() -> None:
     print("  [lyr-preflight] H/截断/历史一致/已保存行/单行参考（Norm 与 LM head）/锚点/边界事实 全部符合预期 ⇒ 可进入 GPU 运行")
 
 
+def _chain_section() -> None:
+    """全层边界工具（`layer_chain_f13_p8209`）的飞行前检查（纯 CPU、只读）。"""
+    from specdec.engine import layer_chain_f13_p8209 as CH
+    print("\n================ 全层边界工具（位置 8209）================")
+    print(f"  配置：PRE={CH.PRE} TARGET={CH.TARGET_POS} FEED={CH.FEED} CANDS={CH.CANDS} "
+          f"REPEAT={CH.REPEAT} ROPE={CH.TARGET_ROPE}")
+    assert CH.DEC_SLOT == 1 and CH.ROW_INDEX == 0 and len(CH.FEED) == 1
+    assert CH.PRE + CH.DEC_SLOT == CH.TARGET_POS
+    cap = C._load_cap(Path(CH.CAP_H))
+    H, t = C._truncate(cap["snapshot_cpu"], CH.PRE, "H")
+    print(f"  H：{Path(CH.CAP_H).name} {t['source_len']} → {t['pre']} 纯切片={t['is_pure_slice']} "
+          f"层数={len(H)}")
+    assert t["is_pure_slice"] and C._cache_len(H) == CH.PRE
+    if Path(CH.CAP_H2).exists():
+        H2, _t2 = C._truncate(C._load_cap(Path(CH.CAP_H2))["snapshot_cpu"], CH.PRE, "H2")
+        eq = C._cache_bitequal(H, H2, "H_vs_H2")
+        print(f"  H vs 第二份捕获：{eq['n_bitequal']}/{eq['n_tensors']} 逐位相同")
+        assert eq["all_equal"]
+    assert Path(CH.SAVED_PT).exists()
+    l27 = torch.load(CH.L27_PT, map_location="cpu")
+    print(f"  上一轮 L27 run 张量：{sorted(k for k in l27 if k.endswith('_raw'))[:6]} ...")
+    assert {"aS_raw", "aB4_raw", "zS_raw", "zB4_raw"} <= set(l27), "缺少跨工具核对所需的 L27 行"
+    a_s = C._anchor_ar(CH.REF_RUN_AR, CH.TARGET_POS)
+    a_b = C._anchor_specdec(CH.REF_RUN_RB, CH.PRE, CH.DEC_SLOT, CH.TARGET_POS)
+    print(f"  锚点：S={a_s.get('token')} / B={a_b.get('token')}")
+    assert a_s["token"] == 323 and a_b["token"] == 659
+    print("  [chain-preflight] H/截断/历史一致/已保存行/L27 跨工具参考/锚点 全部符合预期 ⇒ 可进入 GPU 运行")
+
+
 def main() -> int:
     print(f"配置：PRE={C.PRE} TARGET={C.TARGET_POS} DEC_SLOT={C.DEC_SLOT} ROW_INDEX={C.ROW_INDEX} "
           f"CTX={C.CTX} FEED={C.FEED} CANDS={C.CANDS} WATCH={C.WATCH}")
@@ -229,6 +258,7 @@ def main() -> int:
     _lmhead_section()
     _norm_section()
     _layer_section()
+    _chain_section()
     return 0
 
 

@@ -318,6 +318,96 @@ def layer_forward(model, index: int, x, cos, sin, cache, *, phase: str | None = 
     return _normal_clone(z), _cache_len_of(cache_after), meta
 
 
+@contextlib.contextmanager
+def layer_chain_capture(model, *, indices=None, row_index: int = 0, tag: str = "chain",
+                        want_rope: bool = True):
+    """对**每一层**同时挂 pre/post 只读钩子，只记录**决策行**与元数据（全层边界捕获）。
+
+    * 只保存 `a_row`/`z_row`（`(hidden,)`、**原始 dtype**、在 GPU 上 `detach().clone()`），
+      **不**保存整段 `(1,S,hidden)` 激活；
+    * **不在钩子里做 `.cpu()`**：那会每层引入一次同步、可能改变执行轨迹；`.cpu()` 由调用方在
+      **整个前向结束之后**统一做（数据量很小：28 层 × 2 × 1536 × 2B ≈ 172 KB/条路径）；
+    * 只读：钩子返回 `None`，不改任何张量、不改 cache、不改顺序；
+    * `finally` 里移除全部钩子（异常也会移除）。
+    """
+    idx = list(indices if indices is not None else range(len(model.layers)))
+    rec: dict = dict(tag=tag, indices=[int(i) for i in idx], row_index=int(row_index),
+                     want_rope=bool(want_rope), layers={}, n_pre=0, n_post=0)
+    handles = []
+
+    def mk_pre(i):
+        def hook(module, inputs):
+            rec["n_pre"] += 1
+            ins = list(inputs) + [None, None, None]
+            x, cos, sin, cache = ins[0], ins[1], ins[2], ins[3]
+            d = rec["layers"].setdefault(i, {})
+            row = (x[0, row_index] if (torch.is_tensor(x) and x.dim() == 3) else None)
+            d["pre"] = dict(
+                a_row=(_normal_clone(row) if row is not None else None),
+                a_row_layout=_layout(row),
+                a_shape=([int(v) for v in x.shape] if torch.is_tensor(x) else None),
+                s=(int(x.shape[1]) if torch.is_tensor(x) else None),
+                phase=M.current_attention_phase(),
+                cache_len_before=_cache_len_of(cache),
+                cache_keys=(sorted(cache.keys()) if isinstance(cache, dict) else None),
+                cos_row=((_normal_clone(cos[0, 0, row_index]) if (want_rope and torch.is_tensor(cos)
+                                                                  and cos.dim() == 4) else None)),
+                sin_row=((_normal_clone(sin[0, 0, row_index]) if (want_rope and torch.is_tensor(sin)
+                                                                  and sin.dim() == 4) else None)),
+                module_is_layer=bool(module is model.layers[i]))
+            return None
+        return hook
+
+    def mk_post(i):
+        def hook(module, inputs, output):
+            rec["n_post"] += 1
+            z = output[0] if isinstance(output, (tuple, list)) and output else output
+            cache_after = output[1] if isinstance(output, (tuple, list)) and len(output) > 1 else None
+            row = (z[0, row_index] if (torch.is_tensor(z) and z.dim() == 3) else None)
+            d = rec["layers"].setdefault(i, {})
+            d["post"] = dict(
+                z_row=(_normal_clone(row) if row is not None else None),
+                z_row_layout=_layout(row),
+                z_shape=([int(v) for v in z.shape] if torch.is_tensor(z) else None),
+                cache_len_after=_cache_len_of(cache_after),
+                same_cache_object=(bool(cache_after is inputs[3]) if len(inputs) > 3 else None),
+                phase=M.current_attention_phase())
+            return None
+        return hook
+
+    for i in idx:
+        handles.append(model.layers[i].register_forward_pre_hook(mk_pre(i)))
+    for i in idx:
+        handles.append(model.layers[i].register_forward_hook(mk_post(i)))
+    try:
+        yield rec
+    finally:
+        for h in handles:
+            try:
+                h.remove()
+            except Exception:                                       # noqa: BLE001
+                pass
+
+
+def to_cpu_rows(rec: dict) -> dict:
+    """把链式捕获里的**决策行**统一搬到 CPU（**前向结束之后**才调用）。"""
+    out = {}
+    for i, d in rec["layers"].items():
+        e = {}
+        for k in ("pre", "post"):
+            v = d.get(k)
+            if v is None:
+                e[k] = None
+                continue
+            e[k] = dict(v)
+            for rk in ("a_row", "z_row", "cos_row", "sin_row"):
+                if torch.is_tensor(e[k].get(rk)):
+                    e[k][rk] = e[k][rk].detach().to("cpu")
+        out[i] = e
+    return dict(tag=rec["tag"], indices=rec["indices"], row_index=rec["row_index"],
+                n_pre=rec["n_pre"], n_post=rec["n_post"], layers=out)
+
+
 def install(model, *, enabled: bool = True, tag: str = "cap") -> dict:
     """挂/不挂捕获钩子。**必须在 `finally` / `remove()` 里移除**。
 
@@ -616,6 +706,38 @@ def _selftest() -> int:
     check("★ `embedding_capture` 记录输入 token id 与输出 layout",
           ec["n_calls"] == 1 and ec["ids"] == [int(v) for v in ids.reshape(-1).tolist()]
           and ec["out_layout"]["shape"] == [1, 5, 32], ec.get("ids"))
+    print("== 7) 全层链式捕获（`layer_chain_capture`）==")
+    from . import spec_dec as _SD                       # 自测用：真实单步（会经过 embed_tokens）
+    _tok = int(ids[0, 0])
+    with torch.inference_mode():
+        _lg0, _seed = m._run(m.embed_tokens(torch.randint(0, 64, (1, 3))), None, need_logits=True)
+    _seed_clone = [{k: (v.clone() if torch.is_tensor(v) else v) for k, v in d.items()} for d in _seed]
+    with embedding_capture(m, tag="chain_e") as ce, \
+            layer_chain_capture(m, row_index=0, tag="chain1") as ch:
+        with torch.inference_mode(), M.attention_phase("decode"):
+            _SD._step(m, _tok, _seed_clone)
+    c1 = to_cpu_rows(ch)
+    check("★ 每层 pre/post 各触发 1 次；行形状 (hidden,)、原始 dtype、已搬到 CPU",
+          c1["n_pre"] == len(m.layers) and c1["n_post"] == len(m.layers)
+          and all(tuple(c1["layers"][i]["pre"]["a_row"].shape) == (32,) for i in c1["layers"])
+          and all(str(c1["layers"][i]["pre"]["a_row"].dtype) == "torch.bfloat16"
+                  for i in c1["layers"]))
+    check("★ 边界链自洽：L0 输入行 == embedding 行；layer[i] 输出行 == layer[i+1] 输入行（逐位）",
+          bool(torch.equal(c1["layers"][0]["pre"]["a_row"].to("cpu"), ce["out"][0, 0].detach().to("cpu")))
+          and all(bool(torch.equal(c1["layers"][i]["post"]["z_row"],
+                                   c1["layers"][i + 1]["pre"]["a_row"]))
+                  for i in range(len(m.layers) - 1)))
+    check("★ 钩子在 with 退出后全部移除",
+          all(len(m.layers[i]._forward_pre_hooks) == 0 and len(m.layers[i]._forward_hooks) == 0
+              for i in range(len(m.layers))))
+    try:
+        with layer_chain_capture(m, row_index=0, tag="boom"):
+            raise RuntimeError("注入的链式捕获故障")
+    except RuntimeError:
+        pass
+    check("★ 链式捕获 with 体内抛异常后钩子也全部移除",
+          all(len(m.layers[i]._forward_pre_hooks) == 0 and len(m.layers[i]._forward_hooks) == 0
+              for i in range(len(m.layers))))
     print(f"\nLM head 边界捕获（CPU 门）：PASS {np_} / FAIL {nf}")
     return 0 if nf == 0 else 1
 
