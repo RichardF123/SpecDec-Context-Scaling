@@ -130,6 +130,43 @@ def _norm_section() -> None:
     print("  [nb-preflight] H/截断/历史一致/已保存行/跨 run 参考行/锚点/边界事实 全部符合预期 ⇒ 可进入 GPU 运行")
 
 
+def _layer_section() -> None:
+    """L27 边界工具（`layer_boundary_f13_p8209`）的飞行前检查（纯 CPU、只读）。"""
+    from specdec.engine import layer_boundary_f13_p8209 as LY
+    from specdec.engine import lmhead_boundary as LB
+    print("\n================ L27 边界工具（位置 8209）================")
+    print(f"  配置：LAYER={LY.LAYER} PRE={LY.PRE} TARGET={LY.TARGET_POS} FEED={LY.FEED} "
+          f"CANDS={LY.CANDS} REPEAT={LY.REPEAT} ROPE={LY.TARGET_ROPE}")
+    assert LY.DEC_SLOT == 1 and LY.ROW_INDEX == 0 and len(LY.FEED) == 1
+    assert LY.PRE + LY.DEC_SLOT == LY.TARGET_POS
+    cap = C._load_cap(Path(LY.CAP_H))
+    H, t = C._truncate(cap["snapshot_cpu"], LY.PRE, "H")
+    print(f"  H：{Path(LY.CAP_H).name} {t['source_len']} → {t['pre']} 纯切片={t['is_pure_slice']} "
+          f"层数={len(H)}")
+    assert t["is_pure_slice"] and C._cache_len(H) == LY.PRE
+    if Path(LY.CAP_H2).exists():
+        H2, _t2 = C._truncate(C._load_cap(Path(LY.CAP_H2))["snapshot_cpu"], LY.PRE, "H2")
+        eq = C._cache_bitequal(H, H2, "H_vs_H2")
+        print(f"  H vs 第二份捕获：{eq['n_bitequal']}/{eq['n_tensors']} 逐位相同")
+        assert eq["all_equal"]
+    saved = torch.load(LY.SAVED_PT, map_location="cpu")
+    assert "H_AR-S" in saved and "H_AR-B" in saved
+    nrm = torch.load(LY.NORM_PT, map_location="cpu")
+    nkeys = sorted(nrm.get("proj_rows_raw", {}).keys())
+    lmh = torch.load(LY.LMH_PT, map_location="cpu")
+    lkeys = sorted(lmh.get("rows", {}).keys())
+    print(f"  上一轮 Norm run：proj_rows_raw keys={nkeys}；LM head run：rows keys={lkeys}")
+    assert {"NA", "ND"} <= set(nkeys), "缺少单行尾部参考（NA/ND）"
+    assert {"HS_1", "HB_1"} <= set(lkeys), "缺少单行 LM head 参考（HS_1/HB_1）"
+    a_s = C._anchor_ar(LY.REF_RUN_AR, LY.TARGET_POS)
+    a_b = C._anchor_specdec(LY.REF_RUN_RB, LY.PRE, LY.DEC_SLOT, LY.TARGET_POS)
+    print(f"  锚点：S={a_s.get('token')} / B={a_b.get('token')}")
+    assert a_s["token"] == 323 and a_b["token"] == 659
+    ni = LB.code_facts()
+    assert ni["source_has_expression"] and ni["source_has_norm_call"]
+    print("  [lyr-preflight] H/截断/历史一致/已保存行/单行参考（Norm 与 LM head）/锚点/边界事实 全部符合预期 ⇒ 可进入 GPU 运行")
+
+
 def main() -> int:
     print(f"配置：PRE={C.PRE} TARGET={C.TARGET_POS} DEC_SLOT={C.DEC_SLOT} ROW_INDEX={C.ROW_INDEX} "
           f"CTX={C.CTX} FEED={C.FEED} CANDS={C.CANDS} WATCH={C.WATCH}")
@@ -191,6 +228,7 @@ def main() -> int:
     print("[preflight] 四格工具：配置、捕获读取、截断、历史关系、参考适用性、三个锚点全部符合预期")
     _lmhead_section()
     _norm_section()
+    _layer_section()
     return 0
 
 

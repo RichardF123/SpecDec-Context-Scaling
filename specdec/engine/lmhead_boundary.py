@@ -107,6 +107,34 @@ def _normal_clone(t):
         return t.detach().clone()
 
 
+def _normal_cache_clone(cache):
+    """缓存的**普通张量**深拷贝（保留全部键）——用于"轮前状态"快照。
+
+    ⚠️ **口径**（首版在这里踩过）：`QwenLM._run` 逐层传给 `DecoderLayer` 的是
+    `cache_list[i]`，也就是**单层的 cache dict**（`{"k","v"}`，fp8 时还有 `*_scale`/`fmt`），
+    **不是**整模型的 `list[dict]`。所以这里同时支持两种形态：`dict` 与 `list[dict]`。
+
+    为什么不用 `cache_clone.clone_list_cache_full`：它基于 `copy.deepcopy`（面向 `list[dict]`），
+    对 **inference tensor** 仍会产出 inference tensor；后续若要在 `inference_mode` 之外与普通张量
+    做运算（比较/投影）会报错。这里逐张量 `_normal_clone`，其余键深拷贝。
+    """
+    import copy as _copy
+    if isinstance(cache, dict):
+        return {k: (_normal_clone(v) if torch.is_tensor(v) else _copy.deepcopy(v))
+                for k, v in cache.items()}
+    return [{k: (_normal_clone(v) if torch.is_tensor(v) else _copy.deepcopy(v))
+             for k, v in layer.items()} for layer in cache]
+
+
+def _cache_len_of(cache) -> int | None:
+    """缓存长度（同时支持单层 `dict` 与整模型 `list[dict]`）。"""
+    if cache is None:
+        return None
+    d = cache[0] if isinstance(cache, (list, tuple)) else cache
+    k = d.get("k") if isinstance(d, dict) else None
+    return int(k.shape[2]) if torch.is_tensor(k) else None
+
+
 def norm_info(model) -> dict:
     """最终 RMSNorm 的实际参数与代码路径（**不复用任何"应该怎样"的假设**）。
 
@@ -159,6 +187,135 @@ def norm_forward(model, x, *, phase: str | None = None) -> tuple:
                 module_class=type(model.norm).__name__,
                 note="调用的是模型**现有** Norm 模块；未改公式、未改 dtype 规则")
     return _normal_clone(y), meta
+
+
+def layer_info(model, index: int) -> dict:
+    """第 `index` 层（0 基）的**实际**结构与代码路径（不假定层数、不假定子模块名）。"""
+    lay = model.layers[index]
+    n_layers = len(model.layers)
+    subs = {}
+    for nm in ("input_layernorm", "post_attention_layernorm"):
+        m = getattr(lay, nm, None)
+        w = getattr(m, "weight", None)
+        if w is not None:
+            subs[nm] = dict(shape=[int(x) for x in w.shape], dtype=str(w.dtype),
+                            data_ptr=int(w.data_ptr()), eps=float(getattr(m, "eps", 0.0)))
+    sa = getattr(lay, "self_attn", None)
+    subs["self_attn"] = dict(
+        class_name=(type(sa).__name__ if sa is not None else None),
+        heads=int(getattr(sa, "heads", -1)), kv_heads=int(getattr(sa, "kv_heads", -1)),
+        head_dim=int(getattr(sa, "head_dim", -1)),
+        q_proj_dtype=(str(sa.q_proj.weight.dtype) if sa is not None else None))
+    return dict(index=int(index), n_layers=int(n_layers), is_last=bool(index == n_layers - 1),
+                class_name=type(lay).__name__, submodules=subs,
+                code_path=("atten_out, new_cache = self.self_attn(self.input_layernorm(x), cos, sin, cache); "
+                           "x = x + atten_out; x = x + self.mlp(self.post_attention_layernorm(x)); "
+                           "return x, new_attn_cache"),
+                note="层输入 `x` 就是上一层的输出；最后一层的输出**直接**进入 `self.norm`（`_run` 的下一行）")
+
+
+@contextlib.contextmanager
+def embedding_capture(model, *, tag="embed"):
+    """只读捕获 embedding 的输出与输入 token id（用于核对"对应行"是否同一 token、同一位置）。"""
+    rec: dict = dict(tag=tag, n_calls=0)
+    def hook(module, inputs, output):
+        rec["n_calls"] += 1
+        ids = inputs[0] if inputs else None
+        rec["ids"] = ([int(v) for v in ids.reshape(-1).tolist()] if torch.is_tensor(ids) else None)
+        rec["ids_layout"] = _layout(ids) if torch.is_tensor(ids) else None
+        rec["out"] = _normal_clone(output) if torch.is_tensor(output) else None
+        rec["out_layout"] = _layout(output) if torch.is_tensor(output) else None
+    h = model.embed_tokens.register_forward_hook(hook)
+    try:
+        yield rec
+    finally:
+        h.remove()
+
+
+@contextlib.contextmanager
+def layer_capture(model, index: int, *, tag="layer", clone_cache: bool = True):
+    """在指定层上挂**只读** pre/post 钩子，取「层输入 / cos / sin / **轮前缓存**」与「层输出」。
+
+    ⚠️ **关键纪律**：层的 `forward` 会**就地追加** `cache["k"]/["v"]`（`self_attn` 里
+    `cache["k"] = torch.cat([...], dim=2)`）⇒ "轮前状态"**只能**在 `forward` 执行**之前**取。
+    本函数用 `register_forward_pre_hook` 取**入口**状态并立即做**独立深拷贝**；
+    **不**把 post 钩子里的缓存当作轮前状态（那份已经被追加过）。
+    """
+    rec: dict = dict(tag=tag, index=int(index), n_pre=0, n_post=0, pre=None, post=None)
+    lay = model.layers[index]
+
+    def pre_hook(module, inputs):
+        rec["n_pre"] += 1
+        ins = list(inputs) + [None, None, None]
+        x, cos, sin, cache = ins[0], ins[1], ins[2], ins[3]
+        rec["pre"] = dict(
+            a=(_normal_clone(x) if torch.is_tensor(x) else None), a_layout=_layout(x),
+            cos=(_normal_clone(cos) if torch.is_tensor(cos) else None),
+            sin=(_normal_clone(sin) if torch.is_tensor(sin) else None),
+            cos_layout=_layout(cos), sin_layout=_layout(sin),
+            cache_pre=(_normal_cache_clone(cache) if (clone_cache and cache is not None) else None),
+            cache_len_before=_cache_len_of(cache),
+            phase=M.current_attention_phase(),
+            module_is_layer=bool(module is lay),
+            note="入口状态：`a` 是层输入（= 上一层输出）；`cache_pre` 是**未追加**的独立深拷贝")
+
+    def post_hook(module, inputs, output):
+        rec["n_post"] += 1
+        z = output[0] if isinstance(output, (tuple, list)) and output else output
+        cache_after = output[1] if isinstance(output, (tuple, list)) and len(output) > 1 else None
+        rec["post"] = dict(
+            z=(_normal_clone(z) if torch.is_tensor(z) else None), z_layout=_layout(z),
+            cache_len_after=_cache_len_of(cache_after),
+            same_cache_object=bool(cache_after is inputs[3]) if len(inputs) > 3 else None,
+            phase=M.current_attention_phase(),
+            note="`z` 是层输出；若该层是最后一层，`z` **就是** 随后 `self.norm` 的输入")
+
+    h1 = lay.register_forward_pre_hook(pre_hook)
+    h2 = lay.register_forward_hook(post_hook)
+    try:
+        yield rec
+    finally:
+        h1.remove()
+        h2.remove()
+
+
+def layer_forward(model, index: int, x, cos, sin, cache, *, phase: str | None = None) -> tuple:
+    """用**模型现有的**第 `index` 层做一次前向（**不重写公式**）。
+
+    * `cache` 必须由调用方给出**独立克隆**（本函数会就地追加它）；
+    * 返回 `(z, cache_len_after, meta)`，`z` 是**普通张量**克隆（原始 dtype）；
+    * `meta` 记录：输入/输出 layout、实际 phase、**阶段分流的判定**（引擎纯函数）、
+      期望的掩码可见范围（按 `model_self.py:239-247/415-423` 的规则**由本函数计算并记录**）、缓存长度变化。
+    """
+    if not torch.is_tensor(x):
+        raise BoundaryError("layer_forward 只接受张量输入")
+    if x.dim() != 3:
+        raise BoundaryError(f"层输入应为 (1,T,H)，得到 {list(x.shape)}")
+    w = getattr(getattr(model.layers[index], "self_attn", None), "q_proj", None)
+    if w is not None and x.dtype != w.weight.dtype:
+        raise BoundaryError(f"输入 dtype={x.dtype} 与层权重 dtype={w.weight.dtype} 不一致")
+    s = int(x.shape[1])
+    pre_len = _cache_len_of(cache)
+    T = (s if pre_len is None else pre_len + s)
+    p = T - s
+    path, reason = M.decide_attention_path((phase or "other"), s)
+    ctx = M.attention_phase(phase) if phase else contextlib.nullcontext()
+    with torch.inference_mode(), ctx:
+        z, cache_after = model.layers[index](x, cos, sin, cache)
+    if not torch.is_tensor(z):
+        raise BoundaryError("层未返回张量输出")
+    meta = dict(input=_layout(x), output=_layout(z), dtype_in=str(x.dtype), dtype_out=str(z.dtype),
+                phase=(phase or M.current_attention_phase()), dispatch=dict(path=path, reason=reason),
+                s=s, T=T, p=p,
+                cache_len_before=pre_len, cache_len_after=_cache_len_of(cache_after),
+                cache_is_single_layer_dict=bool(isinstance(cache, dict)),
+                mask_rule=("cache is None ⇒ triu(diagonal=1)" if pre_len is None else
+                           ("s == 1 ⇒ 不加掩码（`elif s == 1: pass`），只可能看到 ≤ 自身位置"
+                            if s == 1 else
+                            f"s > 1 ⇒ triu(diagonal=p+1)（p={p}）⇒ 第 j 行可见 key ≤ p+j")),
+                visible_last_key_row0=((T - 1) if s == 1 else p),
+                source="掩码/分流规则来自 `model_self.py:239-247` 与 `:401-423`（本函数**只读地**照此记录，不参与计算）")
+    return _normal_clone(z), _cache_len_of(cache_after), meta
 
 
 def install(model, *, enabled: bool = True, tag: str = "cap") -> dict:
@@ -407,8 +564,70 @@ def _selftest() -> int:
     print(f"  [obs] 逐行性（CPU 小模型）：4 行与 1 行两种形状下第 0 行输出逐位相同={row_wise_obs}")
     check("★ `norm_forward` 对多行输入形状保持 (1,4,32) 且有限",
           list(y4.shape) == [1, 4, 32] and bool(torch.isfinite(y4).all()))
+    print("== 6) 层边界原语（`layer_info` / `layer_capture` / `layer_forward` / `embedding_capture`）==")
+    M.set_attention_strategy("eager")
+    Llast = len(m.layers) - 1
+    li = layer_info(m, Llast)
+    check("★ `layer_info` 认出最后一层与真实子模块 dtype/形状",
+          li["is_last"] is True and li["n_layers"] == len(m.layers)
+          and li["submodules"]["self_attn"]["q_proj_dtype"] == "torch.bfloat16", li)
+    # 捕获位置：同一前向内挂「L0 + L1(=最后一层) + 最终 norm」三个只读钩子
+    with layer_capture(m, 0, tag="L0") as c0, layer_capture(m, Llast, tag="Llast") as cL, \
+            record(m, tag="norm") as _ni:
+        with torch.inference_mode():
+            lg3, cache3 = m._run(x, None, need_logits=True)
+        norm_cap = take()
+    n_in = norm_cap["caps"][1]["x_in"]
+    check("★ 捕获链逐位成立：L0 输出 == 最后一层输入；最后一层输出 == 最终 Norm 的输入",
+          bool(torch.equal(c0["post"]["z"], cL["pre"]["a"]))
+          and bool(torch.equal(cL["post"]["z"], n_in)), None)
+    check("★ `layer_forward` 的元数据：phase / 阶段分流 / s,T,p / 掩码可见范围 / 缓存长度都有",
+          (lambda meta: meta["phase"] == "decode" and meta["dispatch"]["path"] == "eager"
+           and meta["s"] == 1 and meta["T"] == 1 and meta["cache_len_before"] is None
+           and "triu" in meta["mask_rule"] and meta["visible_last_key_row0"] == 0)(_meta_probe(m, x)),
+          _meta_probe(m, x))
+    check("★ 钩子在 with 退出后已移除（pre/post 两层都回基线）",
+          len(m.layers[Llast]._forward_pre_hooks) == 0 and len(m.layers[Llast]._forward_hooks) == 0)
+    try:
+        with layer_capture(m, Llast, tag="boom"):
+            raise RuntimeError("注入的层捕获故障")
+    except RuntimeError:
+        pass
+    check("★ with 体内抛异常后层钩子仍被移除",
+          len(m.layers[Llast]._forward_pre_hooks) == 0 and len(m.layers[Llast]._forward_hooks) == 0)
+    # 轮前缓存：必须取**入口**状态（post 里的缓存已被就地追加过）
+    x2 = m.embed_tokens(torch.tensor([[7]], device=ids.device))
+    with layer_capture(m, Llast, tag="c") as cc:
+        with torch.inference_mode():
+            _lg4, cache4 = m._run(x2, cache3, need_logits=True)
+    pre = cc["pre"]["cache_pre"]
+    # ⚠️ 口径：层收到/返回的是**单层 cache dict**（`{"k","v"}`），而 `_run` 返回的是 `list[dict]`
+    #    ⇒ 这里 pre 用 `pre["k"]`、模型级用 `cache3[Llast]["k"]`（首版写成 `pre[0]["k"]` 即 KeyError: 0）。
+    _pre_len = _cache_len_of(pre)
+    check("★ 轮前缓存取自 pre 钩子且**未被追加**：长度 = 入口长度，后长度 = 入口+1",
+          _pre_len == cc["pre"]["cache_len_before"]
+          and cc["post"]["cache_len_after"] == cc["pre"]["cache_len_before"] + 1
+          and bool(torch.equal(pre["k"], cache3[Llast]["k"][:, :, :_pre_len]))
+          and cc["post"]["same_cache_object"] is True,
+          (cc["pre"]["cache_len_before"], cc["post"]["cache_len_after"], _pre_len))
+    with embedding_capture(m, tag="e") as ec:
+        with torch.inference_mode():
+            _ = m.embed_tokens(ids)
+    check("★ `embedding_capture` 记录输入 token id 与输出 layout",
+          ec["n_calls"] == 1 and ec["ids"] == [int(v) for v in ids.reshape(-1).tolist()]
+          and ec["out_layout"]["shape"] == [1, 5, 32], ec.get("ids"))
     print(f"\nLM head 边界捕获（CPU 门）：PASS {np_} / FAIL {nf}")
     return 0 if nf == 0 else 1
+
+
+def _meta_probe(model, x) -> dict:
+    """自测用：在**无缓存单步**下调用 `layer_forward`，返回其 meta（只读，不参与分析）。"""
+    L = len(model.layers) - 1
+    cos, sin = M.Build_Rope_cache(model.head_dim, int(x.shape[1]), model.rope_theta,
+                                  x.device, x.dtype, 0)
+    with M.attention_phase("decode"):
+        _z, _c, meta = layer_forward(model, L, x[:, :1, :], cos[:, :, :1, :], sin[:, :, :1, :], None)
+    return meta
 
 
 if __name__ == "__main__":
