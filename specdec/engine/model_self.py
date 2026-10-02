@@ -386,27 +386,68 @@ class SelfAttention(nn.Module):
             else:
                 paged_cache.append_current(cache, k_cur16, qv_cur, vs_cur)
 
-            # H2O v0 reference scorer. This is intentionally outside the
-            # page-aware CUDA kernel: v0 validates policy/retention semantics
-            # before optimizing score collection.
+            # H2O reference scorer.
+            #
+            # q_len == 1:
+            #   returns rank-1 [T] global token mass (legacy H2O v0 API).
+            #
+            # q_len > 1:
+            #   returns rank-2 [S,T] global token mass, one causal row for
+            #   each query.  H2O/SpecDec v2 keeps these rows speculative until
+            #   the round outcome is known; rejected rows never update the
+            #   committed heavy-hitter state.
+            #
+            # This scorer is deliberately outside the page-aware CUDA kernel.
+            # Correctness/state isolation is validated before score collection
+            # is fused into CUDA.
             if self.h2o_capture_scores:
                 if fmt != "fp16":
-                    raise ValueError("H2O v0 score capture supports fp16/base cache only")
-                if s != 1:
-                    raise ValueError("H2O v0 score capture supports q_len=1 decode only")
+                    raise ValueError(
+                        "H2O score capture supports fp16/base paged cache only")
                 if b != 1:
-                    raise ValueError("H2O v0 score capture currently requires batch size 1")
+                    raise ValueError(
+                        "H2O score capture currently requires batch size 1")
+
                 k_score = paged_cache.materialize_k(cache)
-                k_score_rep = kv_repeat(k_score, self.heads // self.kv_heads)
+                k_score_rep = kv_repeat(
+                    k_score, self.heads // self.kv_heads)
                 score_logits = torch.matmul(
                     q.float(), k_score_rep.float().transpose(-2, -1)
                 ) / (self.head_dim ** 0.5)
-                score_prob = torch.softmax(score_logits, dim=-1, dtype=torch.float32)
-                # GQA/global-token adaptation: one scalar importance per
-                # resident token, shared by the layer's paged KV storage.
-                self.h2o_last_score = (
-                    score_prob.mean(dim=(0, 1, 2)).detach().contiguous()
-                )
+
+                T_score = int(k_score.shape[2])
+                if s > 1:
+                    # Same offset-causal visibility as the engine attention:
+                    # query i may see keys <= (T-S)+i.
+                    p_score = T_score - s
+                    mask_score = torch.triu(
+                        torch.ones(
+                            s, T_score,
+                            device=q.device,
+                            dtype=torch.bool,
+                        ),
+                        diagonal=p_score + 1,
+                    )
+                    score_logits = score_logits.masked_fill(
+                        mask_score, float("-inf"))
+
+                score_prob = torch.softmax(
+                    score_logits, dim=-1, dtype=torch.float32)
+
+                if s == 1:
+                    # Preserve the original v0 rank-1 contract exactly.
+                    self.h2o_last_score = (
+                        score_prob.mean(dim=(0, 1, 2))
+                        .detach()
+                        .contiguous()
+                    )
+                else:
+                    # Average batch + query heads, retain one row per query.
+                    self.h2o_last_score = (
+                        score_prob.mean(dim=(0, 1))
+                        .detach()
+                        .contiguous()
+                    )
 
             # PagedAttention v1d: direct CUDA remains single-token BF16 only,
             # and is phase-gated.  SpecDec target verification stays on the
@@ -659,7 +700,7 @@ class QwenLM(nn.Module):
             layer.self_attn.paged_attention_mode = mode
 
     def set_h2o_score_capture(self, enabled: bool) -> None:
-        """Enable/disable H2O v0 reference attention-mass capture."""
+        """Enable/disable H2O reference attention-mass capture."""
         flag = bool(enabled)
         for layer in self.layers:
             layer.self_attn.h2o_capture_scores = flag
@@ -667,7 +708,7 @@ class QwenLM(nn.Module):
                 layer.self_attn.h2o_last_score = None
 
     def pop_h2o_scores(self) -> list[torch.Tensor]:
-        """Return one captured global token-mass vector per decoder layer."""
+        """Return captured global token-mass tensor(s) per decoder layer."""
         out = []
         for index, layer in enumerate(self.layers):
             a = layer.self_attn
