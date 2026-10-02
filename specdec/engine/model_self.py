@@ -108,7 +108,7 @@ _MAX_FALLBACK_LOGGED = 32
 # In particular, `verify` is excluded even when kp == 1 so SpecDec target
 # verification stays on the already-validated materialized/reference path.
 PAGED_ATTENTION_MODES = ("off", "materialized_cuda", "direct_cuda")
-PAGED_DIRECT_PHASES = ("decode", "propose", "repair", "other")
+PAGED_DIRECT_PHASES = ("decode", "propose", "verify", "repair", "other")
 _PAGED_ATTENTION_STATS: dict | None = None
 
 
@@ -377,7 +377,7 @@ class SelfAttention(nn.Module):
             v_cur16 = dequantize_kv_fp8(qv_cur, vs_cur, x.dtype)
         else:
             v_cur16 = v
-        paged_cuda_decode = False
+        paged_cuda_block = False
         if paged_mode:
             if cache_was_none:
                 cache = paged_cache.create_layer_cache(fmt, self.cache_page_size)
@@ -449,25 +449,24 @@ class SelfAttention(nn.Module):
                         .contiguous()
                     )
 
-            # PagedAttention v1d: direct CUDA remains single-token BF16 only,
-            # and is phase-gated.  SpecDec target verification stays on the
-            # materialized/reference path even when kp == 1.
-            paged_cuda_decode = (
+            # FINAL_PAGED_V2_Q1_Q4_VFP8
+            # q_len 1..4 direct page-aware attention for BF16/base and V-FP8.
+            # Prefill remains on the established materialized/fused path.
+            paged_cuda_block = (
                 not cache_was_none
-                and fmt == "fp16"
-                and s == 1
+                and fmt in ("fp16", "v_fp8")
+                and 1 <= s <= 4
                 and q.is_cuda
                 and _ATTENTION_PHASE in PAGED_DIRECT_PHASES
                 and self.paged_attention_mode in ("materialized_cuda", "direct_cuda")
             )
 
-            if paged_cuda_decode and self.paged_attention_mode == "direct_cuda":
-                # Direct page-aware kernel: do not materialize full-history K/V.
+            if paged_cuda_block and self.paged_attention_mode == "direct_cuda":
                 _record_paged_attention("direct_cuda", _ATTENTION_PHASE)
                 k_all = None
                 v_all = None
             else:
-                if paged_cuda_decode and self.paged_attention_mode == "materialized_cuda":
+                if paged_cuda_block and self.paged_attention_mode == "materialized_cuda":
                     _record_paged_attention("materialized_cuda", _ATTENTION_PHASE)
                 else:
                     _record_paged_attention("fallback_materialize", _ATTENTION_PHASE)
@@ -506,10 +505,11 @@ class SelfAttention(nn.Module):
                                self.heads, self.kv_heads, self.head_dim)
         if path == "fused":
             out = _fused_prefill_attention(q, k_all, v_all, self.head_dim)
-        elif paged_cuda_decode:
+        elif paged_cuda_block:
             from specdec.kernels import ops as kernel_ops
             if self.paged_attention_mode == "direct_cuda":
-                out = kernel_ops.paged_attention_decode(q, cache, backend="cuda", validate=False)
+                out = kernel_ops.paged_attention_block(
+                    q, cache, backend="cuda", validate=False)
             elif self.paged_attention_mode == "materialized_cuda":
                 out = kernel_ops.attention(q, k_all, v_all, backend="cuda")
             else:
