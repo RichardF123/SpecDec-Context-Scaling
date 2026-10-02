@@ -3,6 +3,7 @@ from __future__ import annotations
 import torch
 
 from . import spec_cache
+from .model_self import attention_phase
 
 K = 4
 FMT = {"base_bf16": "fp16", "v_fp8": "v_fp8"}
@@ -13,27 +14,35 @@ def _fmt(kv):
 
 
 def _prefill(model, ids):
-    with torch.inference_mode():
+    """Prompt prefill. Explicit phase label keeps attention routing auditable."""
+    with torch.inference_mode(), attention_phase("prefill"):
         lg, cache = model._run(model.embed_tokens(ids), None, need_logits=True)
     return lg, cache
 
 
 def _propose(draft, cache, lg, k_eff, eos_id):
+    """Draft one token at a time; q_len=1 is eligible for direct paged attention."""
     cands = []
     with torch.inference_mode():
         for _ in range(k_eff):
             t = int(lg.reshape(-1, lg.shape[-1])[-1].argmax())
             cands.append(t)
-            lg, cache = draft._run(
-                draft.embed_tokens(torch.tensor([[t]], device=lg.device)),
-                cache, need_logits=True)
+            with attention_phase("propose"):
+                lg, cache = draft._run(
+                    draft.embed_tokens(torch.tensor([[t]], device=lg.device)),
+                    cache, need_logits=True)
             if t == eos_id:
                 break
     return cands, cache, lg
 
 
 def _verify(target, cache, cands):
-    with torch.inference_mode():
+    """Target block verification always stays on the reference/materialized path.
+
+    Even if len(cands) == 1, the phase label `verify` excludes the v1c direct
+    paged-decode kernel.  Multi-token verification is intentionally untouched.
+    """
+    with torch.inference_mode(), attention_phase("verify"):
         lg, cache_blk = target._run(
             target.embed_tokens(
                 torch.tensor([cands], device=spec_cache.cache_device(cache))),
@@ -43,7 +52,8 @@ def _verify(target, cache, cands):
 
 
 def _step(model, token, cache):
-    with torch.inference_mode():
+    """Mismatch repair step; q_len=1 is eligible for direct paged attention."""
+    with torch.inference_mode(), attention_phase("repair"):
         lg, cache = model._run(
             model.embed_tokens(
                 torch.tensor([[token]], device=spec_cache.cache_device(cache))),
@@ -53,7 +63,12 @@ def _step(model, token, cache):
 
 def spec_decode_greedy(target, draft, prompt_ids, max_new_tokens, *, k=K,
                        eos_id=None, target_kv="base_bf16", draft_kv="base_bf16",
-                       log=None):
+                       log=None, return_caches: bool = False):
+    """Greedy speculative decoding.
+
+    `return_caches=False` preserves the historical API.  Tests may request the
+    final caches for strict parity checks without changing normal callers.
+    """
     target.set_kv_format(_fmt(target_kv))
     draft.set_kv_format(_fmt(draft_kv))
 
@@ -113,4 +128,8 @@ def spec_decode_greedy(target, draft, prompt_ids, max_new_tokens, *, k=K,
         if emitted and emitted[-1] == eos_id:
             break
 
-    return {"ids": list(prompt_ids[0]) + gen, "gen": gen, "stats": st}
+    result = {"ids": list(prompt_ids[0]) + gen, "gen": gen, "stats": st}
+    if return_caches:
+        result["target_cache"] = tgt_cache
+        result["draft_cache"] = drf_cache
+    return result
