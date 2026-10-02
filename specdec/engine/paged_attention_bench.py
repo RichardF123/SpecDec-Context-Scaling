@@ -1,44 +1,32 @@
-"""PagedAttention v1c decode benchmark.
+"""PagedAttention v1d repeated decode benchmark.
 
-This is a performance probe, not a correctness gate.
+This benchmark compares identical CUDA attention math under two paged_v0 paths:
+- materialized_cuda: paged K/V -> contiguous materialization -> CUDA attention
+- direct_cuda:       paged K/V -> direct page-aware CUDA attention
 
-It compares identical CUDA attention math under two paged_v0 paths:
-- materialized_cuda:
-    paged K/V -> full contiguous materialization -> existing CUDA attention
-- direct_cuda:
-    paged K/V -> direct page-aware CUDA attention
+v1d adds:
+- repeated measurements with alternating mode order;
+- median/p10/p90 summaries;
+- page-size sweeps;
+- pointer-table build/hit/invalidation statistics;
+- raw and summary CSV output.
 
-Only BF16/base cache and q_len=1 decode are benchmarked.
-
-Examples:
-    # quick
-    python -m specdec.engine.paged_attention_bench \
-      --model small --contexts 128,512,1024 --steps 16
-
-    # fuller
-    python -m specdec.engine.paged_attention_bench \
-      --model small --contexts 256,512,1024,2048 --steps 32 \
-      --page-size 16 --csv paged_attention_bench_small.csv
-
-Notes:
-- Reported latency is whole-model `_run(..., need_logits=False)` decode latency,
-  so it includes all transformer layers but excludes the final LM-head matmul.
-- Prefix construction is not timed.
-- `peak_delta_mib` is additional peak allocated CUDA memory above the
-  post-warmup baseline during timed decode steps.
-- Do not compare these numbers directly with historical runs from a different
-  Torch/CUDA environment.
+Only BF16/base q_len=1 decode is benchmarked. Prefix construction is not timed.
+Do not compare these numbers directly with historical runs from a different
+Torch/CUDA environment.
 """
 from __future__ import annotations
 
 import argparse
 import csv
 import gc
+import statistics
 import time
 from pathlib import Path
 
 import torch
 
+from . import paged_cache
 from .g4_b4_cache_tests import MODEL_SMALL, MODEL_TARGET, load_ours
 from .model_self import (
     attention_phase,
@@ -67,6 +55,19 @@ def _parse_int_csv(value: str) -> list[int]:
     return out
 
 
+def _percentile(values: list[float], p: float) -> float:
+    if not values:
+        raise ValueError("empty percentile input")
+    xs = sorted(float(x) for x in values)
+    if len(xs) == 1:
+        return xs[0]
+    pos = (len(xs) - 1) * p
+    lo = int(pos)
+    hi = min(lo + 1, len(xs) - 1)
+    frac = pos - lo
+    return xs[lo] * (1.0 - frac) + xs[hi] * frac
+
+
 def _build_prefix_cache(model, context: int, *, chunk: int, token_id: int):
     cache = None
     done = 0
@@ -74,16 +75,9 @@ def _build_prefix_cache(model, context: int, *, chunk: int, token_id: int):
         while done < context:
             n = min(chunk, context - done)
             ids = torch.full(
-                (1, n),
-                token_id,
-                dtype=torch.long,
-                device="cuda",
-            )
+                (1, n), token_id, dtype=torch.long, device="cuda")
             _, cache = model._run(
-                model.embed_tokens(ids),
-                cache,
-                need_logits=False,
-            )
+                model.embed_tokens(ids), cache, need_logits=False)
             done += n
     return cache
 
@@ -91,16 +85,9 @@ def _build_prefix_cache(model, context: int, *, chunk: int, token_id: int):
 def _decode_steps(model, cache, *, steps: int, token_id: int):
     with torch.inference_mode(), attention_phase("decode"):
         for _ in range(steps):
-            ids = torch.tensor(
-                [[token_id]],
-                dtype=torch.long,
-                device="cuda",
-            )
+            ids = torch.tensor([[token_id]], dtype=torch.long, device="cuda")
             _, cache = model._run(
-                model.embed_tokens(ids),
-                cache,
-                need_logits=False,
-            )
+                model.embed_tokens(ids), cache, need_logits=False)
     return cache
 
 
@@ -114,51 +101,47 @@ def _run_one(
     warmup: int,
     steps: int,
     token_id: int,
+    repeat: int,
 ):
     model.set_kv_format("fp16")
     model.set_cache_backend("paged_v0", page_size=page_size)
     model.set_paged_attention_mode(mode)
 
     reset_paged_attention_stats()
+    paged_cache.reset_pointer_table_stats()
 
     cache = _build_prefix_cache(
-        model,
-        context,
-        chunk=chunk,
-        token_id=token_id,
-    )
+        model, context, chunk=chunk, token_id=token_id)
 
     if warmup:
         cache = _decode_steps(
-            model,
-            cache,
-            steps=warmup,
-            token_id=token_id,
-        )
+            model, cache, steps=warmup, token_id=token_id)
+
+    # Measure steady state.  Keep already-built pointer tables from warmup but
+    # reset counters so timed-build frequency is visible separately.
+    reset_paged_attention_stats()
+    paged_cache.reset_pointer_table_stats()
 
     torch.cuda.synchronize()
     torch.cuda.reset_peak_memory_stats()
-
     baseline_alloc = torch.cuda.memory_allocated()
 
     start = time.perf_counter()
     cache = _decode_steps(
-        model,
-        cache,
-        steps=steps,
-        token_id=token_id,
-    )
+        model, cache, steps=steps, token_id=token_id)
     torch.cuda.synchronize()
     elapsed = time.perf_counter() - start
 
     peak_alloc = torch.cuda.max_memory_allocated()
     end_alloc = torch.cuda.memory_allocated()
     route = paged_attention_stats()
+    ptr = paged_cache.pointer_table_stats()
 
     result = {
         "mode": mode,
         "context": context,
         "page_size": page_size,
+        "repeat": repeat,
         "warmup": warmup,
         "steps": steps,
         "ms_per_token": elapsed * 1000.0 / steps,
@@ -172,6 +155,9 @@ def _run_one(
         "fallback_materialize_calls": route["fallback_materialize_calls"],
         "direct_decode_calls": route["direct_by_phase"].get("decode", 0),
         "materialized_decode_calls": route["materialized_by_phase"].get("decode", 0),
+        "ptr_table_builds": ptr["builds"],
+        "ptr_table_hits": ptr["hits"],
+        "ptr_table_invalidations": ptr["invalidations"],
     }
 
     del cache
@@ -180,70 +166,123 @@ def _run_one(
     return result
 
 
-def _print_row(model_label: str, row: dict) -> None:
+def _print_raw(model_label: str, row: dict) -> None:
     print(
-        f"[{model_label}] "
+        f"[{model_label}] r={row['repeat']} "
         f"mode={row['mode']:<17} "
-        f"ctx={row['context']:<5} "
-        f"page={row['page_size']:<3} "
+        f"ctx={row['context']:<5} page={row['page_size']:<3} "
         f"lat={row['ms_per_token']:.3f} ms/token "
         f"tok/s={row['tokens_per_sec']:.2f} "
         f"peak_delta={row['peak_delta_mib']:.2f} MiB "
-        f"direct_decode_calls={row['direct_decode_calls']} "
-        f"materialized_decode_calls={row['materialized_decode_calls']}"
+        f"ptr(build/hit/inv)={row['ptr_table_builds']}/"
+        f"{row['ptr_table_hits']}/{row['ptr_table_invalidations']}"
     )
 
 
-def _add_comparison(rows: list[dict]) -> None:
-    grouped = {}
+def _summaries(rows: list[dict]) -> list[dict]:
+    grouped: dict[tuple, list[dict]] = {}
     for row in rows:
-        grouped.setdefault((row["context"], row["page_size"]), {})[row["mode"]] = row
+        key = (row["context"], row["page_size"], row["mode"])
+        grouped.setdefault(key, []).append(row)
 
-    print("\n=== direct_cuda relative to materialized_cuda ===")
-    for key in sorted(grouped):
-        pair = grouped[key]
+    out = []
+    for (context, page_size, mode), group in sorted(grouped.items()):
+        lat = [r["ms_per_token"] for r in group]
+        tps = [r["tokens_per_sec"] for r in group]
+        mem = [r["peak_delta_mib"] for r in group]
+        builds = [r["ptr_table_builds"] for r in group]
+        hits = [r["ptr_table_hits"] for r in group]
+        invalidations = [r["ptr_table_invalidations"] for r in group]
+        out.append({
+            "context": context,
+            "page_size": page_size,
+            "mode": mode,
+            "repeats": len(group),
+            "latency_median_ms": statistics.median(lat),
+            "latency_p10_ms": _percentile(lat, 0.10),
+            "latency_p90_ms": _percentile(lat, 0.90),
+            "tokens_per_sec_median": statistics.median(tps),
+            "peak_delta_mib_median": statistics.median(mem),
+            "ptr_table_builds_median": statistics.median(builds),
+            "ptr_table_hits_median": statistics.median(hits),
+            "ptr_table_invalidations_median": statistics.median(invalidations),
+        })
+    return out
+
+
+def _print_summary(summary: list[dict]) -> None:
+    print("\n=== repeated summary ===")
+    for row in summary:
+        print(
+            f"ctx={row['context']:<5} page={row['page_size']:<3} "
+            f"mode={row['mode']:<17} "
+            f"lat_med={row['latency_median_ms']:.3f} ms "
+            f"p10/p90={row['latency_p10_ms']:.3f}/{row['latency_p90_ms']:.3f} "
+            f"peak_med={row['peak_delta_mib_median']:.2f} MiB "
+            f"ptr_build_med={row['ptr_table_builds_median']:.1f} "
+            f"ptr_hit_med={row['ptr_table_hits_median']:.1f}"
+        )
+
+    by_cfg: dict[tuple[int, int], dict[str, dict]] = {}
+    for row in summary:
+        by_cfg.setdefault((row["context"], row["page_size"]), {})[row["mode"]] = row
+
+    print("\n=== direct_cuda relative to materialized_cuda (median) ===")
+    for key in sorted(by_cfg):
+        pair = by_cfg[key]
         if "materialized_cuda" not in pair or "direct_cuda" not in pair:
             continue
         base = pair["materialized_cuda"]
         direct = pair["direct_cuda"]
-        speedup = base["ms_per_token"] / direct["ms_per_token"]
-        mem_saved = base["peak_delta_mib"] - direct["peak_delta_mib"]
+        ratio = base["latency_median_ms"] / direct["latency_median_ms"]
+        saved = base["peak_delta_mib_median"] - direct["peak_delta_mib_median"]
         print(
             f"ctx={key[0]:<5} page={key[1]:<3} "
-            f"latency_ratio={speedup:.3f}x "
-            f"(>1 means direct is faster), "
-            f"peak_delta_saved={mem_saved:.2f} MiB"
+            f"latency_ratio={ratio:.3f}x (>1 direct faster), "
+            f"peak_delta_saved={saved:.2f} MiB"
         )
+
+
+def _write_csv(path: Path, rows: list[dict]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+        writer.writeheader()
+        writer.writerows(rows)
 
 
 def main() -> int:
     parser = argparse.ArgumentParser()
+    parser.add_argument("--model", choices=("small", "target"), default="small")
     parser.add_argument(
-        "--model",
-        choices=("small", "target"),
-        default="small",
+        "--contexts", type=_parse_int_csv,
+        default=_parse_int_csv("512,1024,2048"),
+        help="comma-separated prefix lengths",
     )
     parser.add_argument(
-        "--contexts",
-        type=_parse_int_csv,
-        default=_parse_int_csv("128,512,1024"),
-        help="comma-separated prefix lengths",
+        "--page-sizes", type=_parse_int_csv, default=None,
+        help="comma-separated page sizes; overrides --page-size",
     )
     parser.add_argument("--page-size", type=int, default=16)
     parser.add_argument("--chunk", type=int, default=128)
     parser.add_argument("--warmup", type=int, default=4)
-    parser.add_argument("--steps", type=int, default=16)
+    parser.add_argument("--steps", type=int, default=32)
+    parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--token-id", type=int, default=42)
-    parser.add_argument("--csv", type=str, default=None)
+    parser.add_argument(
+        "--csv", type=str, default=None,
+        help="summary CSV; a sibling *_raw.csv is also written",
+    )
     args = parser.parse_args()
 
     if not torch.cuda.is_available():
         raise SystemExit("CUDA is required")
     if args.page_size <= 0 or args.chunk <= 0:
         raise SystemExit("page-size and chunk must be positive")
-    if args.steps <= 0 or args.warmup < 0:
-        raise SystemExit("steps must be positive and warmup non-negative")
+    if args.steps <= 0 or args.warmup < 0 or args.repeats <= 0:
+        raise SystemExit("steps/repeats must be positive and warmup non-negative")
 
+    page_sizes = args.page_sizes if args.page_sizes is not None else [args.page_size]
     model_name = MODEL_MAP[args.model]
 
     print("GPU:", torch.cuda.get_device_name(0))
@@ -252,48 +291,58 @@ def main() -> int:
     print(
         "benchmark:",
         f"contexts={args.contexts}",
-        f"page_size={args.page_size}",
+        f"page_sizes={page_sizes}",
         f"chunk={args.chunk}",
         f"warmup={args.warmup}",
         f"steps={args.steps}",
+        f"repeats={args.repeats}",
     )
 
     model, tok = load_ours(model_name)
     vocab_size = int(model.embed_tokens.weight.shape[0])
     if not (0 <= args.token_id < vocab_size):
         raise SystemExit(
-            f"token-id {args.token_id} is outside vocab size {vocab_size}"
-        )
+            f"token-id {args.token_id} is outside vocab size {vocab_size}")
 
     rows = []
-    for context in args.contexts:
-        for mode in ("materialized_cuda", "direct_cuda"):
-            row = _run_one(
-                model,
-                mode=mode,
-                context=context,
-                page_size=args.page_size,
-                chunk=args.chunk,
-                warmup=args.warmup,
-                steps=args.steps,
-                token_id=args.token_id,
-            )
-            row["model"] = model_name
-            row["torch"] = torch.__version__
-            row["gpu"] = torch.cuda.get_device_name(0)
-            rows.append(row)
-            _print_row(args.model, row)
+    for page_size in page_sizes:
+        for context in args.contexts:
+            for repeat in range(args.repeats):
+                # Alternate order to reduce systematic thermal/order bias.
+                modes = (
+                    ("materialized_cuda", "direct_cuda")
+                    if repeat % 2 == 0
+                    else ("direct_cuda", "materialized_cuda")
+                )
+                for mode in modes:
+                    row = _run_one(
+                        model,
+                        mode=mode,
+                        context=context,
+                        page_size=page_size,
+                        chunk=args.chunk,
+                        warmup=args.warmup,
+                        steps=args.steps,
+                        token_id=args.token_id,
+                        repeat=repeat,
+                    )
+                    row["model"] = model_name
+                    row["torch"] = torch.__version__
+                    row["gpu"] = torch.cuda.get_device_name(0)
+                    rows.append(row)
+                    _print_raw(args.model, row)
 
-    _add_comparison(rows)
+    summary = _summaries(rows)
+    _print_summary(summary)
 
     if args.csv:
-        path = Path(args.csv)
-        fieldnames = list(rows[0].keys())
-        with path.open("w", newline="", encoding="utf-8") as f:
-            writer = csv.DictWriter(f, fieldnames=fieldnames)
-            writer.writeheader()
-            writer.writerows(rows)
-        print(f"\nCSV written: {path.resolve()}")
+        summary_path = Path(args.csv)
+        raw_path = summary_path.with_name(
+            summary_path.stem + "_raw" + summary_path.suffix)
+        _write_csv(summary_path, summary)
+        _write_csv(raw_path, rows)
+        print(f"\nSummary CSV written: {summary_path.resolve()}")
+        print(f"Raw CSV written: {raw_path.resolve()}")
 
     del model, tok
     gc.collect()
