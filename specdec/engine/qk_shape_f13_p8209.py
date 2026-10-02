@@ -134,17 +134,27 @@ def _save_pt(payload: dict, run_id: str, selftest: bool = False) -> Path:
     return p
 
 
-def _build_cells(q1, q4_real, k8209, k8212) -> dict:
-    """构造六格并计算 raw/scaled（**只调 matmul + 标量除法**）。"""
+def _build_cells(q1, q4_real, k8209, k8212, *, require_cuda: bool = True) -> dict:
+    """构造六格并计算 raw/scaled（**只调 matmul + 标量除法**）。
+
+    ⚠️ **设备纪律（本轮首跑踩到）**：`op_probe.ProbeCapture.close()` 会把捕获张量搬到 **CPU**
+    ⇒ 若直接用它构造格子，GEMM 会在 **CPU** 上执行，而生产路径在 **CUDA** 上执行
+    ⇒ 即使输入逐位相同，也可能因 kernel/归约差异在 1 ULP 级别不同，**复现门必然失败**。
+    因此正式 run 里必须先把张量**搬回 CUDA**，并在这里**硬断言设备**。
+    """
     cells = {}
     for cell, m_, n_, qk, kk in QK.CELLS:
         q = QK.q_source(qk, q1, q4_real)
         k = QK.k_source(kk, k8209, k8212)
+        if require_cuda:
+            DC.require(q.device.type == "cuda" and k.device.type == "cuda",
+                       f"cell {cell}: Q/K 必须在 CUDA 上（否则是 CPU GEMM，不能代表生产 kernel）",
+                       f"{q.device}/{k.device}")
         DC.require(tuple(q.shape) == (1, QK.HEADS, m_, QK.HEAD_DIM),
                    f"cell {cell}: Q 形状不符", f"{tuple(q.shape)} 期望 (1,{QK.HEADS},{m_},{QK.HEAD_DIM})")
         DC.require(tuple(k.shape) == (1, QK.KV_HEADS, n_, QK.HEAD_DIM),
                    f"cell {cell}: K 形状不符", f"{tuple(k.shape)} 期望 (1,{QK.KV_HEADS},{n_},{QK.HEAD_DIM})")
-        k_rep = QK.k_rep_prod(k) if m_ == 1 or True else None
+        k_rep = QK.k_rep_prod(k)
         raw, scaled = QK.scores_pair(q, k_rep, head_dim=QK.HEAD_DIM)
         DC.require(tuple(raw.shape) == (1, QK.HEADS, m_, n_), f"cell {cell}: raw 形状不符",
                    str(tuple(raw.shape)))
@@ -239,12 +249,30 @@ def _run(rec: dict, run_id: str) -> int:
                             _rb, _ca = spec_dec._verify(tgt, cache, CANDS)
                     pr = capr.close()
                 rec_ = pr["records"]
-                out[arm] = dict(q_rope=rec_["q_rope"]["tensor"], k_visible=rec_["k_visible"]["tensor"],
-                                scores=rec_["qk_scores_pre_mask"]["tensor"],
-                                q_lin=rec_["q_linear"]["tensor"], k_lin=rec_["k_linear"]["tensor"],
+                # ★ 把捕获张量**搬回捕获设备**（`close()` 会把它们搬到 CPU）：
+                #   正式实验必须与生产路径同设备（CUDA）执行同一个 GEMM。
+                d_q = torch.device(rec_["q_rope"]["layout"]["device"])
+                d_k = torch.device(rec_["k_visible"]["layout"]["device"])
+                d_s = torch.device(rec_["qk_scores_pre_mask"]["layout"]["device"])
+                q_c = rec_["q_rope"]["tensor"].to(d_q)
+                k_c = rec_["k_visible"]["tensor"].to(d_k)
+                s_c = rec_["qk_scores_pre_mask"]["tensor"].to(d_s)
+                out[arm] = dict(q_rope=q_c, k_visible=k_c, scores=s_c,
+                                q_lin=rec_["q_linear"]["tensor"].to(d_q),
+                                k_lin=rec_["k_linear"]["tensor"].to(d_k),
                                 q_rope_layout=rec_["q_rope"]["layout"],
                                 k_visible_layout=rec_["k_visible"]["layout"],
                                 scores_layout=rec_["qk_scores_pre_mask"]["layout"],
+                                cpu_capture_device=dict(q=str(rec_["q_rope"]["tensor"].device),
+                                                        k=str(rec_["k_visible"]["tensor"].device),
+                                                        scores=str(rec_["qk_scores_pre_mask"]["tensor"].device)),
+                                device_move_exact=dict(
+                                    q=bool(torch.equal(q_c.cpu(), rec_["q_rope"]["tensor"])),
+                                    k=bool(torch.equal(k_c.cpu(), rec_["k_visible"]["tensor"])),
+                                    scores=bool(torch.equal(s_c.cpu(),
+                                                            rec_["qk_scores_pre_mask"]["tensor"]))),
+                                device_after_move=dict(q=str(q_c.device), k=str(k_c.device),
+                                                       scores=str(s_c.device)),
                                 n_calls=pr["n_calls"], n_kept=pr["n_kept"])
             return out
 
@@ -263,6 +291,11 @@ def _run(rec: dict, run_id: str) -> int:
                          k8209=P1["S"]["k_visible_layout"], k8212=P1["B"]["k_visible_layout"],
                          real_S=P1["S"]["scores_layout"], real_B=P1["B"]["scores_layout"]),
             probe_calls=dict(S=P1["S"]["n_calls"], B=P1["B"]["n_calls"]),
+            device=dict(after_move=dict(S=P1["S"]["device_after_move"], B=P1["B"]["device_after_move"]),
+                        cpu_capture=dict(S=P1["S"]["cpu_capture_device"], B=P1["B"]["cpu_capture_device"]),
+                        move_exact=dict(S=P1["S"]["device_move_exact"], B=P1["B"]["device_move_exact"]),
+                        note="`ProbeCapture.close()` 把张量搬到 CPU；正式实验**搬回 CUDA** 后再算 GEMM，"
+                             "并逐位核对搬回前后数值不变（首跑未搬回 ⇒ 复现门失败，见文档缺陷 ①）"),
             dtypes=dict(q1=str(q1.dtype), k8209=str(k8209.dtype), real_S=str(real_S.dtype)),
             note="live 捕获（生产 S/B 前向 + 只读探针）；原始 dtype/shape/stride/layout 一并记录")
         DC.require(tuple(q1.shape) == (1, QK.HEADS, 1, QK.HEAD_DIM)
@@ -503,7 +536,7 @@ def _selftest(rec: dict, run_id: str) -> int:
     # 真实（合成）S/B scores：用与六格**同一**表达式算出来，保证复现门可通过
     real_S, _ = QK.scores_pair(q1, QK.k_rep_prod(k8209))
     real_B, _ = QK.scores_pair(q4, QK.k_rep_prod(k8212))
-    cells = _build_cells(q1, q4, k8209, k8212)
+    cells = _build_cells(q1, q4, k8209, k8212, require_cuda=False)  # 自测在 CPU 上只验证机制
     cmp_block = _cmp_block(cells, real_S, real_B)
     gate = dict(A_vs_real_S=cmp_block["A_vs_real_S"]["raw"],
                 D_vs_real_B=cmp_block["D_vs_real_B"]["raw"])
@@ -532,12 +565,22 @@ def _selftest(rec: dict, run_id: str) -> int:
           f"（合成随机张量下这些是数据自身的结果，不是结论）")
     # 失败门行为：把 q1 与 q4 第 0 行改成不同 ⇒ 复现门必须失败
     q1_bad = (q1.float() + 1.0).to(torch.bfloat16)
-    cells_bad = _build_cells(q1_bad, q4, k8209, k8212)
+    cells_bad = _build_cells(q1_bad, q4, k8209, k8212, require_cuda=False)
     cmpb = _cmp_block(cells_bad, real_S, real_B)
     gate_bad = dict(A_vs_real_S=cmpb["A_vs_real_S"]["raw"],
                     D_vs_real_B=cmpb["D_vs_real_B"]["raw"])
     check("★ 失败门行为：A 与真实 S 不同 ⇒ 复现门**判否**（工具会停止解释、不重试）",
           QK.expect_fail_gate(gate_bad) is False and cmpb["A_vs_real_S"]["raw"]["exact_equal"] is False)
+    # ★ 设备纪律回归（本轮首跑的缺陷）：CPU 张量必须被 `require_cuda=True` 拦住
+    raised = 0
+    try:
+        _build_cells(q1, q4, k8209, k8212, require_cuda=True)
+    except DC.CheckError:
+        raised += 1
+    check("★ 设备纪律回归：CPU 张量在 `require_cuda=True` 下**报错**（防 CPU GEMM 混入）", raised == 1)
+    check("★ `require_cuda=False` 时可在 CPU 上跑（自测路径），且 raw/scaled 仍分列",
+          all(tuple(_build_cells(q1, q4, k8209, k8212, require_cuda=False)[c]["raw"].shape)
+              == (1, QK.HEADS, m_, n_) for c, m_, n_, _q, _k in QK.CELLS))
     tp = _save_pt(dict(cells={c: dict(raw=cells[c]["raw"], scaled=cells[c]["scaled"])
                              for c in cells},
                        q1=q1, q4_real=q4, k8209=k8209, k8212=k8212,
