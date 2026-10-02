@@ -96,7 +96,7 @@ _ATTENTION_STATS: dict | None = None
 _MAX_FALLBACK_LOGGED = 32
 
 # ---------------------------------------------------------------------------
-# PagedAttention v1c routing/usage statistics.
+# PagedAttention v1d routing/usage statistics.
 #
 # Direct page-aware CUDA is deliberately narrow:
 #   - paged_v0 cache
@@ -382,7 +382,7 @@ class SelfAttention(nn.Module):
             else:
                 paged_cache.append_current(cache, k_cur16, qv_cur, vs_cur)
 
-            # PagedAttention v1c: direct CUDA remains single-token BF16 only,
+            # PagedAttention v1d: direct CUDA remains single-token BF16 only,
             # and is phase-gated.  SpecDec target verification stays on the
             # materialized/reference path even when kp == 1.
             paged_cuda_decode = (
@@ -442,7 +442,7 @@ class SelfAttention(nn.Module):
         elif paged_cuda_decode:
             from specdec.kernels import ops as kernel_ops
             if self.paged_attention_mode == "direct_cuda":
-                out = kernel_ops.paged_attention_decode(q, cache, backend="cuda")
+                out = kernel_ops.paged_attention_decode(q, cache, backend="cuda", validate=False)
             elif self.paged_attention_mode == "materialized_cuda":
                 out = kernel_ops.attention(q, k_all, v_all, backend="cuda")
             else:
