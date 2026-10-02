@@ -320,6 +320,49 @@ def _serial_qk_section() -> None:
           "⇒ 可进入 GPU 运行")
 
 
+def _serial_align_section() -> None:
+    """QK + o_proj 联合对齐工具（`serial_align_l0_f13_p8209`）的飞行前检查（纯 CPU、只读）。"""
+    from specdec.engine import serial_align_l0_f13_p8209 as QT
+    from specdec.engine import serial_align as SA
+    from specdec.engine import model_self as M
+    print("\n================ QK + o_proj 联合对齐（位置 8209）================")
+    plan = [list(p) for p in QT.PLAN]
+    print(f"  配置：LAYER={QT.LAYER} PRE={QT.PRE} VIS={QT.VIS} REPEAT={QT.REPEAT} "
+          f"ROPE={QT.TARGET_ROPE} POISON={QT.POISON_CHECK}；五臂={plan}")
+    assert QT.LAYER == 0 and QT.VIS == QT.PRE + 1 and QT.REPEAT >= 2
+    assert [p[0] for p in plan] == ["S0", "B0", "BQ", "BQO", "S1"], "五臂定义不符"
+    assert [(p[2], p[3]) for p in plan] == [(False, False), (False, False), (True, False),
+                                            (True, True), (True, True)], "两个开关的组合不符"
+    assert M.serial_qk_state()["active"] is False and M.serial_linear_state()["active"] is False
+    for fn in ("set_serial_linear", "clear_serial_linear", "serial_linear_state", "serial_linear_for",
+               "serial_linear_calls"):
+        assert hasattr(M, fn), f"model_self 缺少 {fn}"
+    for fn in ("module_facts", "serial_linear_rows", "chain_persistence", "classify_h2_oproj",
+               "classify_h3_l0", "classify_h4_layers", "classify_h5_final", "mlp_boundary_report"):
+        assert hasattr(SA, fn), f"serial_align 缺少 {fn}"
+    # 上一轮 BQ 参考（本轮控制 3 依赖它）
+    prev = torch.load(QT.PREV_PT, map_location="cpu")
+    pj = json.loads(Path(QT.PREV_JSON).read_text(encoding="utf-8"))
+    need = ("nodes_B1", "rows_B1", "final_row_B1", "norm_row_B1")
+    assert all(k in prev for k in need), f"上一轮 .pt 缺少 {need}"
+    assert pj["H2"]["n_diff"] == 61 and pj["H4"]["logits_n_diff"] == 125439
+    tok = pj["controls"]["B1_final"]["argmax_id"]
+    print(f"  上一轮 BQ 参考：L0 输出 n_diff={pj['H2']['n_diff']}、logits n_diff={pj['H4']['logits_n_diff']}、"
+          f"token={tok}、QK row0 exact={pj['H1']['exact_equal']} ✔")
+    o_proj = pj["controls"]["c9_intervention_only_L0"]["L0_module_id"] if False else None
+    print(f"  本轮要复现的增量：BQ 的 o_proj 决策行在 heads_merged 逐位相同时仍有 2 个差异")
+    l0ops = torch.load(QT.L0OPS_PT, map_location="cpu")
+    for k in ("final_row_S", "final_row_B", "L0_output_row_S", "L0_output_row_B"):
+        assert k in l0ops, f"历史 L0 算子 run 缺少 {k}"
+    cap = C._load_cap(Path(QT.CAP_H))
+    H, t = C._truncate(cap["snapshot_cpu"], QT.PRE, "H")
+    assert t["is_pure_slice"] and C._cache_len(H) == QT.PRE and len(H) == 28
+    print(f"  H：{Path(QT.CAP_H).name} {t['source_len']} → {t['pre']} 纯切片={t['is_pure_slice']}"
+          f"（{len(H)} 层）✔")
+    print("  [sla-preflight] 五臂定义/两个开关组合/默认关闭/API/上一轮 BQ 参考/历史行/H 全部符合预期 "
+          "⇒ 可进入 GPU 运行")
+
+
 def main() -> int:
     print(f"配置：PRE={C.PRE} TARGET={C.TARGET_POS} DEC_SLOT={C.DEC_SLOT} ROW_INDEX={C.ROW_INDEX} "
           f"CTX={C.CTX} FEED={C.FEED} CANDS={C.CANDS} WATCH={C.WATCH}")
@@ -386,6 +429,7 @@ def main() -> int:
     _l0op_section()
     _qk2x2_section()
     _serial_qk_section()
+    _serial_align_section()
     return 0
 
 

@@ -131,6 +131,83 @@ def serial_qk_calls() -> list:
     return [] if _SERIAL_QK is None else list(_SERIAL_QK["calls"])
 
 
+# ---------------------------------------------------------------------------
+# 诊断性**因果干预 ②**：`o_proj` 的逐行 M=1 调用（**默认关闭 = `None`**）
+#
+# 为什么需要它：上一轮把 L0 的 QK 几何恢复成逐行 M=1 后，`heads_merged` 决策行已与 S 路径**逐位相同**，
+# 但 `o_proj` 输出仍有 2 个坐标不同 ⇒ `o_proj` 是本例 L0 中**首个持续到出口**的 shape-sensitive 边界。
+# 本轮把 `self.o_proj(out)` 这一次 M=4 调用换成**四次** M=1 的**同一模块**调用再拼回。
+#
+# 纪律与 `_SERIAL_QK` 完全一致：默认关闭（关闭时只多一次身份判断）、只作用于显式注册的模块实例、
+# 注册期间强引用、退出（含异常）即清空、`seen`/`calls` 分别记录"进入但未注册"与"真正被替换"的次数。
+# ---------------------------------------------------------------------------
+_SERIAL_LINEAR = None
+
+
+def set_serial_linear(*modules, label: str = "serial_linear") -> dict:
+    """开启"逐行 M=1 调用同一 `nn.Linear`"，**只**对给定模块实例生效（如 `layers[0].self_attn.o_proj`）。"""
+    global _SERIAL_LINEAR
+    mods = [m for m in modules]
+    if not mods:
+        raise ValueError("必须显式给出至少一个 nn.Linear 模块实例")
+    _SERIAL_LINEAR = dict(label=str(label), mods={id(m): m for m in mods}, seen=[], calls=[])
+    return serial_linear_state()
+
+
+def clear_serial_linear() -> dict:
+    """关闭该干预（幂等）。"""
+    global _SERIAL_LINEAR
+    _SERIAL_LINEAR = None
+    return dict(serial_linear_is_none=_SERIAL_LINEAR is None)
+
+
+def serial_linear_state() -> dict:
+    if _SERIAL_LINEAR is None:
+        return dict(active=False, n_mods=0, seen_module_ids=[], applied=[],
+                    note="默认关闭 ⇒ Linear 走生产原式的一次调用")
+    calls = _SERIAL_LINEAR["calls"]
+    return dict(active=True, label=_SERIAL_LINEAR["label"], n_mods=len(_SERIAL_LINEAR["mods"]),
+                mods=[dict(module_id=int(k)) for k in _SERIAL_LINEAR["mods"]],
+                n_seen=len(_SERIAL_LINEAR["seen"]), seen_module_ids=sorted(set(_SERIAL_LINEAR["seen"])),
+                n_applied=len(calls),
+                applied=[dict(module_id=int(id(c["module"])), s=int(c["meta"]["s"]),
+                              per_row_input_shapes=list(c["meta"]["per_row_input_shapes"]))
+                         for c in calls],
+                note="`seen` = 进入该分支但**未注册**的 Linear（只计数，仍走原调用）；"
+                     "`applied` = 真正被替换为逐行 M=1 的调用")
+
+
+@contextlib.contextmanager
+def serial_linear_for(*modules, label: str = "serial_linear"):
+    """`with serial_linear_for(target.layers[0].self_attn.o_proj): ...` —— 退出（含异常）必定关闭。"""
+    info = set_serial_linear(*modules, label=label)
+    try:
+        yield info
+    finally:
+        clear_serial_linear()
+
+
+def _serial_linear_branch(mod, x):
+    """诊断分支：命中注册模块 ⇒ 逐行 M=1 调用同一模块；否则记为 `seen` 并返回 `None`。"""
+    ent = _SERIAL_LINEAR["mods"].get(id(mod))
+    if ent is mod:                                    # 同一个对象（防 `id` 复用）
+        from . import serial_align as SA
+        out, meta = SA.serial_linear_rows(mod, x)
+        _SERIAL_LINEAR["calls"].append(dict(module=mod, meta=meta, out=out))
+        return out
+    _SERIAL_LINEAR["seen"].append(int(id(mod)))       # 只计数：这些 Linear 仍走原调用
+    return None
+
+
+def serial_linear_calls() -> list:
+    """诊断用：返回本次注册期间的**原始**调用记录（含逐行元数据与输出）。
+
+    ⚠️ 必须在 `with serial_linear_for(...)` **体内**调用。
+    """
+    return [] if _SERIAL_LINEAR is None else list(_SERIAL_LINEAR["calls"])
+
+
+
 class RMSNORM(nn.Module):
     def __init__(self, hidden: int, eps: float = 1e-6):
         super().__init__()
@@ -617,7 +694,10 @@ class SelfAttention(nn.Module):
             new_cache = cache
         else:
             new_cache = cache
-        op = self.o_proj(out)
+        # 诊断性因果干预 ②（**默认关闭**）：注册的 `o_proj` 改为**逐行 M=1** 调用同一模块再拼回。
+        # 关闭时 `_SERIAL_LINEAR is None` ⇒ 只多一次身份判断，下面走的就是**原样的生产调用**。
+        _sl = (_serial_linear_branch(self.o_proj, out) if _SERIAL_LINEAR is not None else None)
+        op = _sl if _sl is not None else self.o_proj(out)
         _probe("o_proj", op, self)                         # 诊断（默认关闭）
         return op, new_cache
     
