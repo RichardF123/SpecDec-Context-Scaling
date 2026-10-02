@@ -29,6 +29,25 @@ torch::Tensor paged_attention_decode_cuda(
     int64_t page_size,
     int64_t length);
 
+// FINAL_PAGED_V2_Q1_Q4_VFP8
+torch::Tensor paged_attention_block_cuda(
+    torch::Tensor q,
+    torch::Tensor k_ptrs,
+    torch::Tensor v_ptrs,
+    int64_t kv_heads,
+    int64_t page_size,
+    int64_t length);
+
+torch::Tensor paged_attention_vfp8_block_cuda(
+    torch::Tensor q,
+    torch::Tensor k_ptrs,
+    torch::Tensor v_ptrs,
+    torch::Tensor s_ptrs,
+    int64_t kv_heads,
+    int64_t page_size,
+    int64_t length,
+    int64_t scale_groups);
+
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def(
@@ -55,4 +74,13 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "paged_attention_decode",
         &paged_attention_decode_cuda,
         "paged GQA decode attention, q_len=1");
+
+    m.def(
+        "paged_attention_block",
+        &paged_attention_block_cuda,
+        "paged GQA attention, q_len=1..4, BF16/FP32");
+    m.def(
+        "paged_attention_vfp8_block",
+        &paged_attention_vfp8_block_cuda,
+        "paged GQA attention, q_len=1..4, K BF16 + V FP8");
 }
