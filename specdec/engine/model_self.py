@@ -335,6 +335,9 @@ class SelfAttention(nn.Module):
         self.cache_backend = "contiguous"
         self.cache_page_size = paged_cache.DEFAULT_PAGE_SIZE
         self.paged_attention_mode = "off"
+        # H2O v0 reference-score capture. Disabled by default.
+        self.h2o_capture_scores = False
+        self.h2o_last_score = None
         self.fp8_g_k = GROUP_SIZE
         self.fp8_g_v = GROUP_SIZE
         self.fp8_k = True
@@ -342,6 +345,7 @@ class SelfAttention(nn.Module):
 
     def forward(self, x: torch.Tensor, cos, sin, cache = None) -> torch.Tensor:
         cache_was_none = cache is None
+        self.h2o_last_score = None
         cache_is_paged = paged_cache.is_paged_layer(cache)
         if cache is not None and cache_is_paged != (self.cache_backend == "paged_v0"):
             raise ValueError("cache object/backend mismatch; start a fresh cache after switching backend")
@@ -381,6 +385,28 @@ class SelfAttention(nn.Module):
                 paged_cache.append_current(cache, k, v)
             else:
                 paged_cache.append_current(cache, k_cur16, qv_cur, vs_cur)
+
+            # H2O v0 reference scorer. This is intentionally outside the
+            # page-aware CUDA kernel: v0 validates policy/retention semantics
+            # before optimizing score collection.
+            if self.h2o_capture_scores:
+                if fmt != "fp16":
+                    raise ValueError("H2O v0 score capture supports fp16/base cache only")
+                if s != 1:
+                    raise ValueError("H2O v0 score capture supports q_len=1 decode only")
+                if b != 1:
+                    raise ValueError("H2O v0 score capture currently requires batch size 1")
+                k_score = paged_cache.materialize_k(cache)
+                k_score_rep = kv_repeat(k_score, self.heads // self.kv_heads)
+                score_logits = torch.matmul(
+                    q.float(), k_score_rep.float().transpose(-2, -1)
+                ) / (self.head_dim ** 0.5)
+                score_prob = torch.softmax(score_logits, dim=-1, dtype=torch.float32)
+                # GQA/global-token adaptation: one scalar importance per
+                # resident token, shared by the layer's paged KV storage.
+                self.h2o_last_score = (
+                    score_prob.mean(dim=(0, 1, 2)).detach().contiguous()
+                )
 
             # PagedAttention v1d: direct CUDA remains single-token BF16 only,
             # and is phase-gated.  SpecDec target verification stays on the
@@ -528,8 +554,15 @@ class QwenLM(nn.Module):
         self.cache_page_size = paged_cache.DEFAULT_PAGE_SIZE
         self.paged_attention_mode = "off"
 
-    def _run(self,x, cache_list = None, need_logits = True):
-        start_pos = spec_cache.cache_length(cache_list)
+    def _run(self, x, cache_list=None, need_logits=True, start_pos_override: int | None = None):
+        if start_pos_override is None:
+            start_pos = spec_cache.cache_length(cache_list)
+        else:
+            if (not isinstance(start_pos_override, int)
+                    or isinstance(start_pos_override, bool)
+                    or start_pos_override < 0):
+                raise ValueError("start_pos_override must be a non-negative int")
+            start_pos = start_pos_override
         cos, sin = Build_Rope_cache(self.head_dim, seq_len=x.size(1), theta=self.rope_theta, device=x.device, dtype=x.dtype, start_pos=start_pos)
         new_cache_list = []
         for i, layer in enumerate(self.layers):
@@ -624,6 +657,27 @@ class QwenLM(nn.Module):
         self.paged_attention_mode = mode
         for layer in self.layers:
             layer.self_attn.paged_attention_mode = mode
+
+    def set_h2o_score_capture(self, enabled: bool) -> None:
+        """Enable/disable H2O v0 reference attention-mass capture."""
+        flag = bool(enabled)
+        for layer in self.layers:
+            layer.self_attn.h2o_capture_scores = flag
+            if not flag:
+                layer.self_attn.h2o_last_score = None
+
+    def pop_h2o_scores(self) -> list[torch.Tensor]:
+        """Return one captured global token-mass vector per decoder layer."""
+        out = []
+        for index, layer in enumerate(self.layers):
+            a = layer.self_attn
+            value = a.h2o_last_score
+            if value is None:
+                raise RuntimeError(
+                    f"missing H2O score capture for decoder layer {index}")
+            out.append(value)
+            a.h2o_last_score = None
+        return out
 
     def set_fp8_groups(self, k_group: int | None = None, v_group: int | None = None) -> None:
         if k_group is not None:
