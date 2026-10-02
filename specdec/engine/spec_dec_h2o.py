@@ -316,7 +316,19 @@ def _prune_model(
     cache,
     states: list[LayerH2OState],
     config: H2OConfig,
+    *,
+    role: str,
+    round_index: int,
+    seen_after: int,
+    generated_after: int,
+    trace_prune=None,
 ) -> tuple[list[dict], list[LayerH2OState], int, bool]:
+    """Prune one model at a committed round boundary.
+
+    `trace_prune` is an optional audit-only callback.  It receives plain-Python
+    dictionaries and does not participate in selection or state mutation.
+    With trace_prune=None this path is behaviorally identical to v3.
+    """
     if len(cache) != len(states):
         raise RuntimeError("H2O cache/state layer count mismatch")
 
@@ -326,6 +338,39 @@ def _prune_model(
 
     for index, (layer, state) in enumerate(zip(cache, states)):
         before = paged_cache.logical_length(layer)
+
+        # Snapshot the committed state before selection.  This is audit-only.
+        pre_positions = state.positions.detach().cpu().tolist()
+        pre_scores = state.scores.detach().float().cpu().tolist()
+
+        n = len(pre_positions)
+        recent_n = min(config.recent_size, n)
+        old_end = n - recent_n
+        hh_n = min(config.hh_size, old_end)
+
+        heavy_ranked_positions = []
+        heavy_ranked_scores = []
+        if hh_n:
+            heavy_local = torch.topk(
+                state.scores[:old_end],
+                k=hh_n,
+                largest=True,
+                sorted=True,
+            ).indices
+            heavy_ranked_positions = (
+                state.positions.index_select(0, heavy_local)
+                .detach().cpu().tolist()
+            )
+            heavy_ranked_scores = (
+                state.scores.index_select(0, heavy_local)
+                .detach().float().cpu().tolist()
+            )
+
+        recent_positions = (
+            state.positions[old_end:].detach().cpu().tolist()
+            if recent_n else []
+        )
+
         updated, state, keep = prune_committed(
             layer,
             state,
@@ -337,6 +382,35 @@ def _prune_model(
         if keep is not None:
             any_pruned = True
             total_evicted += before - int(keep.numel())
+            keep_local_indices = keep.detach().cpu().tolist()
+        else:
+            keep_local_indices = list(range(before))
+
+        if trace_prune is not None:
+            keep_positions = state.positions.detach().cpu().tolist()
+            keep_set = set(keep_positions)
+            evicted_positions = [
+                p for p in pre_positions if p not in keep_set
+            ]
+            trace_prune(dict(
+                role=role,
+                round=round_index,
+                layer=index,
+                fmt=layer["fmt"],
+                seen_after=seen_after,
+                generated_after=generated_after,
+                resident_before=before,
+                resident_after=paged_cache.logical_length(updated),
+                pruned=keep is not None,
+                pre_positions=pre_positions,
+                pre_scores=pre_scores,
+                keep_local_indices=keep_local_indices,
+                keep_positions=keep_positions,
+                evicted_positions=evicted_positions,
+                heavy_ranked_positions=heavy_ranked_positions,
+                heavy_ranked_scores=heavy_ranked_scores,
+                recent_positions=recent_positions,
+            ))
 
     return new_cache, states, total_evicted, any_pruned
 
@@ -356,6 +430,7 @@ def spec_decode_greedy_h2o(
     target_kv: str = "base_bf16",
     draft_kv: str = "base_bf16",
     log=None,
+    trace_prune=None,
     return_caches: bool = True,
 ) -> dict:
     """Greedy SpecDec with H2O pruning only at committed round boundaries.
@@ -597,11 +672,21 @@ def spec_decode_greedy_h2o(
 
             # At this point caches + H2O states describe only committed tokens.
             # Pruning is finally allowed.
+            # Audit metadata is computed from the already-resolved committed
+            # round.  It cannot affect the selection result.
+            trace_seen_after = seen + len(emitted)
+            trace_generated_after = len(gen) + len(emitted)
+
             target_cache, target_states, target_evicted, target_pruned = (
                 _prune_model(
                     target_cache,
                     target_states,
                     config,
+                    role="target",
+                    round_index=st["rounds"],
+                    seen_after=trace_seen_after,
+                    generated_after=trace_generated_after,
+                    trace_prune=trace_prune,
                 )
             )
             draft_cache, draft_states, draft_evicted, draft_pruned = (
@@ -609,6 +694,11 @@ def spec_decode_greedy_h2o(
                     draft_cache,
                     draft_states,
                     config,
+                    role="draft",
+                    round_index=st["rounds"],
+                    seen_after=trace_seen_after,
+                    generated_after=trace_generated_after,
+                    trace_prune=trace_prune,
                 )
             )
 
