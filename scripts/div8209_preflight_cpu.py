@@ -24,6 +24,8 @@ import os
 import sys
 from pathlib import Path
 
+import torch
+
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
@@ -47,6 +49,51 @@ from specdec.engine import f13_i50_cells as C                     # noqa: E402
 
 # 期望的锚点（真实运行记录里的 argmax；由运行记录本身提供，不硬编码结论）
 EXPECT = dict(H_AR_S=323, H_AR_B=659, H_SP_B=323)
+
+
+def _lmhead_section() -> None:
+    """LM head 边界工具（`lmhead_boundary_f13_p8209`）的飞行前检查（纯 CPU、只读）。"""
+    from specdec.engine import lmhead_boundary_f13_p8209 as L
+    from specdec.engine import lmhead_boundary as LB
+    print("\n================ LM head 边界工具（位置 8209）================")
+    print(f"  配置：PRE={L.PRE} TARGET={L.TARGET_POS} DEC_SLOT={L.DEC_SLOT} "
+          f"ROW_INDEX={L.ROW_INDEX} FEED={L.FEED} CANDS={L.CANDS} REPEAT={L.REPEAT} "
+          f"ROPE={L.TARGET_ROPE}")
+    assert L.DEC_SLOT == 1 and L.ROW_INDEX == 0 and len(L.FEED) == 1
+    assert L.PRE + L.DEC_SLOT == L.TARGET_POS
+    assert L.PRE + 1 + L.ROW_INDEX == L.TARGET_POS
+    # ① H 捕获 + 纯切片截断（与已保存四格同一份）
+    cap = C._load_cap(Path(L.CAP_H))
+    snap = cap["snapshot_cpu"]
+    H, t = C._truncate(snap, L.PRE, "H")
+    print(f"  H：{Path(L.CAP_H).name} 源长={t['source_len']} → {t['pre']} 纯切片={t['is_pure_slice']} "
+          f"层={len(H)} dtype={H[0]['k'].dtype}")
+    assert t["is_pure_slice"] and C._cache_len(H) == L.PRE
+    # ② 第二份捕获（重建历史）在共同前缀上逐位一致
+    if Path(L.CAP_H2).exists():
+        H2, _t2 = C._truncate(C._load_cap(Path(L.CAP_H2))["snapshot_cpu"], L.PRE, "H2")
+        eq = C._cache_bitequal(H, H2, "H_vs_H2")
+        print(f"  H vs 第二份捕获：{eq['n_bitequal']}/{eq['n_tensors']} 逐位相同")
+        assert eq["all_equal"]
+    # ③ 已保存的局部对照行（用于步骤 1 的控制比较）
+    assert Path(L.SAVED_PT).exists(), L.SAVED_PT
+    saved = torch.load(L.SAVED_PT, map_location="cpu")
+    keys = sorted(k for k, v in saved.items() if torch.is_tensor(v))
+    print(f"  已保存对照行：{Path(L.SAVED_PT).name} keys={keys} "
+          f"shapes={ {k: list(saved[k].shape) for k in keys} }")
+    assert "H_AR-S" in keys and "H_AR-B" in keys
+    assert list(saved["H_AR-S"].shape) == [151936]
+    # ④ 锚点（真实运行记录的 argmax）
+    a_s = C._anchor_ar(L.REF_RUN_AR, L.TARGET_POS)
+    a_b = C._anchor_specdec(L.REF_RUN_RB, L.PRE, L.DEC_SLOT, L.TARGET_POS)
+    print(f"  锚点：S={a_s.get('token')}（{a_s.get('source')}） / B={a_b.get('token')}（{a_b.get('source')}）")
+    assert a_s["available"] and a_s["token"] == 323
+    assert a_b["available"] and a_b["token"] == 659
+    # ⑤ 边界事实（源码级）+ 投影取行口径
+    facts = LB.code_facts()
+    assert facts["source_has_expression"] and facts["source_has_norm_call"]
+    print(f"  边界：{facts['boundary']}；表达式 `{facts['projection_expression']}`（源码内确认）")
+    print("  [lmh-preflight] H/截断/历史一致性/已保存行/锚点/边界事实 全部符合预期 ⇒ 可进入 GPU 运行")
 
 
 def main() -> int:
@@ -107,7 +154,8 @@ def main() -> int:
         assert a["available"], (tag, a)
         assert a["token"] == EXPECT[tag], (tag, a["token"], EXPECT[tag])
         print(f"  {tag}: 真实={a['token']}（{a['source']}）")
-    print("[preflight] 配置、捕获读取、截断、历史关系、参考适用性、三个锚点全部符合预期 ⇒ 可进入 GPU 运行")
+    print("[preflight] 四格工具：配置、捕获读取、截断、历史关系、参考适用性、三个锚点全部符合预期")
+    _lmhead_section()
     return 0
 
 
