@@ -401,9 +401,9 @@ class SelfAttention(nn.Module):
             # Correctness/state isolation is validated before score collection
             # is fused into CUDA.
             if self.h2o_capture_scores:
-                if fmt != "fp16":
+                if fmt not in ("fp16", "v_fp8"):
                     raise ValueError(
-                        "H2O score capture supports fp16/base paged cache only")
+                        "H2O score capture supports fp16/base or v_fp8 paged cache only")
                 if b != 1:
                     raise ValueError(
                         "H2O score capture currently requires batch size 1")
