@@ -267,3 +267,19 @@ B6（`SpecDec ids == target-only greedy ids` 且全有限、多轮确定）**仍
 >
 > **纪律**：本轮**不执行**；不做 profiler、不切后端、不改生产默认路径、不做 FP32、
 > **不跑 B6/acceptance/pilot/final**、不外推；新产物用**新 tag**，旧产物（含本轮产物）**一律保留**。
+
+---
+
+## 13. 后续轮次指针（**已完成，不在本文档范围内**）
+
+本文档 §12 的"把干预推广到 `o_proj`"已在下一轮执行，并进一步推进到 **`gate_proj` 的定位**：
+> `docs/div8209_serial_qk_oproj_2026-10-02.md`（报告 §9.58 / 台账 §4.73）——
+> 在保留本轮的 serial-causal QK 之外，再把 L0 的 `self_attn.o_proj` 按行以 **M=1** 调用**同一个 `nn.Linear`**
+> 后 `cat` 拼回（默认关闭、实例级、异常安全），五臂 **S0/B0/BQ/BQO/S1** 比较。
+>
+> 结果：**H2 通过** —— BQO 的 `heads_merged` 与 **`o_proj` 决策行都与 S0 逐位一致**，
+> 本轮 BQ 的 **2 个 `o_proj` 差异被完全消除**，**attention 子块（QK/AV/head merge/o_proj/残差/post-attn RMSNorm）
+> 全部逐位恢复**；**但 H3 仍未通过**：L0 输出差异 **111 → 61 → 21**（`max|Δ|` 恒 1 bf16 ULP）
+> ⇒ **第三个独立边界 = 首个持续边界 `gate_proj`**（`up_proj` 同为其独立边界；两者共用同一输入）。
+> **H5 = 类别 2**：token 恢复 323=323、logits 仍未对齐（`n_diff=129412`）⇒ **token 恢复 ≠ B6 通过**。
+> 该轮**未**改生产默认路径、未做 profiler/FP32、未切后端、未跑 B6。**B6 状态仍未改变。**

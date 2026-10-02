@@ -3582,6 +3582,48 @@ mismatch 轮 `trim` 后把保留区间 `pre..pre+m-1` **逐个单步重放**（�
 其状态以其产物与 `docs/` 报告为准；手册**不**因"未重跑"而标注任何通过或失败。
 
 
+### 4.73 位置 8209：L0 的 **QK + o_proj 联合对齐** = attention 子块闭合、第三处边界 = **`gate_proj`**（2026-10-02）
+
+报告 §9.58；全文 `docs/div8209_serial_qk_oproj_2026-10-02.md`。前置 §4.72（只对齐 QK：H1 通过、L0 111→61）。
+生产路径**未改**；只加**第二个默认关闭**的实例级诊断分支（`serial_linear_for`）；工具**先提交再运行**（`dirty_worktree=false`，commit `39b9342`）。
+
+**唯一目标**：在保留 L0 serial-causal QK 的前提下，把 L0 的 `self_attn.o_proj` 也按行以 **M=1** 调用**同一个 `nn.Linear`**
+再拼回 `(1,4,1536)`，判定 `o_proj`/L0 输出/后续层/最终 logits 能否进一步恢复。**只干预 L0 的 QK 与 o_proj。**
+
+**数据流**：`rows=[self.o_proj(out[:, i:i+1, :]) for i in range(out.shape[1])]; op = torch.cat(rows, dim=1)`
+（每行**实际** `[1,1,1536]`；同一模块/同一权重/`has_bias=False`/bf16；拼接不做算术；不先算 M=4 再切）。
+作用范围：`n_applied=1`（= L0 的 o_proj）、`n_seen=27`（= 其余层）、`seen ∪ applied` = 全部 28 层。
+
+**五臂**：S0 / B0 / **BQ**（只 QK）/ **BQO**（QK+o_proj）/ S1（两开、s=1）；各臂独立克隆同一份 `H(8208)`，**五臂 × 2 pass**。
+
+**结论**：
+* **H2 通过**：BQO 的 `heads_merged` 与 **`o_proj` 决策行都与 S0 逐位一致**（o_proj sha16 同为 `ba484a8bc131b224`）
+  ⇒ 局部闭环；**BQ 的 2 个差异（坐标 `[153]`、`[1519]`）被完全消除**。
+* **H3 未通过**：L0 输出 **111 → 61 → 21**（`max|Δ|` 恒 1 bf16 ULP）；**attention 子块（QK/mask/AV/head merge/o_proj/残差/post-norm）
+  已全部逐位恢复**；**第三个独立边界 = 首个持续边界 `gate_proj`**（全部候选 `['q_proj','softmax','gate_proj','up_proj']`）。
+* **MLP 逐 projection（不合并）**：前提成立（`attention_residual` 与 `post_attention_rmsnorm` 与 S0 逐位相同）；
+  **`gate_proj`（输入逐位相同、输出 4 个坐标不同）是第一个独立边界**，**`up_proj`（同输入、6 个）也是**；
+  `silu`/`gated`/`down`/`residual` 输入已不同 ⇒ 判据无法触发（不判定其独立来源）。
+* **H4**：第 0 层输入逐位相同、输出不同；第 1–27 层**输入已不同** ⇒ 判据**无法触发**（轨迹 21→L1 **851**→…→1050–1348）。
+* **H5 = 类别 2**：logits `n_diff=129412`、`max|Δ|=0.1875`、`mean|Δ|=0.0320`、top-2 margin 两边 `0.0`；
+  **token 恢复（323=323）**；对照 B0（136478/token 659/类别 3）、BQ（125439/类别 2）。**不得**说完整恢复、**不得**宣布 B6 通过。
+
+**控制 20 项全过** + 五臂 × 2 pass 逐位一致 + S0/B0 与历史、BQ 与上一轮产物逐位一致。
+**未证实**：`gate_proj`/`up_proj` 的具体 kernel/tile/归约顺序；`softmax` 差异是被 bf16 回转还是 AV 归约吸收；
+L1–L27 是否有新独立边界；`silu`/`gated`/`down`/`residual` 是否含独立来源；323/659 谁是数学真值（**未** FP32）；不外推。
+**B6 未改变** ⇒ acceptance/pilot/final 仍禁止。
+
+**缺陷（全部保留）**：① 首跑 `stage=crashed`——`_cmp_all_B` 用 **dict 字面量**做口径分派（四个分支全被求值）⇒ 对 3 维张量取 4 个
+索引 `IndexError`，且发生在 **10 次前向跑完之后**（该 run 的 JSON 保留、**无 .pt**）；修正：改 `if/elif` + **把原始张量落盘提前到
+"捕获之后、任何比较之前"**（commit `39b9342`）；② 只读汇总首跑一个键名错误（未消耗 GPU）。**GPU 进程 2 次**（1 次自身缺陷 + 1 次完整）。
+**工具**：`serial_align.py`（CPU 门 19/0）、`serial_align_l0_f13_p8209.py`（CPU 门 14/0）、
+只读汇总 `scripts/serialalign8209_verdict_cpu.py`（13 项核对全 True）；`model_self.py` 加默认关闭的 `serial_linear_for`；
+`scripts/div8209_preflight_cpu.py` 增 1 节。
+**产物**：`output/g5/attn/div8209_sla_20261002T192540Z.{json,pt}`、`serialalign8209_verdict_cpu_20261002T192933Z.json`；
+保留的失败 run：`div8209_sla_20261002T192404Z.json`。
+**下一步（未执行）**：把同一逐行 M=1 干预推广到 `gate_proj` 与 `up_proj`，看 L0 是否完全恢复。
+
+
 ### 4.72 位置 8209：L0 QK 的**逐行 M=1 causal-prefix 因果干预** = QK 是真实来源、但**不是唯一**（2026-10-02）
 
 报告 §9.57；全文 `docs/div8209_serial_qk_causal_2026-10-02.md`。前置 §4.71（QK 2×2：归因 M，与 N 双向交互）。

@@ -4016,6 +4016,75 @@ AR 历史下 6702=20.125、6652=20.0 ⇒ 6702（**历史差异把 6652 挪了 1 
 
 ---
 
+## 9.58 位置 8209：L0 的 **QK + o_proj 联合对齐** —— attention 子块闭合、第三处边界 = **`gate_proj`**（2026-10-02）
+
+> 全文 `docs/div8209_serial_qk_oproj_2026-10-02.md`；台账 §4.73。前置 §9.57（只对齐 QK：H1 通过、L0 111→61）。
+> **只干预 L0 的 QK 与 L0 的 `self_attn.o_proj`**：在保留 serial-causal QK 的基础上，把 `self.o_proj(out)`
+> 这一次 M=4 调用换成**四次** M=1 的**同一 `nn.Linear`** 调用再 `cat(dim=1)` 拼回；其余算子一律不变。
+> 工具**先提交再运行**（`dirty_worktree=false`，commit `39b9342`）。**B6 状态未改变。**
+
+### 9.58.1 数据流与作用范围
+
+`rows=[self.o_proj(out[:, i:i+1, :]) for i in range(out.shape[1])]; op = torch.cat(rows, dim=1)`
+—— 每行**实际**以 `[1,1,1536]` 调用同一模块（同一权重、`has_bias=False`、bf16），拼接不做额外算术。
+`nn.Linear.forward` 对 >2 维输入做 `reshape(-1, in_features)` ⇒ 第 0 行与 S0 那次调用同形状同布局。
+作用范围：`serial_linear_for(L0.self_attn.o_proj)`（默认关闭、实例级、异常安全）；实测 `n_applied=1`（= L0 的 o_proj）、
+`n_seen=27`（= 其余层的 o_proj）、`seen ∪ applied` = 全部 28 层。
+
+### 9.58.2 五臂与 H1–H5
+
+五臂：**S0**（`[20642]`，两开关关）/ **B0**（`[20642,659,576,4531]`，两关）/ **BQ**（只 QK 开）/
+**BQO**（QK + o_proj 开）/ **S1**（同 S0 输入、两开关开）；各臂独立克隆同一份 `H(8208)`，**五臂 × 2 pass**。
+
+* **H1 通过**：S0/B0 逐位复现历史；**BQ ≡ 上一轮 QK-only 干预**（29 节点 + 28 层行 + final + L0 输出全逐位）；**S1 ≡ S0**。
+* **H2 通过**：BQO 的 `heads_merged` 与 **`o_proj` 决策行都与 S0 逐位一致**（`o_proj` sha16 同为 `ba484a8bc131b224`）
+  ⇒ 局部闭环；**BQ 的 2 个差异（坐标 `[153]`、`[1519]`）被完全消除**。
+* **H3 未通过**：L0 输出 **`111 → 61 → 21`**（`max|Δ|` 恒 `0.00390625` = 1 bf16 ULP）
+  ⇒ **第三个独立边界 = 首个持续边界 `gate_proj`**（全部候选 `['q_proj','softmax','gate_proj','up_proj']`）。
+* **H4**：第 0 层输入逐位相同、输出不同（分歧源自 L0 内部）；第 1–27 层**输入已不同** ⇒ 判据**无法触发**
+  （轨迹 21 → L1 **851** → … → 1050–1348 平台；B0 对照平台 1294–1377）。
+* **H5 = 类别 2**：logits `n_diff=129412`、`max|Δ|=0.1875`、`mean|Δ|=0.0320`、top-2 margin 两边都是 `0.0`；
+  **token 恢复（323 = 323）**；对照 B0（136478、token 659、类别 3）与 BQ（125439、类别 2）。
+
+### 9.58.3 L0 逐算子（S0vsBQO | S0vsBQ | S0vsB0 的 n_diff）
+
+`input_rmsnorm` 0|0|0 → **`q_proj` 2|2|2** → `rope_q` **0**|0|0（吸收）→ k/v 全 0 →
+**`qk_matmul_scale` 0|0|3** → `causal_mask` 0|0|3 → **`softmax` 38924|38924|55343** → `attn_times_v` **0**|0|2（吸收）→
+`head_merge` **0**|0|2 → **`o_proj` 0|2|9** → `attention_residual` **0**|1|4 → `post_attn_rmsnorm` **0**|1|4 →
+**`gate_proj` 4|68|247** → **`up_proj` 6|86|318** → `silu` 2|64|232 → `gated` 8|142|503 → `down_proj` 43|125|203 →
+**`layer_output` 21|61|111`**。
+⇒ **attention 子块（QK/mask/AV/head merge/o_proj/残差/post-norm）已全部逐位恢复**。
+
+### 9.58.4 MLP 边界（逐 projection，**不**合并成"MLP 不同"）
+
+前提成立：`attention_residual` 与 `post_attention_rmsnorm` 与 S0 **逐位相同**。逐个判定：
+**`gate_proj`（输入逐位相同、输出 4 个坐标不同）= 第一个独立边界**；**`up_proj`（同输入、输出 6 个不同）也是独立边界**；
+`silu`/`gated`/`down`/`mlp_residual` 的输入**已经不同** ⇒ 严格判据无法触发（**不**判定其独立来源）。
+⇒ **MLP 的 BF16 Linear 同样存在独立的 M=1/M=4 形状敏感性**。
+
+### 9.58.5 控制、缺陷与产物
+
+**20 项必需控制全过**（S0/B0 复现历史；BQ 复现上一轮；S1≡S0；QK row0 / heads_merged / o_proj row0 都逐位；
+serial o_proj 每行 `[1,1,1536]`；同一模块/同一权重/dtype；只作用 L0；L1–L27 走原路径；两次 BQO 逐位一致；
+关闭 ⇒ 生产路径逐位不变；hook/context 全恢复；cache/输入/权重未变；全有限；`allow_tf32=False`；从不加载 draft；
+commit/dirty/产物完整；旧产物不覆盖）。
+**缺陷（保留）**：① 首跑 `stage=crashed`——`_cmp_all_B` 用 **dict 字面量**做口径分派导致四个分支全被求值、
+对 3 维张量取 4 个索引 ⇒ `IndexError`，而且发生在 **10 次前向跑完之后**（该 run 的 JSON 保留、**无 .pt**）；
+两处修正：改用 `if/elif`、并把**原始张量落盘提前到"捕获之后、任何比较之前"**（commit `39b9342`）；
+② 只读汇总首跑一个键名错误（未消耗 GPU）。**GPU 进程：2 次**（1 次自身缺陷 + 1 次完整）。
+**工具**：`serial_align.py`（CPU 门 **19/0**）、`serial_align_l0_f13_p8209.py`（CPU 门 **14/0**）、
+只读汇总 `scripts/serialalign8209_verdict_cpu.py`（13 项核对全 True）；`model_self.py` 加默认关闭的 `serial_linear_for`；
+preflight 增 1 节。产物：`output/g5/attn/div8209_sla_20261002T192540Z.{json,pt}` +
+`serialalign8209_verdict_cpu_20261002T192933Z.json`。
+
+### 9.58.6 唯一最小下一步（未执行）
+
+把同一逐行 M=1 的 `nn.Linear` 干预继续推广到 **`gate_proj` 与 `up_proj`**（两者共用同一输入、都已满足
+"输入逐位相同、输出不同"），判定 **L0 输出能否完全恢复**；若仍不恢复，按同一条链给出下一个持续边界。
+**本轮不执行**；不做 profiler、不切后端、不改默认路径、不做 FP32、不跑 B6、不外推。
+
+---
+
 ## 9.57 位置 8209：L0 QK 的**逐行 M=1 causal-prefix 因果干预** —— QK 是真实来源，但**不是唯一**（2026-10-02）
 
 > 全文 `docs/div8209_serial_qk_causal_2026-10-02.md`；台账 §4.72。前置 §9.56（QK 2×2：归因 M）。
