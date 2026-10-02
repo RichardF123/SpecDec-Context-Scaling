@@ -198,6 +198,57 @@ def materialize_layer(layer: dict) -> dict:
     return out
 
 
+def materialize_k(layer: dict) -> torch.Tensor:
+    """Materialize only K; used by the H2O v0 reference scorer."""
+    check_consistent(layer)
+    return _materialize_pages(
+        layer["k_pages"], logical_length(layer), layer["page_size"])
+
+
+def select_indices(layer: dict, indices: torch.Tensor) -> dict:
+    """Return a fresh paged cache containing selected resident token positions.
+
+    v0 uses a reference compaction path: materialize, gather, repack.
+    """
+    check_consistent(layer)
+    if not isinstance(indices, torch.Tensor):
+        raise TypeError("indices must be a torch.Tensor")
+    if indices.ndim != 1 or indices.dtype != torch.long:
+        raise ValueError("indices must be a rank-1 torch.long tensor")
+    n = int(indices.numel())
+    if n <= 0:
+        raise ValueError("select_indices requires at least one retained token")
+
+    cur = logical_length(layer)
+    idx = indices.to(device=layer["k_pages"][0].device)
+    if int(idx.min()) < 0 or int(idx.max()) >= cur:
+        raise ValueError("select_indices contains an out-of-range resident index")
+    if n > 1 and not bool(torch.all(idx[1:] > idx[:-1]).item()):
+        raise ValueError("select_indices must be strictly increasing")
+
+    raw = materialize_layer(layer)
+    out = create_layer_cache(layer["fmt"], layer["page_size"])
+    k = raw["k"].index_select(2, idx)
+    v = raw["v"].index_select(2, idx)
+    if layer["fmt"] == "v_fp8":
+        scale = raw["v_scale"].index_select(2, idx)
+        append_current(out, k, v, scale)
+    else:
+        append_current(out, k, v)
+    check_consistent(out)
+    return out
+
+
+def payload_bytes(layer: dict) -> int:
+    """Allocated bytes for paged K/V payload tensors, excluding metadata."""
+    check_consistent(layer)
+    total = 0
+    for key in ("k_pages", "v_pages", "v_scale_pages"):
+        for tensor in layer.get(key, []):
+            total += tensor.numel() * tensor.element_size()
+    return int(total)
+
+
 def cuda_pointer_tables(layer: dict, *, validate: bool = True) -> tuple[torch.Tensor, torch.Tensor]:
     """Return cached device arrays of raw K/V page addresses for direct CUDA.
 
@@ -370,7 +421,7 @@ def check_consistent(layer: dict) -> None:
 __all__ = [
     "BACKEND", "DEFAULT_PAGE_SIZE", "SUPPORTED_FORMATS", "append_current",
     "check_consistent", "create_layer_cache", "cuda_pointer_tables",
-    "is_paged_layer", "layer_device", "logical_length", "materialize_layer",
-    "pointer_table_stats", "reset_pointer_table_stats", "trim_layer",
-    "truncate_layer",
+    "is_paged_layer", "layer_device", "logical_length", "materialize_k",
+    "materialize_layer", "payload_bytes", "pointer_table_stats",
+    "reset_pointer_table_stats", "select_indices", "trim_layer", "truncate_layer",
 ]
