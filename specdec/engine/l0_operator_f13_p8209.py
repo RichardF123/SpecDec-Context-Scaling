@@ -337,15 +337,17 @@ def _run(rec: dict, run_id: str) -> int:
         controls = dict(
             c1_L0_input_S_vs_B=_row_cmp(x0_s, x0_b, "L0_input_S_vs_B"),
             c2_L0_input_vs_prev_round=dict(
-                S=(_row_cmp(x0_s, chain["rows_S_raw"][0]["input"][0, 0], "L0in_S_vs_prev")
+                # ⚠️ 上一轮链式捕获保存的 `rows_*_raw[i]["input"/"output"]` **已经是 (hidden,) 决策行**
+                #    （不是 (1,s,hidden)）⇒ 这里**不能**再 `[0,0]` 索引（首跑即此错：白付一次模型加载）。
+                S=(_row_cmp(x0_s, chain["rows_S_raw"][0]["input"], "L0in_S_vs_prev")
                    if chain else None),
-                B=(_row_cmp(x0_b, chain["rows_B_raw"][0]["input"][0, 0], "L0in_B_vs_prev")
+                B=(_row_cmp(x0_b, chain["rows_B_raw"][0]["input"], "L0in_B_vs_prev")
                    if chain else None)),
             c3_L0_output_S_vs_B=_row_cmp(z_s, z_b, "L0_output_S_vs_B"),
             c3_L0_output_vs_prev_round=dict(
-                S=(_row_cmp(z_s, chain["rows_S_raw"][0]["output"][0, 0], "L0out_S_vs_prev")
+                S=(_row_cmp(z_s, chain["rows_S_raw"][0]["output"], "L0out_S_vs_prev")
                    if chain else None),
-                B=(_row_cmp(z_b, chain["rows_B_raw"][0]["output"][0, 0], "L0out_B_vs_prev")
+                B=(_row_cmp(z_b, chain["rows_B_raw"][0]["output"], "L0out_B_vs_prev")
                    if chain else None)),
             c4_same_L0_weights=dict(
                 q_proj_data_ptr=int(tgt.layers[LAYER].self_attn.q_proj.weight.data_ptr()),

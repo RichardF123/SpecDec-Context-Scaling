@@ -227,8 +227,12 @@ def _l0op_section() -> None:
     assert "rows_S_raw" in ch and "rows_B_raw" in ch, "缺少上一轮全层捕获的 L0 参考行"
     l0_in_s = ch["rows_S_raw"][0]["input"]
     l0_out_s = ch["rows_S_raw"][0]["output"]
-    print(f"  上一轮 L0 参考：input sha16={stable(ch['rows_S_raw'][0]['input'])}、"
-          f"output sha16={stable(l0_out_s)}；L0 输出 S/B n_diff="
+    # ⚠️ 口径断言（防复发）：上一轮保存的是 **1 维决策行**，不是 (1,s,hidden)
+    assert l0_in_s.dim() == 1 and l0_out_s.dim() == 1, (l0_in_s.shape, l0_out_s.shape)
+    assert ch["rows_B_raw"][0]["input"].dim() == 1
+    print(f"  上一轮 L0 参考：input sha16={stable(l0_in_s)}、"
+          f"output sha16={stable(l0_out_s)}（形状 {list(l0_in_s.shape)} 1 维决策行）；"
+          f"L0 输出 S/B n_diff="
           f"{int((l0_out_s.reshape(-1) != ch['rows_B_raw'][0]['output'].reshape(-1)).sum())}")
     assert int((l0_out_s.reshape(-1) != ch["rows_B_raw"][0]["output"].reshape(-1)).sum()) == 111
     a_s = C._anchor_ar(L0T.REF_RUN_AR, L0T.TARGET_POS)
