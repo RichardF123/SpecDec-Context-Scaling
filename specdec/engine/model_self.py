@@ -3,6 +3,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 import contextlib
+
+from . import paged_cache, spec_cache
 class RMSNORM(nn.Module):
     def __init__(self, hidden: int, eps: float = 1e-6):
         super().__init__()
@@ -340,6 +342,8 @@ class SelfAttention(nn.Module):
         self.kv_heads = kv_heads
         self.head_dim = head_dim
         self.kv_format = "fp16" 
+        self.cache_backend = "contiguous"
+        self.cache_page_size = paged_cache.DEFAULT_PAGE_SIZE
         # 策略旋钮: 'fp8'(full K/V ablation) 时生效; 'v_fp8'(正式) 时 V 固定 GROUP_V
         self.fp8_g_k = GROUP_SIZE
         self.fp8_g_v = GROUP_SIZE
@@ -347,6 +351,11 @@ class SelfAttention(nn.Module):
         self.fp8_v = True
 
     def forward(self, x: torch.Tensor, cos, sin, cache = None) -> torch.Tensor:
+        cache_was_none = cache is None
+        cache_is_paged = paged_cache.is_paged_layer(cache)
+        if cache is not None and cache_is_paged != (self.cache_backend == "paged_v0"):
+            raise ValueError("cache object/backend mismatch; start a fresh cache after switching backend")
+        paged_mode = self.cache_backend == "paged_v0"
         b, s, _ = x.shape
         q = self.q_proj(x).view(b, s, self.heads, self.head_dim).transpose(1, 2)
         k = self.k_proj(x).view(b, s, self.kv_heads, self.head_dim).transpose(1, 2)
@@ -354,6 +363,8 @@ class SelfAttention(nn.Module):
         q = apply_rope(q, cos, sin)
         k = apply_rope(k, cos, sin)
         fmt = cache.get("fmt", self.kv_format) if cache is not None else self.kv_format
+        if paged_mode and fmt == "fp8":
+            raise ValueError("paged_v0 does not support full fp8 K/V")
         # 模式语义: 'fp16'=base(bf16 KV 计算); 'v_fp8'=正式 V-only(K bf16 + V FP8 GROUP_V);
         #           'fp8'=full FP8 K/V(negative ablation, 粒度经 fp8_g_*/fp8_k/v 旋钮)
         if fmt == 'v_fp8':
@@ -374,7 +385,21 @@ class SelfAttention(nn.Module):
             v_cur16 = dequantize_kv_fp8(qv_cur, vs_cur, x.dtype)
         else:
             v_cur16 = v
-        if cache is None:
+        if paged_mode:
+            if cache_was_none:
+                cache = paged_cache.create_layer_cache(fmt, self.cache_page_size)
+            if fmt == "fp16":
+                paged_cache.append_current(cache, k, v)
+            else:
+                paged_cache.append_current(cache, k_cur16, qv_cur, vs_cur)
+            materialized = paged_cache.materialize_layer(cache)
+            k_all = materialized["k"]
+            if fmt == "v_fp8":
+                v_all = dequantize_kv_fp8(
+                    materialized["v"], materialized["v_scale"], x.dtype)
+            else:
+                v_all = materialized["v"]
+        elif cache is None:
             k_all, v_all = k_cur16, v_cur16
         elif fmt == 'fp16':
             k = torch.cat([cache["k"], k], dim=2)
@@ -413,7 +438,7 @@ class SelfAttention(nn.Module):
             else:
                 scores = torch.matmul(q, k_rep.transpose(-2, -1)) / (self.head_dim ** 0.5)
             p = T - s
-            if cache is None:
+            if cache_was_none:
                 mask = torch.triu(torch.ones(s, T, device=x.device, dtype=torch.bool), diagonal=1)
                 scores = scores.masked_fill(mask, float('-inf'))
             elif s == 1:
@@ -430,7 +455,9 @@ class SelfAttention(nn.Module):
                 out = torch.matmul(attn, v_rep)
             out = out.to(q.dtype)      # o_proj 是 bf16 ⇒ 这一步在默认路径是**无操作**（无拷贝）
         out = out.transpose(1, 2).contiguous().view(b, s, self.heads * self.head_dim)
-        if cache is None:
+        if paged_mode:
+            new_cache = cache
+        elif cache_was_none:
             if fmt in ('fp8', 'v_fp8'):
                 nc = {"fmt": fmt}
                 if k_on:
@@ -481,11 +508,11 @@ class QwenLM(nn.Module):
         self.head_dim = head_dim
         self.rope_theta = rope_theta
         self.kv_format = "fp16"   
+        self.cache_backend = "contiguous"
+        self.cache_page_size = paged_cache.DEFAULT_PAGE_SIZE
 
     def _run(self,x, cache_list = None, need_logits = True):  
-        start_pos = 0
-        if cache_list is not None and cache_list[0] is not None:
-            start_pos = cache_list[0]["k"].shape[2]
+        start_pos = spec_cache.cache_length(cache_list)
         cos, sin = Build_Rope_cache(self.head_dim, seq_len=x.size(1), theta=self.rope_theta, device=x.device, dtype=x.dtype, start_pos=start_pos)
         new_cache_list = []
         for i, layer in enumerate(self.layers):
@@ -526,6 +553,8 @@ class QwenLM(nn.Module):
         (K bf16 不量化 + V FP8 E4M3 group=GROUP_V=128, 每 head 1 group);
         'fp8'=full FP8 K/V(negative ablation; K/V 粒度可经 set_fp8_groups/matrices 调)。"""
         assert fmt in ("fp16", "fp8", "v_fp8"), fmt
+        if self.cache_backend == "paged_v0" and fmt == "fp8":
+            raise ValueError("paged_v0 does not support full fp8 K/V")
         if fmt == "v_fp8":
             assert self.head_dim % GROUP_V == 0, f"head_dim {self.head_dim} % GROUP_V != 0"
         self.kv_format = fmt
@@ -538,6 +567,26 @@ class QwenLM(nn.Module):
                 a.fp8_k, a.fp8_v = True, True
                 a.fp8_g_k, a.fp8_g_v = GROUP_SIZE, GROUP_SIZE
             # 'fp16': 仅记录格式; fp8 旋钮不影响 base 路径
+
+    def set_cache_backend(self, backend: str, page_size: int = 16) -> None:
+        """Select cache storage; contiguous remains the default.
+
+        Backend changes apply to newly-created caches.  Callers must not pass a
+        cache created by a different backend after switching.
+        """
+        if backend not in ("contiguous", "paged_v0"):
+            raise ValueError(f"unknown cache backend {backend!r}")
+        if backend == "paged_v0":
+            if self.kv_format == "fp8":
+                raise ValueError("paged_v0 does not support full fp8 K/V")
+            if (not isinstance(page_size, int) or isinstance(page_size, bool)
+                    or page_size <= 0):
+                raise ValueError("page_size must be a positive int")
+        self.cache_backend = backend
+        self.cache_page_size = page_size
+        for layer in self.layers:
+            layer.self_attn.cache_backend = backend
+            layer.self_attn.cache_page_size = page_size
 
     def set_fp8_groups(self, k_group: int | None = None, v_group: int | None = None) -> None:
         """诊断开关: K/V 各自 FP8 scale 分组粒度(须整除 head_dim)。默认 None=不动。

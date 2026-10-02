@@ -36,7 +36,7 @@ def _verify(target, cache, cands):
     with torch.inference_mode():
         lg, cache_blk = target._run(
             target.embed_tokens(
-                torch.tensor([cands], device=cache[0]["k"].device)),
+                torch.tensor([cands], device=spec_cache.cache_device(cache))),
             cache, need_logits=True)
     kp = len(cands)
     return lg[0, -kp:], cache_blk
@@ -46,7 +46,7 @@ def _step(model, token, cache):
     with torch.inference_mode():
         lg, cache = model._run(
             model.embed_tokens(
-                torch.tensor([[token]], device=cache[0]["k"].device)),
+                torch.tensor([[token]], device=spec_cache.cache_device(cache))),
             cache, need_logits=True)
     return lg[:, -1:], cache
 
