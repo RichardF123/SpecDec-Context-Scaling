@@ -53,12 +53,19 @@ def _validate_page_size(page_size: int) -> int:
 
 
 def _invalidate_pointer_tables(layer: dict) -> None:
+    # FINAL_PAGED_V2_Q1_Q4_VFP8: BF16 and V-FP8 direct kernels share the page lifecycle.
     had = any(
         key in layer
-        for key in ("_k_ptrs_cuda", "_v_ptrs_cuda", "_ptr_page_count")
+        for key in (
+            "_k_ptrs_cuda",
+            "_v_ptrs_cuda",
+            "_v_scale_ptrs_cuda",
+            "_ptr_page_count",
+        )
     )
     layer.pop("_k_ptrs_cuda", None)
     layer.pop("_v_ptrs_cuda", None)
+    layer.pop("_v_scale_ptrs_cuda", None)
     layer.pop("_ptr_page_count", None)
     if had:
         _POINTER_TABLE_STATS["invalidations"] += 1
@@ -316,6 +323,84 @@ def cuda_pointer_tables(layer: dict, *, validate: bool = True) -> tuple[torch.Te
     return k_ptrs, v_ptrs
 
 
+def cuda_pointer_tables_vfp8(
+    layer: dict,
+    *,
+    validate: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    '''Return cached K/V/V-scale raw CUDA page-address tables for V-FP8.'''
+    if validate:
+        check_consistent(layer)
+    elif not is_paged_layer(layer):
+        raise TypeError("not a paged_v0 layer cache")
+
+    if layer.get("fmt") != "v_fp8":
+        raise ValueError("V-FP8 pointer tables require fmt='v_fp8'")
+
+    k_pages = layer.get("k_pages")
+    v_pages = layer.get("v_pages")
+    s_pages = layer.get("v_scale_pages")
+    if not k_pages or not v_pages or not s_pages:
+        raise ValueError("cannot build V-FP8 pointer tables for an empty cache")
+    if not (len(k_pages) == len(v_pages) == len(s_pages)):
+        raise RuntimeError("paged K/V/V-scale page count mismatch")
+
+    device = k_pages[0].device
+    if device.type != "cuda":
+        raise ValueError("CUDA pointer tables require CUDA page tensors")
+
+    count = len(k_pages)
+    k_cached = layer.get("_k_ptrs_cuda")
+    v_cached = layer.get("_v_ptrs_cuda")
+    s_cached = layer.get("_v_scale_ptrs_cuda")
+    cached_count = layer.get("_ptr_page_count")
+
+    cache_ok = (
+        cached_count == count
+        and isinstance(k_cached, torch.Tensor)
+        and isinstance(v_cached, torch.Tensor)
+        and isinstance(s_cached, torch.Tensor)
+        and k_cached.dtype == torch.int64
+        and v_cached.dtype == torch.int64
+        and s_cached.dtype == torch.int64
+        and k_cached.device == device
+        and v_cached.device == device
+        and s_cached.device == device
+        and k_cached.ndim == 1
+        and v_cached.ndim == 1
+        and s_cached.ndim == 1
+        and k_cached.numel() == count
+        and v_cached.numel() == count
+        and s_cached.numel() == count
+    )
+    if cache_ok:
+        _POINTER_TABLE_STATS["hits"] += 1
+        return k_cached, v_cached, s_cached
+
+    k_ptrs = torch.tensor(
+        [int(page.data_ptr()) for page in k_pages],
+        dtype=torch.int64,
+        device=device,
+    )
+    v_ptrs = torch.tensor(
+        [int(page.data_ptr()) for page in v_pages],
+        dtype=torch.int64,
+        device=device,
+    )
+    s_ptrs = torch.tensor(
+        [int(page.data_ptr()) for page in s_pages],
+        dtype=torch.int64,
+        device=device,
+    )
+
+    layer["_k_ptrs_cuda"] = k_ptrs
+    layer["_v_ptrs_cuda"] = v_ptrs
+    layer["_v_scale_ptrs_cuda"] = s_ptrs
+    layer["_ptr_page_count"] = count
+    _POINTER_TABLE_STATS["builds"] += 1
+    return k_ptrs, v_ptrs, s_ptrs
+
+
 def trim_layer(layer: dict, new_len: int) -> dict:
     """Return a non-mutating logical prefix with copy-on-write tail storage."""
     check_consistent(layer)
@@ -421,6 +506,7 @@ def check_consistent(layer: dict) -> None:
 __all__ = [
     "BACKEND", "DEFAULT_PAGE_SIZE", "SUPPORTED_FORMATS", "append_current",
     "check_consistent", "create_layer_cache", "cuda_pointer_tables",
+    "cuda_pointer_tables_vfp8",
     "is_paged_layer", "layer_device", "logical_length", "materialize_k",
     "materialize_layer", "payload_bytes", "pointer_table_stats",
     "reset_pointer_table_stats", "select_indices", "trim_layer", "truncate_layer",
