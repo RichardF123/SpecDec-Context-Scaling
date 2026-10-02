@@ -95,6 +95,65 @@ _ATTENTION_PHASE = "other"
 _ATTENTION_STATS: dict | None = None
 _MAX_FALLBACK_LOGGED = 32
 
+# ---------------------------------------------------------------------------
+# PagedAttention v1c routing/usage statistics.
+#
+# Direct page-aware CUDA is deliberately narrow:
+#   - paged_v0 cache
+#   - BF16/base K/V (fmt == "fp16")
+#   - q_len == 1
+#   - CUDA
+#   - phase in decode/propose/repair/other
+#
+# In particular, `verify` is excluded even when kp == 1 so SpecDec target
+# verification stays on the already-validated materialized/reference path.
+PAGED_ATTENTION_MODES = ("off", "materialized_cuda", "direct_cuda")
+PAGED_DIRECT_PHASES = ("decode", "propose", "repair", "other")
+_PAGED_ATTENTION_STATS: dict | None = None
+
+
+def _fresh_paged_attention_stats() -> dict:
+    return {
+        "direct_cuda_calls": 0,
+        "materialized_cuda_calls": 0,
+        "fallback_materialize_calls": 0,
+        "direct_by_phase": {},
+        "materialized_by_phase": {},
+        "fallback_by_phase": {},
+    }
+
+
+def reset_paged_attention_stats() -> None:
+    global _PAGED_ATTENTION_STATS
+    _PAGED_ATTENTION_STATS = _fresh_paged_attention_stats()
+
+
+def paged_attention_stats() -> dict:
+    import copy
+    global _PAGED_ATTENTION_STATS
+    if _PAGED_ATTENTION_STATS is None:
+        _PAGED_ATTENTION_STATS = _fresh_paged_attention_stats()
+    return copy.deepcopy(_PAGED_ATTENTION_STATS)
+
+
+def _record_paged_attention(kind: str, phase: str) -> None:
+    global _PAGED_ATTENTION_STATS
+    if _PAGED_ATTENTION_STATS is None:
+        _PAGED_ATTENTION_STATS = _fresh_paged_attention_stats()
+    st = _PAGED_ATTENTION_STATS
+    if kind == "direct_cuda":
+        st["direct_cuda_calls"] += 1
+        bucket = st["direct_by_phase"]
+    elif kind == "materialized_cuda":
+        st["materialized_cuda_calls"] += 1
+        bucket = st["materialized_by_phase"]
+    elif kind == "fallback_materialize":
+        st["fallback_materialize_calls"] += 1
+        bucket = st["fallback_by_phase"]
+    else:
+        raise ValueError(f"unknown paged attention stat kind {kind!r}")
+    bucket[phase] = bucket.get(phase, 0) + 1
+
 DIAG_QK_FP32 = False
 DIAG_PROB_FP32 = False
 
@@ -323,22 +382,28 @@ class SelfAttention(nn.Module):
             else:
                 paged_cache.append_current(cache, k_cur16, qv_cur, vs_cur)
 
-            # PagedAttention v1b: only an already-existing BF16 paged cache
-            # followed by a single-token decode may use the CUDA comparison paths.
-            # Unsupported cases retain the existing paged_v0 materialization path.
+            # PagedAttention v1c: direct CUDA remains single-token BF16 only,
+            # and is phase-gated.  SpecDec target verification stays on the
+            # materialized/reference path even when kp == 1.
             paged_cuda_decode = (
                 not cache_was_none
                 and fmt == "fp16"
                 and s == 1
                 and q.is_cuda
+                and _ATTENTION_PHASE in PAGED_DIRECT_PHASES
                 and self.paged_attention_mode in ("materialized_cuda", "direct_cuda")
             )
 
             if paged_cuda_decode and self.paged_attention_mode == "direct_cuda":
                 # Direct page-aware kernel: do not materialize full-history K/V.
+                _record_paged_attention("direct_cuda", _ATTENTION_PHASE)
                 k_all = None
                 v_all = None
             else:
+                if paged_cuda_decode and self.paged_attention_mode == "materialized_cuda":
+                    _record_paged_attention("materialized_cuda", _ATTENTION_PHASE)
+                else:
+                    _record_paged_attention("fallback_materialize", _ATTENTION_PHASE)
                 materialized = paged_cache.materialize_layer(cache)
                 k_all = materialized["k"]
                 if fmt == "v_fp8":
@@ -547,9 +612,12 @@ class QwenLM(nn.Module):
             For the same case, read paged K/V directly with the page-aware
             CUDA kernel and do not materialize full-history K/V.
 
-        Unsupported cases keep the existing engine path.
+        Direct/materialized CUDA comparison paths are used only for
+        q_len=1 BF16 paged calls in decode/propose/repair/other phases.
+        Prefill, verify, V-FP8, multi-token, and CPU calls keep the existing
+        materialized engine path.
         """
-        allowed = ("off", "materialized_cuda", "direct_cuda")
+        allowed = PAGED_ATTENTION_MODES
         if mode not in allowed:
             raise ValueError(
                 f"unknown paged attention mode {mode!r}; choose from {allowed}")
