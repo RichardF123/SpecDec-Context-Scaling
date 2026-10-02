@@ -223,9 +223,9 @@ def prune_committed(
     state must already describe exactly the same committed token set.
     """
     paged_cache.check_consistent(layer)
-    if layer["fmt"] != "fp16":
+    if layer["fmt"] not in ("fp16", "v_fp8"):
         raise ValueError(
-            "H2O committed pruning supports fp16/base paged cache only")
+            "H2O committed pruning supports fp16/base or v_fp8 paged cache only")
 
     resident = paged_cache.logical_length(layer)
     if resident != int(state.scores.numel()):
