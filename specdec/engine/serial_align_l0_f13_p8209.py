@@ -151,10 +151,22 @@ def _cmp_all(a_nodes: dict, b_nodes: dict) -> dict:
 
 
 def _cmp_all_B(a_nodes: dict, b_nodes: dict) -> dict:
-    """B 口径 vs B 口径（两侧都取第 0 行）。"""
+    """B 口径 vs B 口径（两侧都取第 0 行）。
+
+    ⚠️ 首跑缺陷：这里曾写成 `return {"row": t[0,0], "heads": t[0,:,0,:], ...}[kind]` ——
+    **dict 字面量会把四个分支全部求值**，对 3 维张量取 4 个索引直接 IndexError（白付一次加载）。
+    必须用 `if/elif` 只求值命中的那一支。
+    """
     def sl(kind, t):
-        return {"row": t[0, 0], "heads": t[0, :, 0, :], "kv": t[0, :, :VIS, :],
-                "scores": t[0, :, 0, :VIS]}[kind]
+        if kind == "row":
+            return t[0, 0]
+        if kind == "heads":
+            return t[0, :, 0, :]
+        if kind == "kv":
+            return t[0, :, :VIS, :]
+        if kind == "scores":
+            return t[0, :, 0, :VIS]
+        raise OP.ProbeError(f"未知口径：{kind}")
 
     out = {}
     for name, (who, kind) in OP.SPECS.items():
@@ -444,6 +456,16 @@ def _run(rec: dict, run_id: str) -> int:
 
         S0, B0, BQ, BQO, S1 = (P1["S0"], P1["B0"], P1["BQ"], P1["BQO"], P1["S1"])
 
+        # ★★★ 先把**原始张量**落盘，再做任何比较 ★★★
+        #   本轮首跑教训：比较代码里的一个下标缺陷（`_cmp_all_B` 的 dict 字面量分派）在
+        #   10 次前向全部跑完之后崩溃，把昂贵的捕获数据全部丢掉。落盘必须早于比较。
+        payload = _build_payload({a: P1[a] for a in [p[0] for p in PLAN]}, n_layers=n_layers)
+        payload["H_L0_cache_pre"] = dict(k=H[LAYER]["k"].detach().cpu(), v=H[LAYER]["v"].detach().cpu())
+        payload["oproj_facts"] = rec["oproj_facts"]
+        tp = _save_pt(payload, run_id)
+        rec["artifacts"] = dict(json=str(_write(rec, run_id)), pt=str(tp))
+        print(f"[sla] 原始张量已落盘（早于比较）：{tp.name}", flush=True)
+
         # ---------------- 参考产物 ----------------
         l0ops = torch.load(L0OPS_PT, map_location="cpu") if Path(L0OPS_PT).exists() else {}
         prev = torch.load(PREV_PT, map_location="cpu") if Path(PREV_PT).exists() else {}
@@ -725,12 +747,7 @@ def _run(rec: dict, run_id: str) -> int:
               f"逐行输入={controls['c8_serial_oproj_per_row_shape']['calls'][0]['per_row_input_shapes']}）",
               flush=True)
 
-        # ---------------- 先落盘 ----------------
-        payload = _build_payload({a: P1[a] for a in [p[0] for p in PLAN]}, n_layers=n_layers)
-        payload["H_L0_cache_pre"] = dict(k=H[LAYER]["k"].detach().cpu(), v=H[LAYER]["v"].detach().cpu())
-        payload["oproj_facts"] = rec["oproj_facts"]
-        tp = _save_pt(payload, run_id)
-        rec["artifacts"] = dict(json=str(_write(rec, run_id)), pt=str(tp))
+        # ---------------- 先落盘（已在上面完成；此处只做打印）----------------
         print("== H1–H5 ==")
         print(f"  H1 S0/B0 复现历史=True；BQ ≡ 上一轮（节点={prev_bq['nodes_all_identical']}，"
               f"层行={prev_bq['layer_rows_identical']}）；S1≡S0={controls['c4_S1_equals_S0']['nodes_identical']}")
