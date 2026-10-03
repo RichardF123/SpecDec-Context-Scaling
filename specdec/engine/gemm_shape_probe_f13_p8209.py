@@ -111,25 +111,43 @@ def _versions() -> dict:
 
 
 def _cuda_kernels(prof, top: int = 12) -> list:
-    """**真正的 CUDA kernel** 名称（从原始事件里过滤 `device_type == CUDA`）。
+    """**真正的 CUDA kernel** 名称。
 
-    ⚠️ 首跑用 `key_averages()` 拿到的是 **ATen 层**名字（`aten::mm`/`aten::bmm`），
-    因为那些行的 `self_cuda_time_total` 是**含子项的总和** ⇒ 名字完全不是 kernel。
-    这里改用 `prof.events()` 只取 CUDA 事件，并按 kernel 名聚合调用次数与设备时间。
+    两条路径都试，取第一条非空的：
+    1. `prof.events()` 里 `device_type` 为 CUDA 的原始事件（最可靠）；
+    2. 退路：`key_averages()` 里**排除 `aten::`** 且 `self_device_time_total > 0` 的行
+       —— kernel 行的 `self_device_time_total` 是自身时间，而 ATen 行的自身设备时间为 0。
+
+    ⚠️ 首跑用 `self_device_time_total or self_cuda_time_total`，于是把 `aten::mm` 的**含子项总和**
+    当成了 kernel 时间 ⇒ 打印出来全是 ATen 名字；次跑 `prof.events()` 的设备过滤又静默失败（拿到空表）。
+    两处都已修正。
     """
     agg: dict = {}
-    for e in prof.events():
-        try:
-            if e.device_type != torch.autograd.DeviceType.CUDA:
+    try:
+        for e in prof.events():
+            dt = getattr(e, "device_type", None)
+            is_cuda = ("CUDA" in str(dt)) or (dt == 1)
+            if not is_cuda:
                 continue
-        except Exception:                                                 # noqa: BLE001
-            continue
-        d = agg.setdefault(e.name, dict(kernel=str(e.name), count=0, cuda_us=0.0, shapes=set()))
-        d["count"] += 1
-        d["cuda_us"] += float(getattr(e, "device_time_total", 0.0) or 0.0)
-        sh = getattr(e, "input_shapes", None)
-        if sh:
-            d["shapes"].add(str(sh)[:100])
+            d = agg.setdefault(e.name, dict(kernel=str(e.name), count=0, cuda_us=0.0, shapes=set()))
+            d["count"] += 1
+            d["cuda_us"] += float(getattr(e, "device_time_total", 0.0) or 0.0)
+            sh = getattr(e, "input_shapes", None)
+            if sh:
+                d["shapes"].add(str(sh)[:100])
+    except Exception:                                                     # noqa: BLE001
+        agg = {}
+    if not agg:
+        for e in prof.key_averages():
+            name = str(e.key)
+            if name.startswith("aten::"):
+                continue
+            ct = float(getattr(e, "self_device_time_total", 0.0) or 0.0)
+            if ct <= 0:
+                continue
+            d = agg.setdefault(name, dict(kernel=name, count=0, cuda_us=0.0, shapes=set()))
+            d["count"] += int(e.count)
+            d["cuda_us"] += ct
     out = sorted(agg.values(), key=lambda x: (-x["cuda_us"], -x["count"]))[:top]
     for d in out:
         d["shapes"] = sorted(d["shapes"])[:3]
@@ -459,15 +477,17 @@ def main() -> int:
         for name in ("QK", "o_proj", "gate_proj", "up_proj", "down_proj"):
             d = rec["step1_op_matrix_L0"][name]
             ck = (d.get("M4row0_vs_M1_sameN") or d.get("M4row0_vs_M1"))
-            ka = ((d.get("profile_all") or {}).get("cuda_kernels") or [{}])
-            kr = ((d.get("profile_row") or {}).get("cuda_kernels") or [{}])
-            fa = ka[0].get("kernel")
-            fr = kr[0].get("kernel")
-            same = bool(fa == fr)
+            ka = list((d.get("profile_all") or {}).get("cuda_kernels") or [])
+            kr = list((d.get("profile_row") or {}).get("cuda_kernels") or [])
+            fa = ka[0]["kernel"] if ka else None
+            fr = kr[0]["kernel"] if kr else None
+            same = bool(fa is not None and fa == fr)
             print(f"   {name:<10} M4row0_vs_M1 n_diff={ck['n_diff']:>5d} max|Δ|={ck['max_abs']:<11.6g}"
                   f" | M4 kernel={str(fa)[:52]} | M1 kernel={str(fr)[:52]} | 同名={same}", flush=True)
-            print(f"              M4 kernels={[(k['kernel'][:44], k['count']) for k in ka[:3]]}", flush=True)
-            print(f"              M1 kernels={[(k['kernel'][:44], k['count']) for k in kr[:3]]}", flush=True)
+            print(f"              M4 kernels={[(k.get('kernel', '')[:44], k.get('count')) for k in ka[:3]]}",
+                  flush=True)
+            print(f"              M1 kernels={[(k.get('kernel', '')[:44], k.get('count')) for k in kr[:3]]}",
+                  flush=True)
         c = rec["step2_controls_L0"]
         print(f"[gp] Step 2（L0）：QK 四行同内容 vs M1 n_diff="
               f"{c['QK']['all_rows_same_vs_M1']['n_diff']}；改其他行后第 0 行 vs 真实 M4 第 0 行="
