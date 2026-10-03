@@ -482,11 +482,14 @@ def _run(rec: dict, run_id: str) -> int:
         DC.require(ctl["positions"]["both_predict_target"], "位置口径失败", str(ctl["positions"]))
         DC.require(all(v["match"] for v in ctl["token_match_anchors"].values()), "锚点不一致",
                    str(ctl["token_match_anchors"]))
-        DC.require(all(all(l == ctl["cache_struct"]["S0"]["lens"][0] for l in ctl["cache_struct"][a]["lens"])
-                       and ctl["cache_struct"][a]["n_layers"] == n_layers
+        DC.require(all(ctl["cache_struct"][a]["n_layers"] == n_layers
                        and ctl["cache_struct"][a]["keys"] == ["k", "v"]
-                       and ctl["cache_struct"][a]["dtype"] == "torch.bfloat16" for a in ARM_NAMES),
-                   "控制 10 失败：cache 结构/长度/dtype 不符", str(ctl["cache_struct"]))
+                       and ctl["cache_struct"][a]["dtype"] == "torch.bfloat16"
+                       and len(set(ctl["cache_struct"][a]["lens"])) == 1
+                       and ctl["cache_struct"][a]["lens"][0]
+                       == (PRE + 1 if a in S_ARMS else PRE + len(CANDS)) for a in ARM_NAMES),
+                   "控制 10 失败：cache 结构/长度/dtype 不符（判据：每臂内 28 层等长，"
+                   "且 S 臂 = PRE+1、B 臂 = PRE+len(cands)）", str(ctl["cache_struct"]))
         if saved_rows:
             for a, key in (("S0", "H_AR-S"), ("B0", "H_AR-B")):
                 if key in saved_rows:
