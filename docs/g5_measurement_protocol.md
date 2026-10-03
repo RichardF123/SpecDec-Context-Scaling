@@ -1,10 +1,3 @@
-> **SUPERSEDED SCOPE NOTICE — HISTORICAL MEASUREMENT PROTOCOL.**
-> Its measurement discipline remains useful historical context, but its
-> 12-condition matrix is not the current formal course scope. Current scope is
-> the frozen **6 main + 2 supplement** design in
-> [`proposal_freeze_2026-10-01.md`](proposal_freeze_2026-10-01.md); also consult
-> [`README.md`](../README.md) and [`status_update_2026-10-02.md`](status_update_2026-10-02.md).
-
 # G5 测量协议（冻结 v1，2026-09-21）
 
 > 目的：把 Part 4 暴露出来的三个测量问题（**显存饱和导致的顺序效应**、**决策可复现但计时不可复现**、

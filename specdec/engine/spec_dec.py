@@ -37,10 +37,11 @@ def _propose(draft, cache, lg, k_eff, eos_id):
 
 
 def _verify(target, cache, cands):
-    """Target block verification always stays on the reference/materialized path.
+    """Verify the candidate block through the configured attention route.
 
-    Even if len(cands) == 1, the phase label `verify` excludes the v1c direct
-    paged-decode kernel.  Multi-token verification is intentionally untouched.
+    With paged_v0 and direct mode explicitly enabled, eligible BF16 or
+    asymmetric V-FP8 verification calls with q_len=1..4 may use direct
+    page-aware CUDA.  Other calls keep the existing materialized/fused path.
     """
     with torch.inference_mode(), attention_phase("verify"):
         lg, cache_blk = target._run(

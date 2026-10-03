@@ -1,10 +1,3 @@
-> **SUPERSEDED SCOPE NOTICE — HISTORICAL PROTOCOL.**
-> The 12-condition factorial in this v7.1/v7.2 protocol is not the current
-> formal course scope. It was superseded by the frozen **6 main + 2 supplement**
-> design in [`proposal_freeze_2026-10-01.md`](proposal_freeze_2026-10-01.md).
-> Preserve this file for historical methodology; consult [`README.md`](../README.md)
-> and [`status_update_2026-10-02.md`](status_update_2026-10-02.md) for current status.
-
 # SpecDec v7.1 —— Experimental Protocol Freeze
 
 > 目标：不改变方向、不加功能、不扩 scope；只修复影响正式实验**有效性/可解释性/可复现性**的协议缺口。

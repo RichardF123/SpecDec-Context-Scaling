@@ -1,11 +1,3 @@
-> **SUPERSEDED HISTORICAL SNAPSHOT — NOT THE CURRENT PROJECT SCOPE.**
-> This checkpoint preserves an early project-state snapshot; its progress,
-> matrix, commitments, and next steps are not current requirements. Current
-> formal scope is governed by
-> [`proposal_freeze_2026-10-01.md`](proposal_freeze_2026-10-01.md); for current
-> status, also consult [`README.md`](../README.md) and
-> [`status_update_2026-10-02.md`](status_update_2026-10-02.md).
-
 # SpecDec 状态快照（Checkpoint）
 
 > 用途：阶段性"收工记录"——汇总当前进度、已定决策、实测数据、未决项与下一步。

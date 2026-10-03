@@ -1,10 +1,3 @@
-> **SUPERSEDED HISTORICAL SNAPSHOT — NOT THE CURRENT PROJECT SCOPE.**
-> This file preserves the project state and evidence as reported on 2026-09-26.
-> Current formal scope is governed by
-> [`proposal_freeze_2026-10-01.md`](proposal_freeze_2026-10-01.md); for current
-> status, also consult [`README.md`](../README.md) and
-> [`status_update_2026-10-02.md`](status_update_2026-10-02.md).
-
 # SpecDec — 结果汇报（给分析 Agent）｜2026-09-26
 
 > **读者**：接手**分析与实验设计**的 agent。

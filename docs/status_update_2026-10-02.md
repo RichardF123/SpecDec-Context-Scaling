@@ -1,6 +1,6 @@
 # SpecDec 阶段状态同步（2026-10-02）
 
-本记录的原始主体汇总截至 `f6335f5` 的已有 correctness/status 结果与后续分析，原始主体本身不包含新 GPU 实验。文末后来追加的独立附录记录已经完成的 2026-10-02 KV Optimization Final GPU Closeout；该附录不修改 proposal 范围、生产默认、正式验收门槛或历史 FAIL/CHECK。
+本记录汇总截至 `f6335f5` 的已有结果与后续分析，不包含新 GPU 实验。不修改 proposal、生产默认、正式验收门槛或旧 FAIL/CHECK。
 
 ## 当前研究范围与状态
 
@@ -47,30 +47,3 @@ AR 历史下 6702/6652 的 logits 为 20.125/20.0；Spec 历史下均为 20.125�
 5. 完整 64-token 一致性是额外观察，不作为历史效应成立的唯一判据。即使缓存历史一致，当前块计算仍可能在其他位置改变选择；新分歧需单独记录。
 
 这只是待执行的因果诊断，不是已验证修复，也不是最终性能方案。串行重放增加 target 工作量，不得隐藏其成本或把外部 AR 缓存免费提供给正式 Spec 性能测试。保持串行 GPU、现有资源护栏和严格正确性门；未经后续授权不执行新实验。
-
-## KV Optimization Final GPU Closeout（2026-10-02，独立补充线）
-
-这是一条与上述 production BF16 AR/Spec correctness 调查相互独立的 KV
-optimization engineering extension。最终 GPU 工作已经完成；本节只同步已归档结果，
-不修改 proposal、正式 6+2 范围、历史 FAIL/CHECK 或 correctness 状态。
-
-- Paged KV storage、BF16/V-FP8 direct paged CUDA、`q_len=1..4`、
-  decode/propose/verify/repair direct route、target verify 和 pointer-table reuse 已完成，
-  real-model / SpecDec parity 通过。Prefill 保持既有 materialized/fused path。
-- 最终 microbenchmark 的 direct path 在所有 12 个配置中都不快于 materialized
-  reference；已验证收益是避免 full-history materialization，并显著减少
-  attention-call temporary allocation/peak delta，不是整机 VRAM 或 latency speedup。
-- A–D 在 6 个小规模 exact-input cases 中保持 exact output；V-FP8 的 combined
-  final payload ratio 为 `0.83046875`。H2O 50% 的 E/F exact rate 均为
-  `0.6666667`、mean token agreement `0.875`，因此不得称为 lossless；G 的 25%
-  retention 是 aggressive stress。
-- H2O paired interaction audit：quantization-only exact `12/12`；keep-set/state
-  change `12/12`；9 个 `retention_changed_output_same`，3 个
-  `retention_diverged_before_output`（均来自 ratio `0.25`）。这是有边界的
-  retention-mediated evidence，不是完整因果证明。
-- H2O score capture 与 compaction 仍是 reference/materialized 路径，不能声明
-  H2O latency improvement。
-
-权威总结和 canonical `_final` 文件分别见
-[`kv_optimization_closeout_2026-10-02.md`](kv_optimization_closeout_2026-10-02.md)
-与 [`results/kv_closeout_2026-10-02/`](../results/kv_closeout_2026-10-02/)。

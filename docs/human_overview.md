@@ -1,12 +1,3 @@
-> **SUPERSEDED HISTORICAL SNAPSHOT — NOT THE CURRENT PROJECT SCOPE.**
-> This v3 overview preserves earlier planning ideas. Dynamic draft trees, a
-> weight-quantization ladder, training a draft head, FlashAttention as a
-> promised project stage, and int2/int4 KV as committed scope are historical
-> ideas—not current commitments. Current formal scope is governed by
-> [`proposal_freeze_2026-10-01.md`](proposal_freeze_2026-10-01.md); for current
-> status, also consult [`README.md`](../README.md) and
-> [`status_update_2026-10-02.md`](status_update_2026-10-02.md).
-
 # SpecDec 推理引擎 —— 项目说明书（给你看，v3 版）
 
 > 这是**用大白话**讲清"我们到底在做什么、为什么、怎么做、怎么衡量、最后得到什么"的文档。

@@ -1,10 +1,3 @@
-> **SUPERSEDED HISTORICAL EXECUTION PLAN — NOT CURRENT NEXT STEPS.**
-> This 2026-09-08 plan preserves its stage-specific gates and 12-condition
-> assumptions. Current formal scope is governed by
-> [`proposal_freeze_2026-10-01.md`](proposal_freeze_2026-10-01.md); for current
-> status, consult [`README.md`](../README.md) and
-> [`status_update_2026-10-02.md`](status_update_2026-10-02.md).
-
 # G4 下一步执行规划（2026-09-08 制定，待执行）
 
 > 依据：`design_freeze_g4_specdec.md` v0.2、`plan_v7_1_protocol_freeze.md` §0 Amendment v7.2、`docs/design_g4_cache_api.md`、`data_ledger.md` §4.5.2/§3.5.3。

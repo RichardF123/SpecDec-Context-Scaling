@@ -1,10 +1,3 @@
-> **SUPERSEDED HISTORICAL SNAPSHOT — NOT THE CURRENT PROJECT SCOPE.**
-> This 2026-09-21 handoff preserves its period-specific evidence and plans.
-> Its 12-condition factorial has been superseded by the frozen **6 main + 2
-> supplement** design in [`proposal_freeze_2026-10-01.md`](proposal_freeze_2026-10-01.md).
-> For current status, also consult [`README.md`](../README.md) and
-> [`status_update_2026-10-02.md`](status_update_2026-10-02.md).
-
 # SpecDec — 分析 Agent 交接报告（2026-09-21）
 
 > 读者：接手**分析与实验设计**的 agent。本文档自包含：项目目标、冻结口径、**已确立事实 / 推断 /

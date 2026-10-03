@@ -4,7 +4,7 @@
 
 > 从零实现 Qwen2 系推理引擎 + KV-cache 解码 + 优化阶梯（KV 压缩 → 投机解码），
 > 在 8GB 笔记本 GPU 上做可复现测量。
-> 历史执行协议：`docs/plan_v7_1_protocol_freeze.md`（旧 12 条件协议，正式范围已由 2026-10-01 proposal freeze 取代）；`docs/data_ledger.md`（数据台账）、
+> 权威文档：`docs/plan_v7_1_protocol_freeze.md`（实验协议冻结 + Amendment v7.2）、`docs/data_ledger.md`（数据台账）、
 > `docs/design_freeze_fp8_kv.md`（FP8 KV 设计冻结 v1.3）、`docs/design_freeze_g4_specdec.md`（G4 协议 v0.3）、
 > `docs/plan_g4_next_steps.md`（G4 阶段状态）。
 
@@ -25,24 +25,6 @@
 **下一步（尚未执行）**：做一次默认关闭的串行历史重建诊断，覆盖全接受轮和拒绝轮；从轮前缓存重放已提交 token，并同步刷新 saved_next。优先检查同前缀历史是否逐位一致、原位置 8239 的选择是否恢复，再观察完整生成。该实验用于验证因果，不是免费性能优化，也不保证其他位置不会产生新的形状敏感分歧。正式矩阵仍等待严格正确性及测量准备验收，不放宽门槛。
 
 详见：[本次状态与结论边界](docs/status_update_2026-10-02.md)、[RoPE 对齐](docs/c1_rope_source_alignment_2026-10-01.md)、[真实生成对照](docs/ar_spec_aligned_rope_2026-10-01.md)、[第 47 位四格定位](docs/divasc_index47_localization_2026-10-01.md)。定位报告的原下一步建议需按本次状态说明修正，尚未据此执行新实验。
-
-## KV optimization engineering extension closeout（2026-10-02）
-
-这条 supplementary engineering study 已完成最终 GPU closeout，数据见
-[`results/kv_closeout_2026-10-02/`](results/kv_closeout_2026-10-02/)，权威总结见
-[`docs/kv_optimization_closeout_2026-10-02.md`](docs/kv_optimization_closeout_2026-10-02.md)。
-
-- Paged KV storage：closed；paged storage parity 通过。
-- Direct page-aware CUDA：closed；覆盖 BF16 / V-FP8、`q_len=1..4`，以及
-  decode/propose/verify/repair direct route；prefill 保持既有 materialized/fused path。
-- V-FP8 direct paged attention 与 SpecDec target verify direct route：closed，最终 parity 通过。
-- Direct paged path 的实测收益是 attention-call temporary allocation/peak delta
-  显著下降；本次 RTX 4060 microbenchmark **没有 latency speedup**。
-- H2O committed-history integration：作为 reference retention implementation
-  closed；完成 quality/payload 和 interaction audit，但**没有 H2O latency claim**。
-
-这次 closeout 没有重定义正式课程实验的 6+2 范围，也没有解决生产 BF16
-AR/Spec 严格逐 token correctness；后者仍是独立、未解决/进行中的问题。
 
 ## 历史状态快照（2026-09-27）
 
@@ -177,7 +159,7 @@ python -m specdec.engine.g4_b6_tie_diag                 # 分歧位置的 signal
 ## 文档
 
 - [合作者 PR #2 / #3 评审与隔离研究归档](docs/collaborator_pr_review_2026-10-02.md) — 保留 KV 压缩、two-pass attention 和性能归因成果；未整包合并旧引擎，不改变现有默认或正式验收。
-- `docs/plan_v7_1_protocol_freeze.md` — 历史实验协议（v7.1 + Amendment v7.2，旧 12 conditions；当前正式范围以 `proposal_freeze_2026-10-01.md` 的 6+2 为准）
+- `docs/plan_v7_1_protocol_freeze.md` — 实验协议冻结（v7.1 + §0 **Amendment v7.2**：Compute=BF16、KV 因子、12 conditions）
 - `docs/plan_v7.md` — v7 方案（方向、承诺、裁剪序）；`docs/plan_v6.md` — v6/v6.1 历史方案
 - `docs/data_ledger.md` — 实测数据台账（§3.4 G1、§3.5.x FP8 KV、§4.5.1 G2、§4.5.2 B3、§4.5.3 B4、§4.5.4 B5、§4.5.5 B6-bf16、§4.5.6 B6-fp32）
 - `docs/status_note_fp8_v4.md` — FP8 KV：根因、修复、正式判定、G4 前置清单
