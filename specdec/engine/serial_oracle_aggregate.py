@@ -53,6 +53,33 @@ def _gen_hash(gen: list) -> str:
     return P5V._gen_hash(list(gen))
 
 
+def _n_gen_s_gt1(tgt: dict) -> int | None:
+    """**非 prefill 阶段**里 `seq_len > 1` 的 target 调用数（需求项 5 的"真正的 block 前向"口径）。
+
+    ⚠️ 命名澄清（**必须写进报告**）：生产 `specdec_stats.target_block_calls` 的历史含义是
+    "**每轮一次 verify 调用**"的计数器（`spec_dec` 主循环里 `st["target_block_calls"] += 1`），
+    它**不是**"`s>1` 的 block 前向数"。serial 模式下该计数器仍等于**轮数**。
+    因此需求项 5"`target_block_calls == 0`"的**实质**（不存在 block 前向）由本函数给出：
+    从审计的逐阶段 `seq_len` 明细里数出非 prefill 且 `s>1` 的调用数，必须为 **0**。
+    两者都如实记录，不做任何"改名冒充"。
+    """
+    if not tgt:
+        return None
+    n = 0
+    for ph, d in (tgt.get("by_phase") or {}).items():
+        if ph == "prefill":
+            continue
+        n += sum(1 for s in (d.get("seq_lens") or []) if int(s) > 1)
+    return n
+
+
+def _prefill_seq_lens(tgt: dict) -> list | None:
+    """prefill 阶段的 `seq_len` 列表（需求项 9：分块 prefill 不得被误判为 generation）。"""
+    if not tgt:
+        return None
+    return (tgt.get("by_phase") or {}).get("prefill", {}).get("seq_lens")
+
+
 def _first_div(a: list, b: list):
     for i, (x, y) in enumerate(zip(a, b)):
         if x != y:
@@ -135,6 +162,15 @@ def _row(rec: dict) -> dict:
                 target_gen_calls=(tgt.get("n_generation_calls")),
                 target_gen_seq_lens=(tgt.get("generation_seq_lens")),
                 target_all_m1=(tgt.get("all_generation_m1")),
+                target_label=(tgt.get("label")), target_label_source=(tgt.get("label_source")),
+                target_n_layers=(tgt.get("n_layers_first")), target_n_params=(tgt.get("n_params")),
+                target_by_phase=(tgt.get("by_phase")),
+                target_n_prefill_calls=(tgt.get("n_prefill_calls")),
+                # ★ 需求项 5：**真正**的 block（`s>1`）generation 前向计数（由审计的逐阶段 seq_len 明细数出来）
+                target_n_gen_calls_with_s_gt_1=_n_gen_s_gt1(tgt),
+                target_prefill_seq_lens=_prefill_seq_lens(tgt),
+                audit_n_calls=(au.get("n_calls")), audit_labels=(au.get("labels")),
+                audit_cross_check=(au.get("cross_check")),
                 audit_sane=au.get("sane"), audit_certifies_m1=au.get("certifies_m1"),
                 audit_n_instances=au.get("n_instances"), audit_violations=au.get("violations"),
                 accounting=rec.get("accounting"), self_checks=rec.get("self_checks"),
@@ -147,6 +183,18 @@ def _row(rec: dict) -> dict:
                 peak_alloc_mib=((sm.get("mem_timeline_last") or {}).get("pt_peak_allocated_mib")),
                 peak_res_mib=((sm.get("mem_timeline_last") or {}).get("pt_peak_reserved_mib")),
                 pstate=sm.get("pstate"), smoke_artifact=rec.get("smoke_artifact"),
+                diagnostic_only=rec.get("diagnostic_only"),
+                smoke_rc_zero=((rec.get("self_checks") or {}).get("smoke_rc_zero")),
+                end_state_gen_hash=((sm.get("end_state") or {}).get("gen_hash")),
+                end_state_len=((sm.get("end_state") or {}).get("gen_len")),
+                end_state_stop=((sm.get("end_state") or {}).get("stop_reason")),
+                eos_seen=((sm.get("end_state") or {}).get("eos_seen")),
+                cache_structure_ok=sm.get("cache_structure_ok"),
+                cache_structure_n_checks=sm.get("cache_structure_n_checks"),
+                finiteness_n_checked=((sm.get("checks") or {}).get("n_checked")),
+                checks_n_required=((sm.get("checks") or {}).get("n_required")),
+                checks_uncovered=((sm.get("checks") or {}).get("uncovered")),
+                kv_format=sm.get("kv_format"), weights_bitmatch=sm.get("weights_bitmatch"),
                 kill_switch_off=(rec.get("verify_mode_after_run") == "block"))
 
 
@@ -329,10 +377,301 @@ def aggregate(scope: str) -> int:
     return 0 if decision == "SERIAL_ORACLE_PASS" else 1
 
 
+# ===========================================================================
+# Stage 1（F13）专用判定：四类判决 + 17 项硬性检查
+#   `SERIAL_ORACLE_STAGE1_PASS` / `SERIAL_ORACLE_STAGE1_FAIL` / `BASELINE_REGRESSION` /
+#   `CHECK_NEEDS_REVIEW`（本轮任务书 §7 的规定）。
+#   `--scope final`（5 family）仍沿用**设计文档 §6** 预先登记的
+#   `SERIAL_ORACLE_PASS/FAIL/CHECK_NEEDS_REVIEW` 口径，两套口径并存、不互相替换。
+#
+# 判定次序（写死）：先"能否评估"（缺运行/环境/审计无法证明非空 ⇒ NEEDS_REVIEW）
+#   ⇒ 再基线锚点（AR/production 复现失败 ⇒ BASELINE_REGRESSION）
+#   ⇒ 再 serial 硬门（⇒ SERIAL_ORACLE_STAGE1_FAIL）⇒ 最后 PASS。
+# ===========================================================================
+STAGE1_FAMILY = "F13"
+STAGE1_REQUIRED_REPS = 2
+STAGE1_ANCHORS = dict(
+    ar=dict(expected_gen_hash="6e7522bf2521ad7b", expected_len=64, expected_stop="max_new_reached"),
+    prod=dict(expected_gen_hash="e90dad2b3fcf1c65", expected_len=64, expected_stop="max_new_reached",
+              expected_first_divergence_vs_ar=47))
+LEGAL_STOPS = ("max_new_reached", "eos")
+
+
+def _serial_hard_checks(r: dict) -> dict:
+    """**需求项 1–16**（逐 run）。返回 `{name: dict(ok=bool|None, detail=...)}`。
+
+    `ok=None` 表示**无法评估**（字段缺失）⇒ 归入 `CHECK_NEEDS_REVIEW`，不得当作通过。
+    """
+    tr = r.get("_trace") or {}
+    rc_ = r.get("_rounds") or {}
+    cr = r.get("_cross") or {}
+    need_fields = ("pre", "Kp", "m")
+    out: dict = {}
+    out["01_diagnostic_only"] = dict(ok=(r.get("diagnostic_only") is True),
+                                     detail=f"diagnostic_only={r.get('diagnostic_only')}")
+    out["02_verify_mode_serial"] = dict(
+        ok=(r.get("verify_mode") == "serial"),
+        detail=f"运行期 target_verify_mode={r.get('verify_mode')}；运行后={r.get('verify_mode_after')}")
+    out["03_row_aligned_off"] = dict(ok=(r.get("row_aligned_wrap_active") is False),
+                                     detail=f"row_aligned_wrap_active={r.get('row_aligned_wrap_active')}")
+    out["04_all_target_gen_s_eq_1"] = dict(ok=(r.get("target_all_m1") is True),
+                                          detail=f"generation_seq_lens={r.get('target_gen_seq_lens')}")
+    out["05_no_block_generation_forward"] = dict(
+        ok=(r.get("target_n_gen_calls_with_s_gt_1") == 0),
+        detail=(f"非 prefill 且 s>1 的 target 调用数={r.get('target_n_gen_calls_with_s_gt_1')}"
+                f"（注意 `specdec_stats.target_block_calls`={((r.get('specdec_stats') or {}).get('target_block_calls'))}"
+                f" 是**每轮一次 verify 调用**的计数器，不是 block 前向数）"))
+    out["06_audit_nonvacuous"] = dict(
+        ok=bool(r.get("audit_sane") is True and (r.get("target_gen_calls") or 0) > 0),
+        detail=f"audit_sane={r.get('audit_sane')} target_gen_calls={r.get('target_gen_calls')} "
+               f"audit_n_calls={r.get('audit_n_calls')}")
+    out["07_accounting_identity"] = dict(ok=((r.get("accounting") or {}).get("matches") is True),
+                                         detail=str(r.get("accounting")))
+    out["08_identity_target_vs_draft"] = dict(
+        ok=bool(r.get("target_label") == "target"
+                and r.get("target_label_source") == "smoke_hooks._HOOK_REGISTRY.tgt"
+                and cr.get("layer_counts_differ") is True and cr.get("target_params_gt_draft") is True),
+        detail=f"label={r.get('target_label')} source={r.get('target_label_source')} cross={cr}")
+    _pref = r.get("target_prefill_seq_lens") or []
+    out["09_prefill_chunked_not_generation"] = dict(
+        ok=bool((r.get("target_n_prefill_calls") or 0) >= 1 and _pref and max(_pref) > 1
+                and r.get("target_n_gen_calls_with_s_gt_1") == 0),
+        detail=f"n_prefill_calls={r.get('target_n_prefill_calls')} prefill_seq_lens={_pref}"
+               f"（分块 prefill 用大 s；generation 里 s>1 计数必须为 0）")
+    n_rounds = r.get("n_rounds")
+    out["10_per_round_trace_complete"] = dict(
+        ok=bool(rc_.get("ok") is True and (r.get("serial_trace_len") or 0) == (n_rounds or -1)
+                and n_rounds and all(k in rc_.get("fields", []) for k in
+                                     ("pre", "Kp", "m", "cands", "g", "emitted", "tgt_len", "drf_len"))
+                if rc_.get("fields") is not None else None),
+        detail=(f"n_rounds={n_rounds} serial_trace_len={r.get('serial_trace_len')} "
+                f"round_fields={rc_.get('fields')} missing={rc_.get('missing')} "
+                f"trace_check={tr.get('ok')}"))
+    out["11_round_invariants"] = dict(
+        ok=bool(rc_.get("ok") is True and r.get("round_invariants_all_ok") is True),
+        detail=f"独立重算 ok={rc_.get('ok')} bad={rc_.get('bad')}；"
+               f"harness all_ok={r.get('round_invariants_all_ok')}")
+    out["12_cache_structure"] = dict(
+        ok=None if r.get("cache_structure_ok") is None
+        else bool(r.get("cache_structure_ok") is True and (r.get("cache_structure_n_checks") or 0) > 0),
+        detail=f"cache_structure_ok={r.get('cache_structure_ok')} "
+               f"n_checks={r.get('cache_structure_n_checks')}")
+    out["13_finite"] = dict(ok=bool(r.get("prefill_finite") is not False
+                                    and r.get("checks_passed") is True
+                                    and (r.get("finiteness_n_checked") or 0) > 0),
+                            detail=f"prefill_finite={r.get('prefill_finite')} "
+                                   f"checks_passed={r.get('checks_passed')} "
+                                   f"finiteness_n_checked={r.get('finiteness_n_checked')}")
+    out["14_gen_ids_in_vocab"] = dict(ok=(r.get("gen_ids_in_vocab") is not False),
+                                      detail=f"gen_ids_in_vocab={r.get('gen_ids_in_vocab')}")
+    out["15_stop_reason_legal"] = dict(
+        ok=bool(r.get("stop_reason") in LEGAL_STOPS and r.get("stop_reason") == r.get("_ar_stop")),
+        detail=f"stop={r.get('stop_reason')} AR_stop={r.get('_ar_stop')} legal={LEGAL_STOPS}")
+    out["16_no_oom"] = dict(ok=bool(r.get("smoke_rc_zero") is True and r.get("model_run_happened") is True
+                                    and (r.get("stage") or "") not in ("crashed",)),
+                            detail=f"stage={r.get('stage')} smoke_rc_zero={r.get('smoke_rc_zero')} "
+                                   f"peak_res_mib={r.get('peak_res_mib')}")
+    return out
+
+
+def _stage1_rounds_fields(rec: dict) -> dict:
+    """需求项 10：逐轮 trace 是否**字段完整**（并给出缺失项），以及 trace/round 一致性。"""
+    rounds = (rec.get("smoke") or {}).get("rounds") or []
+    tr = rec.get("serial_trace") or []
+    need = ("pre", "Kp", "m", "cands", "g", "emitted", "tgt_len", "drf_len",
+            "rollback", "repair", "correction", "all_accept", "tgt_len_after", "drf_len_after")
+    missing = sorted({k for r in rounds for k in need if k not in r})
+    trc = _trace_checks(rec)
+    return dict(n_rounds=len(rounds), fields=(sorted(need) if not missing else None) if rounds else None,
+                missing=missing, ok=bool(rounds and not missing), trace=trc,
+                note=("逐轮字段：pre（轮前 cache 长度=target/draft 的 before）/ Kp / m / cands（proposals）/ "
+                      "g（target predictions）/ emitted / tgt_len·drf_len（after）/ rollback·repair / "
+                      "correction（replacement）/ all_accept（=bonus 情形，bonus 在下一轮 emit）；"
+                      "serial_trace 另给每步 cache 长度与逐步 argmax"))
+
+
+def aggregate_stage1() -> int:
+    from .. import results_schema as S
+    runs = _load_runs()
+    rows_all = [_row(r) for r in runs]
+    for r, raw in zip(rows_all, runs):
+        r["_rounds"] = _stage1_rounds_fields(raw)
+        r["_trace"] = _trace_checks(raw)
+        r["_cross"] = (((raw.get("audit") or {}).get("cross_check")) or {})
+    by: dict = {m: [] for m in ("ar", "prod", "serial")}
+    env_blocked: list = []
+    for r in rows_all:
+        if r.get("blocked_by") == "environment" or r.get("model_run_happened") is False:
+            env_blocked.append(r)
+        else:
+            by.setdefault(r.get("mode"), []).append(r)
+    ar, pr, se = by.get("ar", []), by.get("prod", []), by.get("serial", [])
+    ar_ref = ar[0]["gen"] if ar else None
+    for r in pr + se:
+        r["_ar_stop"] = (ar[0]["stop_reason"] if ar else None)
+        r["_first_div_vs_ar"] = (_first_div(r["gen"], ar_ref) if ar_ref is not None else None)
+
+    needs_review: list = []
+    baseline_fail: list = []
+    serial_fail: list = []
+    # ---- 0) 能否评估 ----
+    for r in env_blocked:
+        cg = r.get("commit_guard") or {}
+        needs_review.append(f"{r['file']}（{r['mode']}/rep{r['rep']}）: 环境不合格（未加载模型）"
+                            f"stage={r.get('stage')} why={str(cg.get('why'))[:110]}")
+    for m, lst in (("ar", ar), ("prod", pr), ("serial", se)):
+        if len(lst) < STAGE1_REQUIRED_REPS:
+            needs_review.append(f"{m}: 可用运行 {len(lst)}/{STAGE1_REQUIRED_REPS}（缺重复 ⇒ 无法评估可重复性）")
+    for r in rows_all:
+        if r.get("stage") == "crashed" or r.get("post_processing_error"):
+            needs_review.append(f"{r['mode']}/rep{r['rep']}: 运行器自身失败 stage={r.get('stage')} "
+                                f"{r.get('post_processing_error')}")
+    # ---- 1) 基线锚点（AR / production）----
+    ar_hash_ok = bool(ar and all(r["gen_hash"] == STAGE1_ANCHORS["ar"]["expected_gen_hash"] for r in ar))
+    ar_len_ok = bool(ar and all(r["gen_len"] == STAGE1_ANCHORS["ar"]["expected_len"] for r in ar))
+    ar_stop_ok = bool(ar and all(r["stop_reason"] == STAGE1_ANCHORS["ar"]["expected_stop"] for r in ar))
+    ar_reps_ok = bool(len(ar) >= 2 and len({tuple(r["gen"]) for r in ar}) == 1)
+    ar_selfhash_ok = bool(ar and all(r["gen_hash"] == r.get("end_state_gen_hash") for r in ar))
+    if ar and not (ar_hash_ok and ar_len_ok and ar_stop_ok and ar_reps_ok):
+        baseline_fail.append(f"AR 未复现历史锚点：hash_ok={ar_hash_ok}（实得 "
+                             f"{[r['gen_hash'] for r in ar]}，期望 {STAGE1_ANCHORS['ar']['expected_gen_hash']}）"
+                             f" len_ok={ar_len_ok} stop_ok={ar_stop_ok} reps_ok={ar_reps_ok}")
+    prod_hash_ok = bool(pr and all(r["gen_hash"] == STAGE1_ANCHORS["prod"]["expected_gen_hash"] for r in pr))
+    prod_len_ok = bool(pr and all(r["gen_len"] == STAGE1_ANCHORS["prod"]["expected_len"] for r in pr))
+    prod_stop_ok = bool(pr and all(r["stop_reason"] == STAGE1_ANCHORS["prod"]["expected_stop"] for r in pr))
+    prod_reps_ok = bool(len(pr) >= 2 and len({tuple(r["gen"]) for r in pr}) == 1)
+    prod_div = (pr[0]["_first_div_vs_ar"] if pr else None)
+    prod_div_ok = bool(prod_div == STAGE1_ANCHORS["prod"]["expected_first_divergence_vs_ar"])
+    if pr and not (prod_hash_ok and prod_len_ok and prod_stop_ok and prod_reps_ok and prod_div_ok):
+        baseline_fail.append(f"production 未复现历史锚点：hash_ok={prod_hash_ok}（实得 "
+                             f"{[r['gen_hash'] for r in pr]}，期望 {STAGE1_ANCHORS['prod']['expected_gen_hash']}）"
+                             f" len_ok={prod_len_ok} stop_ok={prod_stop_ok} reps_ok={prod_reps_ok} "
+                             f"首分歧={prod_div}（期望 "
+                             f"{STAGE1_ANCHORS['prod']['expected_first_divergence_vs_ar']}）")
+    # ---- 2) serial 硬性检查（需求项 1–16）----
+    hard: dict = {}
+    for r in se:
+        key = f"rep{r['rep']}"
+        hard[key] = _serial_hard_checks(r)
+        for name, d in hard[key].items():
+            if d["ok"] is None:
+                needs_review.append(f"serial/{key}: 无法评估 `{name}`（字段缺失）{d['detail']}")
+            elif d["ok"] is False:
+                serial_fail.append(f"serial/{key}: `{name}` 失败 —— {d['detail']}")
+    # ---- 3) serial 与 AR 的 token equality（需求项 17 + 核心命题）----
+    serial_eq_ar = bool(se and ar_ref is not None and all(r["gen"] == ar_ref for r in se))
+    serial_reps_ok = bool(len(se) >= 2 and len({tuple(r["gen"]) for r in se}) == 1)
+    div_rows = [dict(rep=r["rep"], first_divergence=r["_first_div_vs_ar"],
+                     ar_token=(ar_ref[r["_first_div_vs_ar"]] if (ar_ref and r["_first_div_vs_ar"] is not None
+                                                                 and r["_first_div_vs_ar"] < len(ar_ref)) else None),
+                     serial_token=(r["gen"][r["_first_div_vs_ar"]] if (r["_first_div_vs_ar"] is not None
+                                                                       and r["_first_div_vs_ar"] < len(r["gen"]))
+                                   else None))
+                for r in se]
+    if se and ar_ref is not None and not serial_eq_ar:
+        serial_fail.append(f"serial 与 AR 的 token IDs 不一致：{div_rows}")
+    if se and not serial_reps_ok:
+        serial_fail.append("两次 serial 运行不完全一致")
+    # 首个分歧轮的**记录**（只记录，明确不做算子级定位）
+    div_round = None
+    if se and se[0]["_first_div_vs_ar"] is not None:
+        idx = int(se[0]["_first_div_vs_ar"])
+        cum = 0
+        for rr in (se[0].get("_rounds") or {}).get("rounds_detail") or []:
+            if cum <= idx < cum + len(rr.get("emitted") or []):
+                div_round = rr
+                break
+            cum += len(rr.get("emitted") or [])
+    # ---- 4) 判决（次序写死）----
+    if needs_review:
+        decision = "CHECK_NEEDS_REVIEW"
+    elif baseline_fail:
+        decision = "BASELINE_REGRESSION"
+    elif serial_fail:
+        decision = "SERIAL_ORACLE_STAGE1_FAIL"
+    else:
+        decision = "SERIAL_ORACLE_STAGE1_PASS"
+    run_utc = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    summary = dict(
+        tool="serial_oracle_aggregate_stage1", tag=TAG, scope="stage1", family=STAGE1_FAMILY,
+        run_utc=run_utc, git=S.git_meta(ROOT),
+        decision_rule=("本轮任务书 §7：PASS = AR 两进程一致并复现历史 hash；production 两进程一致并复现 "
+                       "hash 与 index 47；serial 两进程一致且 64/64 与 AR 相同；全部几何/缓存/轮/有限性/停止检查通过。"
+                       "次序：先判（能否评估：缺运行/环境不合格/字段缺失 ⇒ CHECK_NEEDS_REVIEW）"
+                       "⇒ 再判基线锚点（⇒ BASELINE_REGRESSION）⇒ 再判 serial 硬门"
+                       "（⇒ SERIAL_ORACLE_STAGE1_FAIL）⇒ 最后 PASS"),
+        pre_registered_anchors=STAGE1_ANCHORS, required_reps=STAGE1_REQUIRED_REPS,
+        default_off="serial 模式仅作用于 target verification；row-aligned 必须关闭",
+        n_runs_total=len(rows_all), n_runs_used=len(ar) + len(pr) + len(se),
+        n_env_blocked=len(env_blocked),
+        anchors=dict(ar=dict(hash_ok=ar_hash_ok, len_ok=ar_len_ok, stop_ok=ar_stop_ok,
+                             reps_identical=ar_reps_ok, self_reported_hash_agrees=ar_selfhash_ok,
+                             hashes=[r["gen_hash"] for r in ar], lens=[r["gen_len"] for r in ar],
+                             stops=[r["stop_reason"] for r in ar],
+                             expected=STAGE1_ANCHORS["ar"]),
+                     prod=dict(hash_ok=prod_hash_ok, len_ok=prod_len_ok, stop_ok=prod_stop_ok,
+                               reps_identical=prod_reps_ok,
+                               first_divergence=prod_div, first_divergence_ok=prod_div_ok,
+                               hashes=[r["gen_hash"] for r in pr], lens=[r["gen_len"] for r in pr],
+                               stops=[r["stop_reason"] for r in pr],
+                               expected=STAGE1_ANCHORS["prod"])),
+        serial=dict(reps_identical=serial_reps_ok, equals_ar=serial_eq_ar,
+                    hashes=[r["gen_hash"] for r in se], lens=[r["gen_len"] for r in se],
+                    stops=[r["stop_reason"] for r in se],
+                    first_divergence_vs_ar=[r["_first_div_vs_ar"] for r in se],
+                    divergence_detail=div_rows,
+                    geometry=dict(target_gen_calls=[r.get("target_gen_calls") for r in se],
+                                  generation_seq_lens=[r.get("target_gen_seq_lens") for r in se],
+                                  n_block_generation_forwards=[r.get("target_n_gen_calls_with_s_gt_1") for r in se],
+                                  accounting_matches=[(r.get("accounting") or {}).get("matches") for r in se],
+                                  prefill_seq_lens=[r.get("target_prefill_seq_lens") for r in se],
+                                  specdec_target_block_calls=[(r.get("specdec_stats") or {}).get("target_block_calls")
+                                                              for r in se])),
+        hard_checks=hard,
+        needs_review=needs_review, baseline_failures=baseline_fail, serial_failures=serial_fail,
+        decision=decision, runs=rows_all,
+        next_round_allowed=(decision == "SERIAL_ORACLE_STAGE1_PASS"),
+        next_round_note=("仅当判决为 SERIAL_ORACLE_STAGE1_PASS 时才**建议**下一轮执行 F01/F02/F08/F10 Stage 2；"
+                         "本轮**不执行** Stage 2"))
+    p = OUTDIR / f"{TAG}_stage1_aggregate_{run_utc}.json"
+    pj = OUTDIR / f"{TAG}_stage1_aggregate_{run_utc}.jsonl"
+    with pj.open("w", encoding="utf-8") as fh:
+        for r in rows_all:
+            fh.write(json.dumps(r, ensure_ascii=False, default=str) + "\n")
+    summary["artifact_json"] = str(p)
+    summary["artifact_jsonl"] = str(pj)
+    p.write_text(json.dumps(summary, ensure_ascii=False, indent=1, default=str), encoding="utf-8")
+
+    print(f"== Stage 1（F13）聚合 ==")
+    print(f"  运行：total={len(rows_all)} used={len(ar) + len(pr) + len(se)} env_blocked={len(env_blocked)}"
+          f"（AR {len(ar)} / prod {len(pr)} / serial {len(se)}）")
+    print(f"  AR 锚点：hash_ok={ar_hash_ok} len_ok={ar_len_ok} stop_ok={ar_stop_ok} "
+          f"reps={ar_reps_ok} hashes={[r['gen_hash'] for r in ar]}")
+    print(f"  production 锚点：hash_ok={prod_hash_ok} len_ok={prod_len_ok} stop_ok={prod_stop_ok} "
+          f"reps={prod_reps_ok} 首分歧={prod_div}（期望 "
+          f"{STAGE1_ANCHORS['prod']['expected_first_divergence_vs_ar']}）")
+    print(f"  serial 几何：seq_lens={[r.get('target_gen_seq_lens') for r in se]} "
+          f"block_forwards={[r.get('target_n_gen_calls_with_s_gt_1') for r in se]}")
+    print(f"  serial == AR：{serial_eq_ar}（首分歧 {[r['_first_div_vs_ar'] for r in se]}）；"
+          f"两进程一致={serial_reps_ok}")
+    for x in needs_review:
+        print(f"  [需复核] {x}")
+    for x in baseline_fail:
+        print(f"  [基线回归] {x}")
+    for x in serial_fail:
+        print(f"  [serial 硬门失败] {x}")
+    print(f"  ★ 判决 = {decision}")
+    print(f"\n[so-s1] RESULT_JSON={p}")
+    print(f"[so-s1] RESULT_JSONL={pj}")
+    return 0 if decision == "SERIAL_ORACLE_STAGE1_PASS" else 1
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--scope", choices=("stage1", "final"), default="stage1")
     a = ap.parse_args()
+    if a.scope == "stage1":
+        return aggregate_stage1()
     return aggregate(a.scope)
 
 
