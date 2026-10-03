@@ -106,7 +106,7 @@ def _versions() -> dict:
                 cudnn_allow_tf32=bool(torch.backends.cudnn.allow_tf32),
                 deterministic=bool(torch.are_deterministic_algorithms_enabled()),
                 cublas_workspace_config=os.environ.get("CUBLAS_WORKSPACE_CONFIG"),
-                prefer_blas=(torch.backends.cuda.preferred_blas_library()
+                prefer_blas=(str(torch.backends.cuda.preferred_blas_library())
                              if hasattr(torch.backends.cuda, "preferred_blas_library") else None))
 
 
