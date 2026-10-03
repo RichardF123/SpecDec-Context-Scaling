@@ -102,6 +102,13 @@
 ① 聚合器与核对器的 **tag 参数化**（CLI 或环境变量）；② 聚合器的 **family 集合参数化**（或改为从产物自动发现 family）；
 ③ 核对器移入 `scripts/` 并参数化。修改后**必须**用 `serial_oracle_aggregate_selftest_cpu`（含字段名契约检查）+ 守卫复跑验证。
 
+> **2026-10-04 更新：上述三项阻断已修复**（不再是"建议"）。实际做法比原建议更强：**新写**
+> `specdec/engine/stage2b_verdict.py`（`--tag/--families/--modes/--reps` **全部必填**，覆盖性不满足即
+> `CHECK_NEEDS_REVIEW`），并把核对器改为受版本控制的 `specdec/engine/stage_check.py`；
+> legacy 路径另加"越界 family ⇒ NEEDS_REVIEW"的反静默提示（不改其既有判决）。
+> 修复证据、自测输出（**27/0** 与 **21/0**）、以及更新后的复制即用命令见
+> `docs/stage2b_runbook_2026-10-04.md`。**本节其余内容保留为当时的审计记录，不改写。**
+
 ---
 
 ## 4. V-only FP8 的 Gate A 缺口（**不得**用 BF16 的五 family PASS 外推）

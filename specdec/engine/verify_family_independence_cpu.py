@@ -105,7 +105,25 @@ OPT_IN_CONSUMERS = {"g5_8k_smoke_cudnn.py",      # fam16 授权轮（SMOKE_FAMIL
                     # 2026-10-03 经**本轮任务**（分层正确性协议的未见数据验证）登记：
                     # 决策位置 top-1/top-2/margin 提取 —— **注册范围仅限协议预登记的 4 个 family**
                     # （F01/F02/F08/F10；由下方 scoped 检查把这一限制变成可判定条件）
-                    "correctness_protocol_margins.py"}
+                    "correctness_protocol_margins.py",
+                    # 2026-10-04 登记：**Stage 2b 工具**（判决/逐阶段核对/预检/自测）。
+                    # 它们会**读取**记录里的 manifest 字段（`family_id` / `window_token_start` /
+                    # `token_sha1` 等）与 manifest 本身（预检复现 token hash）⇒ 按 `_manifest_consumers()`
+                    # 的口径属于消费方，必须显式登记（登记 + 下方 scoped 检查；**不放宽**任何既有检查）。
+                    # 它们**不产生任何 run**，因此**不**影响 run 级授权检查。
+                    "stage2b_verdict.py", "stage2b_preflight_cpu.py",
+                    "stage2b_verdict_selftest_cpu.py"}
+                    # 注：`stage_check.py` **不**登记 —— 它不引用 manifest 字段（`_manifest_consumers()`
+                    # 的检测器扫不到它），而"消费方集合 == OPT_IN_CONSUMERS"是**等式**检查，
+                    # 多登记一个检测不到的文件会直接判失败（首版即如此）。
+
+# 2026-10-04：**Stage 2b 候选 family**（尚未授权运行；D-3 待批准）。
+# 语义边界（必须写清，避免"登记=已授权"的误读）：
+#   * 这里只是把这些 id 从"**未知**字面量"降级为"**已知候选**"，使**工具源码**可以通过源级检查；
+#   * **run 级**授权**没有**放宽：任何 *run* 消费这四个 family 仍会被
+#     `smoke_other` / `outside` 检查判为**越界**（下方另有专门的"候选 family 未被任何 run 消费"检查）；
+#   * D-3 批准前**不得**用它们跑任何 GPU 任务。
+STAGE2B_CANDIDATE_FAMILIES = ("F09", "F03", "F11", "F04")
 
 # 2026-10-03：本轮协议**预登记**的未见数据 family（四 stratum 各取最小 id，排除 F13/F06）。
 # 授权来源 = **用户在本轮任务中明确指定**"从 manifest 选 4 个未参与 8209/F13 定位的 family，
@@ -392,6 +410,21 @@ def main() -> int:
     _so_out_of_scope = [f for f in _so_ids if f not in so_fams]
     check("★ 本轮运行器/汇总器的**源码**里没有授权集合之外的 family 字面量（源级检查）",
           not _so_out_of_scope, dict(found=_so_ids, out_of_scope=_so_out_of_scope))
+    # 源级（Stage 2b 工具，2026-10-04 新增）：允许的 family 字面量 = 已授权集合 ∪ **候选集合**。
+    # 候选集合只用于"让工具源码可被检查"，**不构成 run 级授权**（见下方 run 级检查）。
+    _s2b_src = "\n".join((ROOT / "specdec" / "engine" / n).read_text(encoding="utf-8", errors="ignore")
+                         for n in ("stage2b_verdict.py", "stage_check.py",
+                                   "stage2b_preflight_cpu.py", "stage2b_verdict_selftest_cpu.py")
+                         if (ROOT / "specdec" / "engine" / n).exists())
+    _s2b_allowed = set(so_fams) | set(STAGE2B_CANDIDATE_FAMILIES) | {"F06"}   # F06 = 已登记的定点诊断 family
+    _s2b_ids = sorted({m for m in re.findall(r"(?<![A-Za-z0-9_])F\d{2}\b", _s2b_src)})
+    _s2b_bad = [f for f in _s2b_ids if f not in _s2b_allowed]
+    check("★ Stage 2b 工具的源码里只有'已授权 ∪ 候选'的 family 字面量（候选 = 待 D-3，未授权运行）",
+          not _s2b_bad, dict(found=_s2b_ids, allowed=sorted(_s2b_allowed), out_of_scope=_s2b_bad))
+    _cand_used = [u["file"] for u in used
+                  if (u.get("family") or {}).get("family_id") in STAGE2B_CANDIDATE_FAMILIES]
+    check("★ Stage 2b 候选 family **尚未被任何 run 消费**（D-3 批准前不得跑；run 级授权未放宽）",
+          not _cand_used, dict(n_bad=len(_cand_used), bad=_cand_used[:4]))
     scoped = [u for u in used if (u.get("tool") or "").startswith("prefill_sb_replay_f06")]
     bad_family = [u["file"] for u in scoped
                   if (u.get("family") or {}).get("family_id") != "F06"]

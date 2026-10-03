@@ -113,6 +113,23 @@ def main() -> int:
     checks += [_ck("s07_no_unexpectedly_unevaluable_hard_check", not none_items, none_items),
                _ck("s08_hard_check_count_is_16", len(h16) == 16, sorted(h16))]
 
+    # 4b) **Stage 2b 工具**也必须满足字段名契约（同一类缺陷 D7/D9 的防线）
+    try:
+        from . import stage2b_verdict as SV
+        src2 = (ROOT / "specdec" / "engine" / "stage2b_verdict.py").read_text(encoding="utf-8")
+        src3 = (ROOT / "specdec" / "engine" / "stage_check.py").read_text(encoding="utf-8")
+        row2 = {**SV._row(rec), "_rounds": None, "_trace": None, "_cross": None} if rec else {}
+        refs2 = (_referenced_row_fields(src2) | _referenced_row_fields(src3)) - INTERNAL_KEYS
+        missing2 = sorted(k for k in refs2 if k not in row2)
+        checks += [_ck("s12_stage2b_field_names_exist_in_SV_row", not missing2,
+                       dict(missing=missing2, n_refs=len(refs2))),
+                   _ck("s13_stage2b_scan_found_references", len(refs2) >= 10, len(refs2)),
+                   _ck("s14_SV_row_is_superset_of_AGG_row", set(AG._row(rec)) <= set(SV._row(rec))
+                       if rec else False)]
+    except Exception as e:                                                # noqa: BLE001
+        checks += [_ck("s12_stage2b_field_names_exist_in_SV_row", False,
+                       f"无法检查：{type(e).__name__}: {str(e)[:120]}")]
+
     # 5) F13 的 D6 项必须是 **na**（带理由），不是 False、也不是静默跳过
     f13 = [f for f in sorted(OUTDIR.glob("div8209_so_F13_serial_rep*_*.json"))
            if json.loads(f.read_text(encoding="utf-8-sig")).get("model_run_happened")]

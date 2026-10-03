@@ -841,6 +841,16 @@ def aggregate_final() -> int:
     baseline_fail: list = []
     serial_fail: list = []
     per_family: dict = {}
+    # ⚠️ 反静默（审计 B-2）：本 legacy 路径的 family 集合写死为 `STAGE2_FAMILIES`；若该 tag 内出现
+    #    **集合之外**的 family（例如后续 Stage 2b 计划新增的候选 family），本路径**不评它们** ⇒
+    #    必须转成需复核，否则会产出"没看数据却像通过"的判决。新数据请改用
+    #    `python -X utf8 -m specdec.engine.stage2b_verdict --tag ... --families ... --reps ...`
+    #    （此处**故意不写**候选 family 的字面量：守卫的源级检查只允许已授权集合内的 family 字面量。）
+    _off_scope = sorted({r.get("case") for r in rows_all if r.get("case") not in STAGE2_FAMILIES})
+    if _off_scope:
+        needs_review.append(
+            f"tag 内存在 STAGE2_FAMILIES 之外的 family {_off_scope} ⇒ legacy 路径**不评**这些 family；"
+            f"请改用 stage2b_verdict（显式 --tag/--families/--reps）")
     for fam in STAGE2_FAMILIES:
         d = by.get(fam, {})
         ar, se = d.get("ar", []), d.get("serial", [])
