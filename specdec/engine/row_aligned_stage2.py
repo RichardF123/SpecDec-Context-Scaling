@@ -256,8 +256,7 @@ def aggregate() -> int:
     summary["stage2_hard_gate"] = ("PASS" if (checks and all(checks.values())) else "FAIL")
     # ★ 先落盘（含全部生成 IDs），再打印
     sp_pt = OUTDIR / f"{TAG}_stage2_summary_{summary['run_utc']}.pt"
-    torch.save({r["case"] + "|" + r["mode"] + "|" + str(r["rep"]): r["smoke"].get("gen")
-                for r in summary["runs"] if r.get("gen") is not None or True}, str(sp_pt))
+    torch.save({f"{r['case']}|{r['mode']}|rep{r['rep']}": r.get("gen") for r in summary["runs"]}, str(sp_pt))
     sp = OUTDIR / f"{TAG}_stage2_summary_{summary['run_utc']}.json"
     summary["artifact_pt"] = str(sp_pt)
     summary["artifact_json"] = str(sp)
