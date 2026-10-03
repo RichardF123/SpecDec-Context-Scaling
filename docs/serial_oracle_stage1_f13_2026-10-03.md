@@ -6,23 +6,23 @@
 
 ## 0. 结论速览
 
-**本报告包含同一轮 Stage 1 的三次尝试**（第 2 次在环境检查器判据修正之后）。三次都在**环境门**被拦下，
-**均未加载模型、均未执行 Stage 1 的任何一次运行**。
+**本报告包含同一轮 Stage 1 的四次尝试**（第 2 次在环境检查器判据修正之后；第 4 次实际执行完成）。
+前三次都在**环境门**被拦下（未加载模型、0/6 次运行）；第 4 次环境合格并按固定顺序完成 **6/6 次运行**。
 
 | 尝试 | 时间（UTC） | 关键读数（available commit） | 判决 |
 | --- | --- | --- | --- |
 | 第 1 次 | 15:12:35Z | **14.441 GiB**（< harness 16 GiB 线） | **`ENVIRONMENT_BLOCKED`** |
 | 第 2 次 | 15:37:31Z | **17.374 GiB**（≥ 16，< 18，差 0.63 GiB） | **`ENVIRONMENT_MARGIN_TOO_LOW`** |
-| 第 3 次 | 16:07:42Z | **17.190 GiB**（≥ 16，< 18，差 **0.81 GiB**） | **`ENVIRONMENT_MARGIN_TOO_LOW`** |
+| 第 3 次 | 16:07:42Z | **17.190 GiB**（≥ 16，< 18，差 0.81 GiB） | **`ENVIRONMENT_MARGIN_TOO_LOW`** |
+| **第 4 次** | **16:11:54Z** | **24.100 GiB**（margin +6.10 GiB）**⇒ ENVIRONMENT_OK** | **`SERIAL_ORACLE_STAGE1_PASS`** ✅ |
 
 | 项 | 结果 |
 | --- | --- |
-| **本轮最终判决** | **`ENVIRONMENT_MARGIN_TOO_LOW`**（尚未进入任何生成；详见 §12、§13） |
-| 是否加载模型 | **否**（工作树 clean、未设置 `SMOKE_ALLOW_UNQUALIFIED`、未降低任何安全线、未结束任何用户进程） |
-| 是否执行 Stage 1 | **否**（0/6 次运行） |
-| 是否执行 Stage 2 | **否**，且**不允许建议**执行（只有 `SERIAL_ORACLE_STAGE1_PASS` 才可建议） |
-| 关于 serial oracle 的结论 | **无**（真实模型上一条数值证据都没有） |
-| 这不是 | 不是 `SERIAL_ORACLE_STAGE1_FAIL`（任务书明确禁止把环境拒绝归为此类）；也不是 `BASELINE_REGRESSION`（AR/production 锚点**未验证**，无从判回归） |
+| **本轮最终判决** | **`SERIAL_ORACLE_STAGE1_PASS`**（6/6 次运行完成，判据见 §14.8） |
+| AR 历史锚点 | **复现**：`6e7522bf2521ad7b`（两次均一致） |
+| production 历史锚点 | **复现**：`e90dad2b3fcf1c65`，相对 AR 首分歧 **index 47** |
+| serial oracle | **与 AR 完整 64 token 完全相同**（hash 相同、首分歧 = `null`），两进程一致 |
+| 是否允许建议 Stage 2 | **允许建议**（本轮**未执行** Stage 2） |
 
 ## 1. 本轮实际执行了什么（时间线，UTC）
 
@@ -319,3 +319,188 @@ CSV 解析（含名字里带逗号）· 分类逻辑逐类（空列表 / 纯桌�
   `node` 3.04 · `DSH Desktop` 2.71（本会话环境，别关）· `ChatGPT`×3 ≈ **2.49** · `Doubao` 0.66 ·
   `msedge` 0.61 · `QQMusic` 0.60 · `msedgewebview2` 0.59 · `mysqld` 0.57 · `MsMpEng` 0.50 ·
   `steamwebhelper` 0.48 GiB。**只关 ChatGPT 三个进程就足够**（≈2.49 GiB ⇒ free commit 约 19.7 GiB）。
+
+---
+
+# 14. **Stage 1 实际执行与判决**（第 4 次尝试，2026-10-03 16:11–16:19Z）
+
+## 14.1 开跑前检查：`ENVIRONMENT_OK`
+
+产物：`output/g5/attn/serial_oracle_env_check_20261003T161154Z.json`
+
+| 项 | 实测 | 判定 |
+| --- | --- | --- |
+| 工作树 | commit `909dda642a854522fdc1a07d86b21095daba4ba6`，dirty=False | ✅ clean |
+| available commit | **24.100 GiB**（需要 ≥18；margin **+6.10 GiB**） | ✅ |
+| harness 16 GiB 门（未改） | 通过 | ✅ |
+| P-state | qualified=True，sm_median 2325 MHz，mem_median 8000 MiB | ✅ |
+| GPU 残留 | 19 个进程中**本项目 0**（本项目 Python/实验进程 = 0） | ✅ clean |
+| 显存 | 387 MiB 已用 / 7701 MiB 可用 | 记录（非门槛） |
+| `SMOKE_ALLOW_UNQUALIFIED` | 未设置 | ✅ |
+
+## 14.2 六次运行的原始产物（**每次独立进程、串行执行**，全部在 commit `909dda64`）
+
+| # | 模式 | rep | 产物 JSON | 长度 | stop | gen hash | wall_s | peak_reserved |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 | AR（target-only） | 1 | `div8209_so_F13_ar_rep1_20261003T161218Z.json` | 64 | `max_new_reached` | `6e7522bf2521ad7b` | 9.01 | 9668 MiB |
+| 2 | AR | 2 | `div8209_so_F13_ar_rep2_20261003T161251Z.json` | 64 | `max_new_reached` | `6e7522bf2521ad7b` | 8.33 | 9668 MiB |
+| 3 | production SpecDec | 1 | `div8209_so_F13_prod_rep1_20261003T161411Z.json` | 64 | `max_new_reached` | `e90dad2b3fcf1c65` | 42.68 | 10648 MiB |
+| 4 | production SpecDec | 2 | `div8209_so_F13_prod_rep2_20261003T161519Z.json` | 64 | `max_new_reached` | `e90dad2b3fcf1c65` | 48.27 | 10648 MiB |
+| 5 | **serial oracle SpecDec** | 1 | `div8209_so_F13_serial_rep1_20261003T161655Z.json` | 64 | `max_new_reached` | **`6e7522bf2521ad7b`** | 59.99 | 10648 MiB |
+| 6 | **serial oracle SpecDec** | 2 | `div8209_so_F13_serial_rep2_20261003T161820Z.json` | 64 | `max_new_reached` | **`6e7522bf2521ad7b`** | 60.21 | 10648 MiB |
+
+> `wall_s` 含插桩、仅供运行观测；按仓库既有计时纪律**不进入任何加速比结论**（本轮也不做速度结论）。
+
+## 14.3 冻结配置逐项核对（与设计文档一致，未改动）
+
+family **F13** · target Qwen2.5-1.5B-Instruct · draft Qwen2.5-0.5B-Instruct · ctx **8192** · chunk **2048** ·
+k **4** · max_new **64** · dtype **BF16** · target KV **base_bf16** · attention **all-eager** ·
+target RoPE **CPU-FP32 inv_freq**（`SMOKE_TARGET_ROPE=cpu_fp32`）· greedy argmax ·
+`SMOKE_BF16_RED_REDUCTION=1` · `SMOKE_STRUCT_CHECK=1` · 每次独立进程 · 不共享 cache · 不自动重试 ·
+serial 模式**仅**作用于 target verification · row-aligned wrapper **关闭**。
+
+## 14.4 阶段一：AR ×2 —— 历史锚点**复现**
+
+| 检查 | 期望 | 实测 | 结果 |
+| --- | --- | --- | --- |
+| hash | `6e7522bf2521ad7b` | 两次均 `6e7522bf2521ad7b` | ✅ |
+| 长度 | 64 | 64 / 64 | ✅ |
+| stop | `max_new_reached` | 两次均 `max_new_reached` | ✅ |
+| 两次完整 token IDs 一致 | 是 | **是** | ✅ |
+| 我算的 hash vs harness 记录的 `end_state.gen_hash` | 一致 | 一致（两处独立） | ✅ |
+| target generation 调用几何 | 全部 `s=1` | `generation_seq_lens=[1]`，63 次调用，记账 63/63 | ✅ |
+
+⇒ **新 runner 未改变 AR 路径**；AR 基线可信。
+
+## 14.5 阶段二：production SpecDec ×2 —— 历史锚点**复现**
+
+| 检查 | 期望 | 实测 | 结果 |
+| --- | --- | --- | --- |
+| hash | `e90dad2b3fcf1c65` | 两次均 `e90dad2b3fcf1c65` | ✅ |
+| 长度 / stop | 64 / `max_new_reached` | 64 / `max_new_reached`（两次） | ✅ |
+| 两次一致 | 是 | **是** | ✅ |
+| **相对 AR 首分歧 index** | **47** | **47**（两次均 47） | ✅ |
+| 几何（对照） | 出现 `s=Kp` 的 block 校验 | `generation_seq_lens=[1, 4]`，43 次调用，记账 43/43 | ✅ |
+
+⇒ **production 路径与历史逐位一致**（含首分歧位置），基线锚点全部成立。
+
+## 14.6 阶段三：serial oracle ×2 —— 17 项硬检查全部通过
+
+两次运行的 16 项逐 run 硬检查**逐项为真**，加上跨 run 的重复性 = **17/17**：
+
+| # | 检查 | 实测（两次相同） |
+| --- | --- | --- |
+| 1 | `diagnostic_only=true` | ✅ |
+| 2 | 运行期 `target_verify_mode="serial"` | ✅ |
+| 3 | row-aligned **未**启用 | ✅（`row_aligned_wrap_active=False`） |
+| 4 | target generation 前向**全部 `s=1`** | ✅ `generation_seq_lens=[1]`（**115** 次调用） |
+| 5 | **无 block（`s>1`）generation 前向** | ✅ `n_block_generation_forwards=0` |
+| 6 | 调用审计**非空**且非空泛 | ✅ `n_calls=238`、2 个实例、`sane=true`、`certifies_m1=true` |
+| 7 | 调用数与记账一致 | ✅ `target_calls=115 == proposed 97 + rollbacks 18 = 115` |
+| 8 | target/draft 按**实例身份**区分 | ✅ 来源 `smoke_hooks._HOOK_REGISTRY.tgt`；层数 28 vs 24、参数量 1.5B vs 0.5B 交叉核对 |
+| 9 | 分块 prefill 未被误判为 generation | ✅ prefill **4 次 × `s=2048`**（8192/2048），generation 里 `s>1` 计数为 0 |
+| 10 | 逐轮 trace 完整 | ✅ **25 轮 = 25 条 trace**；字段 `pre/Kp/m/cands/g/emitted/tgt_len/drf_len/rollback/repair/correction/all_accept` 全在，另含每步 cache 长度与逐步 argmax |
+| 11 | round invariants | ✅ 独立重算 `tgt_len==drf_len==pre+(m+1\|Kp)` 全过；harness `all_ok=true` |
+| 12 | cache 结构/长度/dtype | ✅ `cache_structure_ok=true`，**50** 次结构检查 |
+| 13 | logits/cache 全 finite | ✅ harness 判定通过、**210** 次有限性检查、14/14 必需项、`uncovered=[]`、`first_bad=null`、逐阶段全 ok |
+| 14 | gen IDs 合法 | ✅ `gen_ids_in_vocab=true` |
+| 15 | stop 合法且与 AR 相同 | ✅ `max_new_reached`（== AR） |
+| 16 | 无 OOM | ✅ rc=0、峰值 reserved 10648 MiB（8 GiB 卡） |
+| 17 | **两次独立运行一致** | ✅ hash、长度、stop、完整 token IDs 全同 |
+
+控制流统计（两次相同）：`rounds=25` · `proposed=97` · `accepted=46` · `rollbacks=18` · `mismatch=18` ·
+`all_accept=7` · `draft_calls=97`。
+
+> **命名澄清（必须写进报告）**：`specdec_stats.target_block_calls=25` 在 `spec_dec` 里的历史含义是
+> "**每轮一次 verify 调用**"的计数器，**不是** `s>1` 的 block 前向数。serial 模式下它自然等于轮数（25）。
+> 需求项 5 的实质（"不存在 block 前向"）由审计的逐阶段 `seq_len` 明细给出：**0**。两者都如实记录，
+> 没有把 25 说成 0，也没有把 0 说成 25。
+
+## 14.7 核心命题：serial oracle 与 AR 的 token equality
+
+| 项 | 结果 |
+| --- | --- |
+| serial hash（两次） | **`6e7522bf2521ad7b`** —— 与 AR **完全相同** |
+| 长度 / stop | 64 / `max_new_reached`（与 AR 相同） |
+| **相对 AR 的首分歧 index** | **`null`（不存在）** ⇒ **完整 64/64 token 逐位相同** |
+| 两次 serial 之间 | 完整 token IDs 一致 |
+
+因此不需要记录"首分歧 index / round / proposals / `g` / `m` / branch / cache before-after / saved-next"——
+因为**没有分歧**。（若出现分歧，本 runner 的逐轮 trace 已具备记录这些字段的能力。）
+
+## 14.8 判决：`SERIAL_ORACLE_STAGE1_PASS`
+
+判据（任务书 §7）与本轮实际数据逐条对应：
+
+| PASS 条件 | 依据 |
+| --- | --- |
+| AR 两次一致并复现历史 hash | 两次 `6e7522bf2521ad7b`，64，`max_new_reached`（§14.4） |
+| production 两次一致并复现历史 hash 与 index 47 | 两次 `e90dad2b3fcf1c65`，首分歧 **47**（§14.5） |
+| serial 两次一致 | hash/长度/stop/完整 token IDs 全同（§14.6 第 17 项） |
+| serial 完整 64 token 与 AR 完全相同 | hash 相同、首分歧 `null`（§14.7） |
+| 全部调用几何/缓存/轮/有限性/停止检查通过 | 17/17 硬检查通过（§14.6） |
+
+* `hard_failures=[]`、`baseline_failures=[]`、`serial_failures=[]`、`needs_review=[]`（聚合 JSON 内可核）。
+* **未**使用 margin/ULP 豁免；**未**改动门槛；**未**使用 `SMOKE_ALLOW_UNQUALIFIED`；**未**结束任何用户进程。
+* 机器可读判决：`output/g5/attn/div8209_so_stage1_aggregate_20261003T162327Z.json`（`decision=SERIAL_ORACLE_STAGE1_PASS`，`next_round_allowed=true`）。
+
+## 14.9 本轮发现的**工具缺陷**（D6/D7/D8）与两次中间判决
+
+三个缺陷**都不在被测算法里**（`spec_dec` / `serial_oracle` 的语义一字未改），而在**我的记录/判定工具**里。
+按纪律：**不重跑实验**、保留全部中间产物、并公开中间判决。
+
+| # | 缺陷 | 类别 | 表现 | 修正（**事后**、无重跑） |
+| --- | --- | --- | --- | --- |
+| **D6** | 运行器在**复位之前**读 `verify_mode_after_run` | 记录顺序缺陷 | serial 运行的 `mode_restored_to_block` 恒为 `False` ⇒ `stage=complete_with_selfcheck_failures`。**不是复位失效**：读点在 L186、复位在 L202 | 改为 `verify_mode_at_run_end`（运行结束时的模式）+ **复位之后**再读 `verify_mode_after_run`（应为 `block`），使该自检真正检验杀开关 |
+| **D7** | 有限性计数读错字段路径 | 字段映射缺陷 | 读 `checks.n_checked`（不存在，恒 None）⇒ 需求项 13 被**误判为失败** ⇒ 首次聚合给出 `CHECK_NEEDS_REVIEW`。真实路径是 `checks.finiteness_coverage.n_checked = 210` | 按真实路径读取；并把该项**加严**（另要求 `uncovered==[]`、`first_bad is None`、逐阶段 ok、cache 结构 ok） |
+| **D8** | 把**本轮之前**的废弃探测记录当成"本轮缺证据" | 判定范围缺陷 | 3 条历史环境不合格记录（14:06/14:38/14:44Z 的门试探）进入 `needs_review` ⇒ 判决被拉成 `CHECK_NEEDS_REVIEW`，尽管本轮 2/2/2 运行齐备 | 环境不合格记录改为**单独列出**（`env_blocked_records`，仅报告）；**仅当导致必需重复数 <2 时**才进入 `needs_review`（该规则保留，未放宽） |
+
+**中间判决（保留并公开）**：
+
+| 聚合产物 | 判决 | 原因 |
+| --- | --- | --- |
+| `div8209_so_stage1_aggregate_20261003T162059Z.json` | `CHECK_NEEDS_REVIEW` | D7（`13_finite` 误判） |
+| `div8209_so_stage1_aggregate_20261003T162232Z.json` | `CHECK_NEEDS_REVIEW` | D8（历史环境记录被计入） |
+| `div8209_so_stage1_aggregate_20261003T162327Z.json` | **`SERIAL_ORACLE_STAGE1_PASS`** | D7/D8 修正后，对**同一批**六次运行产物重新判定 |
+
+**不重跑的理由**：D6/D7/D8 只影响"如何读记录"与"哪些记录进入本轮判定"，不改变任何数值路径；
+六次运行产物（commit `909dda64`）保持原样、未覆盖、未重算；修正后重新判定所依据的仍是同一批原始文件
+（`gen`、`tot_len`、审计、trace、harness 检查全部取自运行当时写下的值）。
+
+## 14.10 已证明与未证明
+
+**已证明（本轮的实测数据）**
+1. 在 F13（ctx 8192、k=4、max_new=64、BF16、all-eager、target CPU-FP32 RoPE、greedy）上，
+   **当 target verification 完全走与 AR 相同的逐 token `M=1` 路径时，现有 SpecDec 控制逻辑生成了与
+   target-only AR 完全相同的 64 个 token IDs**（hash 相同、首分歧 `null`、两次独立进程一致）。
+2. 该结论伴随**调用几何的硬证据**：target 的 115 次 generation 前向**全部 `s=1`**、**0** 次 block 前向、
+   4 次分块 prefill 未被误判；调用数与解码器记账恒等（115 = 97 + 18）。
+3. 控制逻辑（accept / replacement / rollback / EOS / 截断 / cache 提交与回滚）在真实模型上
+   逐轮不变量全过（25 轮），cache 结构 50 次检查全过，有限性 210 次检查全过。
+4. **基线未被改动**：AR 与 production 两条路径都逐位复现历史锚点（含 production 的首分歧 index 47）。
+
+**未证明 / 不得外推**
+* **不是**"所有输入上的形式化证明"：本轮只覆盖 **1 个 family（F13）**；F01/F02/F08/F10 **未运行**。
+* **不**证明 production block verification 的差异"是什么"——只证明在冻结锚点上它复现历史行为；
+  差异归因（有限精度执行路径）仍属**解释**，不是本轮数据能证明的。
+* 本轮**没有**速度结论：serial 验证每轮 `kp` 次串行前向，`wall_s≈60 s` 明显慢于 AR（≈9 s）与
+  production（≈43–48 s），但计时含插桩，**不作为加速比**，也不影响"控制逻辑正确性"这一结论。
+* Stage 1 的 PASS **不**等于 B6 通过；**不**授权启动正式实验。
+
+## 14.11 下一轮建议（**本轮不执行**）
+
+判决为 `SERIAL_ORACLE_STAGE1_PASS` ⇒ 按任务书**允许建议**下一轮执行 F01/F02/F08/F10 的 Stage 2
+（每 family：AR ×2 + serial ×2 = 4 次，共 16 次；production/row-aligned 不重跑，引用既有结果）。
+建议在 Stage 2 前先确认环境门（≥18 GiB）并重跑治理守卫（记录级检查将首次变为非空）。
+**本轮不启动 Stage 2、B6、pilot 或 factorial。**
+
+## 14.12 本轮产物清单（第 4 次尝试）
+
+| 类型 | 路径 |
+| --- | --- |
+| 环境检查 | `output/g5/attn/serial_oracle_env_check_20261003T161154Z.json` |
+| 六次运行原始产物 | `div8209_so_F13_{ar,prod,serial}_rep{1,2}_20261003T16*.json`（+ 同名 `.pt` 生成 ID） |
+| 运行日志 | `output/g5/attn/div8209_so_F13_{ar,prod,serial}_rep{1,2}.log`、`div8209_so_batch_*.log` |
+| 聚合 JSON / JSONL | `div8209_so_stage1_aggregate_20261003T162327Z.json` / `.jsonl` |
+| 中间判决（保留） | `div8209_so_stage1_aggregate_20261003T162059Z.json`、`..._20261003T162232Z.json` |
+| 本报告 | `docs/serial_oracle_stage1_f13_2026-10-03.md`（本节 §14） |

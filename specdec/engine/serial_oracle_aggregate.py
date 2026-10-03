@@ -191,7 +191,18 @@ def _row(rec: dict) -> dict:
                 eos_seen=((sm.get("end_state") or {}).get("eos_seen")),
                 cache_structure_ok=sm.get("cache_structure_ok"),
                 cache_structure_n_checks=sm.get("cache_structure_n_checks"),
-                finiteness_n_checked=((sm.get("checks") or {}).get("n_checked")),
+                # ⚠️ 缺陷 D7：harness 把有限性计数放在 `checks.finiteness_coverage.n_checked`
+                #    （首版误读 `checks.n_checked` ⇒ 恒为 None ⇒ 需求项 13 被**误判为失败**）。
+                #    这里按记录里的**真实路径**读取，并附带 first_bad / 逐阶段 ok / uncovered。
+                finiteness_n_checked=(((sm.get("checks") or {}).get("finiteness_coverage") or {})
+                                      .get("n_checked")),
+                finiteness_first_bad=(((sm.get("checks") or {}).get("finiteness_coverage") or {})
+                                      .get("first_bad")),
+                finiteness_by_phase_all_ok=all(
+                    bool(v.get("ok")) for v in (((sm.get("checks") or {}).get("finiteness_coverage") or {})
+                                                .get("by_phase_model") or {}).values()) or None,
+                finiteness_by_phase=(((sm.get("checks") or {}).get("finiteness_coverage") or {})
+                                     .get("by_phase_model")),
                 checks_n_required=((sm.get("checks") or {}).get("n_required")),
                 checks_uncovered=((sm.get("checks") or {}).get("uncovered")),
                 kv_format=sm.get("kv_format"), weights_bitmatch=sm.get("weights_bitmatch"),
@@ -456,12 +467,23 @@ def _serial_hard_checks(r: dict) -> dict:
         else bool(r.get("cache_structure_ok") is True and (r.get("cache_structure_n_checks") or 0) > 0),
         detail=f"cache_structure_ok={r.get('cache_structure_ok')} "
                f"n_checks={r.get('cache_structure_n_checks')}")
-    out["13_finite"] = dict(ok=bool(r.get("prefill_finite") is not False
-                                    and r.get("checks_passed") is True
-                                    and (r.get("finiteness_n_checked") or 0) > 0),
-                            detail=f"prefill_finite={r.get('prefill_finite')} "
-                                   f"checks_passed={r.get('checks_passed')} "
-                                   f"finiteness_n_checked={r.get('finiteness_n_checked')}")
+    # 需求项 13（finite）：**加强**而非放宽 —— 除 ①prefill 有限 ②harness 判定通过 ③有限性检查数>0 外，
+    # 还要求 ④无未覆盖项 ⑤逐阶段有限性全 ok ⑥first_bad 为空 ⑦cache 结构检查通过。
+    # （缺陷 D7：首版把有限性计数读成 `checks.n_checked`（不存在）⇒ 误判为失败；改为真实路径后
+    #  本条检查**更严**：serial 记录实测 210 次有限性检查、14/14 必需项、uncovered=[]、first_bad=null。）
+    out["13_finite"] = dict(
+        ok=bool(r.get("prefill_finite") is not False
+                and r.get("checks_passed") is True
+                and (r.get("finiteness_n_checked") or 0) > 0
+                and (r.get("checks_uncovered") in ([], None))
+                and r.get("finiteness_first_bad") is None
+                and r.get("finiteness_by_phase_all_ok") is True
+                and r.get("cache_structure_ok") is True),
+        detail=f"prefill_finite={r.get('prefill_finite')} checks_passed={r.get('checks_passed')} "
+               f"finiteness_n_checked={r.get('finiteness_n_checked')} "
+               f"first_bad={r.get('finiteness_first_bad')} "
+               f"by_phase_all_ok={r.get('finiteness_by_phase_all_ok')} "
+               f"uncovered={r.get('checks_uncovered')} cache_structure_ok={r.get('cache_structure_ok')}")
     out["14_gen_ids_in_vocab"] = dict(ok=(r.get("gen_ids_in_vocab") is not False),
                                       detail=f"gen_ids_in_vocab={r.get('gen_ids_in_vocab')}")
     out["15_stop_reason_legal"] = dict(
@@ -515,13 +537,23 @@ def aggregate_stage1() -> int:
     baseline_fail: list = []
     serial_fail: list = []
     # ---- 0) 能否评估 ----
+    # ⚠️ 缺陷 D8（**判定范围**修正）：环境不合格的记录若来自**本轮之前的废弃尝试**，
+    #    必须**如实列出**（`env_blocked_records`）但**不能**当成"本轮缺证据"——
+    #    本轮的环境门是 ENVIRONMENT_OK、六次运行各自的进程内环境门也都合格。
+    #    只有当它**导致必需重复数不足**（<2）时才算"无法评估"。这样既不放宽，
+    #    也避免把历史探测记录误读成本轮结论。
+    env_blocked_records = []
     for r in env_blocked:
         cg = r.get("commit_guard") or {}
-        needs_review.append(f"{r['file']}（{r['mode']}/rep{r['rep']}）: 环境不合格（未加载模型）"
-                            f"stage={r.get('stage')} why={str(cg.get('why'))[:110]}")
+        env_blocked_records.append(dict(
+            file=r["file"], mode=r["mode"], rep=r["rep"], stage=r.get("stage"),
+            why=str(cg.get("why"))[:140], run_id=None,
+            note="本轮之前的废弃尝试记录（仅报告，不进入本轮判决）"))
     for m, lst in (("ar", ar), ("prod", pr), ("serial", se)):
         if len(lst) < STAGE1_REQUIRED_REPS:
-            needs_review.append(f"{m}: 可用运行 {len(lst)}/{STAGE1_REQUIRED_REPS}（缺重复 ⇒ 无法评估可重复性）")
+            n_env = len([x for x in env_blocked if x.get("mode") == m])
+            needs_review.append(f"{m}: 可用运行 {len(lst)}/{STAGE1_REQUIRED_REPS}"
+                                f"（其中环境不合格 {n_env} 条）⇒ 缺重复，无法评估可重复性")
     for r in rows_all:
         if r.get("stage") == "crashed" or r.get("post_processing_error"):
             needs_review.append(f"{r['mode']}/rep{r['rep']}: 运行器自身失败 stage={r.get('stage')} "
@@ -628,6 +660,7 @@ def aggregate_stage1() -> int:
                                   specdec_target_block_calls=[(r.get("specdec_stats") or {}).get("target_block_calls")
                                                               for r in se])),
         hard_checks=hard,
+        env_blocked_records=env_blocked_records,
         needs_review=needs_review, baseline_failures=baseline_fail, serial_failures=serial_fail,
         decision=decision, runs=rows_all,
         next_round_allowed=(decision == "SERIAL_ORACLE_STAGE1_PASS"),
@@ -654,6 +687,8 @@ def aggregate_stage1() -> int:
           f"block_forwards={[r.get('target_n_gen_calls_with_s_gt_1') for r in se]}")
     print(f"  serial == AR：{serial_eq_ar}（首分歧 {[r['_first_div_vs_ar'] for r in se]}）；"
           f"两进程一致={serial_reps_ok}")
+    for x in env_blocked_records:
+        print(f"  [环境不合格·仅报告] {x['file']}（{x['mode']}/rep{x['rep']}）{x['why']}")
     for x in needs_review:
         print(f"  [需复核] {x}")
     for x in baseline_fail:

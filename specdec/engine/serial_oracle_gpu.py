@@ -183,9 +183,9 @@ def run_one() -> int:
     # ⚠️ 后处理**不得**丢失运行记录：首版这里写成 `aud.uninstall`（应为 `aud["uninstall"]`）⇒
     #    AttributeError 直接抛出、连 JSON 都没写。现在整段包起来，异常也照常落盘并标出。
     try:
-        rec["verify_mode_after_run"] = spec_dec.target_verify_mode()
+        rec["verify_mode_at_run_end"] = spec_dec.target_verify_mode()
         rec["verify_wrap_after_run"] = spec_dec.verify_wrap_state()
-        rec["serial_verify_dispatched"] = bool(rec["verify_mode_before_run"] == "serial")
+        rec["serial_verify_dispatched"] = bool(rec["verify_mode_at_run_end"] == "serial")
         tr_ = spec_dec.serial_trace()
         rec["serial_trace"] = tr_
         rec["serial_trace_summary"] = dict(
@@ -202,6 +202,11 @@ def run_one() -> int:
             spec_dec.set_target_verify_mode("block")
         except Exception:                                                 # noqa: BLE001
             pass
+        # ⚠️ 缺陷 D6：首版在**复位之前**读 `verify_mode_after_run` ⇒ serial 运行必然读到 "serial"，
+        #    于是 `mode_restored_to_block` 恒为 False（**记录顺序缺陷**，不是复位没生效）。
+        #    现在：`verify_mode_at_run_end` = 运行结束时的模式（serial）；**复位之后**再读
+        #    `verify_mode_after_run`（应为 "block"）⇒ 该自检项才真正检验"杀开关"。
+        rec["verify_mode_after_run"] = spec_dec.target_verify_mode()
         stats = ((rec.get("smoke") or {}).get("specdec_stats") or {})
         end_state = ((rec.get("smoke") or {}).get("end_state") or {})
         rec["accounting"] = _accounting(MODE, stats, end_state, trun)
