@@ -466,10 +466,13 @@ def main() -> int:
               f"{int(all_row.argmax())}", flush=True)
 
         # ---------------- Step 4：跨层 ----------------
+        # ⚠️ `OP.capture` 用的是**单探针全局槽**（`M.set_attn_probe`）⇒ 同时 enter 多层只有最后一个生效
+        #   （首跑在 `per_op` 里报 `KeyError: 'input_rmsnorm'`，就是这个原因）。
+        #   因此这里**逐层各跑一次前向**：B0（无干预）与 BALL（全层候选）各 4 次。
         cross = {}
-        _rb, n_b0 = _forward("B", "verify", capture_layers=CROSS_LAYERS)
-        _rball, n_ball = _forward("B", "verify", capture_layers=CROSS_LAYERS, row_aligned=True)
         for li in CROSS_LAYERS:
+            _rb, n_b0 = _forward("B", "verify", capture_layers=[li])
+            _rball, n_ball = _forward("B", "verify", capture_layers=[li], row_aligned=True)
             a, b2 = n_b0[li], n_ball[li]
             per_op = {}
             for (op, ins), outn in zip(OP.CHAIN, OP.CHAIN_NODE_OUT):
