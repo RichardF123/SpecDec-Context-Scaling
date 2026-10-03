@@ -3582,6 +3582,60 @@ mismatch 轮 `trim` 后把保留区间 `pre..pre+m-1` **逐个单步重放**（�
 其状态以其产物与 `docs/` 报告为准；手册**不**因"未重跑"而标注任何通过或失败。
 
 
+### 4.75 项目级候选：全层 **row-aligned verify** 候选模式（Stage 0–3）= **CORRECT_BUT_NO_SPEED_VALUE**（2026-10-03）
+
+报告 §9.60；全文 `docs/row_aligned_candidate_report_2026-10-03.md`。前置 §4.74（L0 全闭合）。
+**不是正式 B6**；把诊断性逐行 M=1 机制一次性应用到 target **全部 28 层**，默认关闭，按 Stage 0→1→2→3 评估。
+
+**候选作用范围**（可核）：只作用于 **SpecDec 的 target block verify** —— 28 个 `self_attn` 的 QK 逐行 M=1 +
+真实 causal 前缀 `p+i+1`；每层 `o_proj`/`gate_proj`/`up_proj`/`down_proj` 共 **112** 个 Linear 逐行 M=1 后 `cat`；
+数量**从模型结构推导**（`qk=层数`、`linear=4×层数`、`total=5×层数`）。**不**改 q/k/v/RoPE/softmax/AV/RMSNorm/
+SiLU/gated/residual/cache/argmax。挂载点 `spec_dec.set_verify_wrap(...)`（**默认 `None`** ⇒ 生产路径一字不变）；
+模块按**对象身份**匹配；**draft 永不启用**（Stage 0 用第二个微型模型证明 `applied=0`）；AR/decode 的 s=1 与生产路径逐位一致。
+
+**阶段结果**：
+* **Stage 0**（CPU + 微型模型）**PASS 17/0**：多层多模块注册、数量推导、draft 隔离、AR s=1 逐位一致、
+  block 每行 causal prefix、多 context 嵌套、正常/异常恢复、旧单层 L0 模式不变（`applied` 恰为 L0 的 5 个）、默认关闭、先落盘。
+* **Stage 1**（位置 8209，四臂 × 2 pass）：**1A PASS**（S0/B0 复现历史；**SALL≡S0**；QK applied **28/28**、
+  Linear applied **112/112**、`seen=0`；两次 pass 逐位一致）；**1B = 类别 2** —— token **323 = 323**、
+  logits `n_diff=118003`/`max|Δ|=0.125`；逐层：**L0–L1 逐位一致**、**首个重新分歧层 = L2**（输入逐位相同、输出差 126），
+  L3+ 输入已不同（平台 1250–1340）；**按约定只记录编号与 n_diff，不进入层内部**。
+* **Stage 2**（F13 主案例 + F06 对照；每 (案例,模式) 2 个独立进程）：**硬门 PASS（12/12 检查全 True）** ——
+  **F13 上原始 SpecDec 与 AR 不一致**（首个分歧 index **47**；`gen_hash` `e90dad2b3fcf1c65` **逐位复现历史**），
+  而**全层候选的生成 token IDs 与 AR 完全一致**（`6e7522bf2521ad7b`）；F06 两模式都通过；
+  两次重复逐 token 相同；全有限、无 `other_short`、结构不变量通过、无 OOM。规则逐项沿用既有记录
+  （F13/F06 manifest 窗口 8192 token + `token_sha1`、ctx 8192、chunk 2048、k=4、max_new=64、base_bf16、eager、
+  target RoPE cpu_fp32、`BF16_RED_REDUCTION=1`、`STRUCT_CHECK=1`）；**接受公式/停止条件/draft 均未改**。
+* **Stage 3**（pilot：F13，warm-up 1 + reps 3 + 固定 block micro-latency，P-state `qualified=True` sm=2430）：
+  decode **AR 12.40 tok/s**、原始 Spec **2.75**、候选 **2.19**；**固定 block target verify 137.66 → 232.62 ms = 1.69×**；
+  decode 单步 1.15×（且 ON/OFF **逐位一致** ✓）；峰值 reserved 10648 → **10656 MiB（+8 MiB）**。
+
+**决策量**：`correctness_gain`：原始 Spec 失败={F13: true, F06: false}、候选通过 token equality={F13: true, F06: true}；
+`overhead`：aligned_decode_over_original=**1.258**、aligned_verify_micro_over_original=**1.690**、
+aligned_decode_step_micro_over_original=1.152、aligned_e2e_wall_over_original=1.148；
+`net_value`：aligned_spec_vs_ar=**0.176**（原始 Spec 0.222）。
+⇒ **CORRECT_BUT_NO_SPEED_VALUE**（只有 VIABLE_B6_CANDIDATE 才建议进入正式 B6）。
+
+**未证实**：L2 内部是什么（**按约定不进入** L1–L27 算子内部）；各 GEMM 的 kernel/tile/归约顺序（未做 profiler）；
+候选在其它位置/长度/family/模型上是否同样通过；正式 B6 是否通过（**未跑**）；速度数字能否外推（Stage 3 是 pilot）。
+**B6 未改变** ⇒ acceptance/pilot/final 仍禁止。
+
+**缺陷（全部保留）**：① Stage 1 首跑 `checks_failed`（控制 9 为空 —— 我在上下文体内读 `verify_log()`，而它在 `finally` 写入）；
+② Stage 1 次跑 `checks_failed`（控制 10 —— 我误要求四臂共用一个 cache 长度，实际 S 8209/B 8212）；
+③ Stage 0 两个 FAIL：期望算错 + **真实设计缺陷**（同类 context 嵌套时内层退出清空外层注册表 ⇒
+改为"进入保存、退出恢复上一个注册表"并回归全部旧门）；④ Stage 3 micro 首跑把"候选 ON≠OFF"误当失败
+（那正是候选**目的**：改变块 verify 的执行几何；改为只对 s=1 等价设硬门）；⑤ 汇总器键名；⑥ PowerShell
+`Set-Content` 破坏 preflight 的 UTF-8（已从 git 恢复）；⑦ 空集冒烟产物已删（不是数据）。
+**GPU 进程**：Stage 1 三次（2 次自身断言缺陷 + 1 次完整）、Stage 2 十二次、Stage 3 十二次 + micro 两次。
+**工具**：`row_aligned.py`（Stage 0 门 17/0）、`row_aligned_stage1_f13_p8209.py`（门 9/0）、
+`row_aligned_stage2.py`（运行器 + 汇总器）、`row_aligned_stage3_f13_p8209.py`（固定 block micro-latency）、
+`scripts/row_aligned_stage3_cpu.py`、`scripts/row_aligned_decision_cpu.py`；`spec_dec.py` 加默认关闭的
+`set_verify_wrap`；`model_self.py` 的 `serial_*_for` 改为嵌套安全的保存/恢复语义；preflight 增 1 节。
+**下一步（项目级二选一，本轮不执行；不含任何 L1–L27 算子级诊断）**：
+(A) 把候选登记为**默认关闭的数值对齐选项**（用于需要与 AR 逐 token 一致的复核），不纳入生产解码路径；
+(B) 先解决 **SpecDec 本身的执行效率**（8K/all-eager 下只有 AR 的 0.22×）这一真正瓶颈，再谈正确性对齐。
+
+
 ### 4.74 位置 8209：L0 全部持续 GEMM 边界闭环 = **L0 输出逐位恢复**、后续第一处分歧 = **L1**（2026-10-02）
 
 报告 §9.59；全文 `docs/div8209_serial_l0_closure_2026-10-02.md`。前置 §4.73（QK+o_proj：L0 111→61→21，第三边界 `gate_proj`）。

@@ -95,7 +95,7 @@ def main() -> int:
     a = ap.parse_args()
     s1p = Path(a.stage1) if a.stage1 else _newest("div8209_ball_*.json")
     s2p = Path(a.stage2) if a.stage2 else _newest("div8209_ra2_stage2_summary_*.json")
-    s3p = Path(a.stage3) if a.stage3 else _newest("div8209_ra2_stage3_summary_*.json")
+    s3p = Path(a.stage3) if a.stage3 else _newest("div8209_ra3_stage3_summary_*.json")
     rec: dict = dict(tool="row_aligned_decision_cpu",
                      run_utc=time.strftime("%Y%m%dT%H%M%SZ", time.gmtime()),
                      semantics="只读：从已落盘产物汇总 Stage 0–3 的门与代价，给出四选一决策；不加载模型、不改产物",
@@ -139,8 +139,20 @@ def main() -> int:
         print("   （无 Stage 2 产物 ⇒ Stage 2 未执行或未完成）")
     print("\n== ③ Stage 3（性能观察）==")
     if s3:
-        for k, v in (s3.get("comparison") or {}).items():
-            print(f"   {k}: {json.dumps(v, ensure_ascii=False, default=str)[:400]}")
+        for m, st in (s3.get("per_mode") or {}).items():
+            print(f"   {m:<8} decode_s 中位={st.get('decode_s_median')} wall_s 中位={st.get('wall_s_median')} "
+                  f"decode tok/s={st.get('decode_tok_s_median')} e2e tok/s={st.get('e2e_tok_s_median')} "
+                  f"acc={st.get('acceptance_rate_median')} rounds={st.get('rounds')} "
+                  f"tgt_blk={st.get('target_block_calls')} peakR={st.get('peak_res_mib_median')}")
+        mi = (s3.get("micro") or {}).get("summary") or {}
+        if mi:
+            print(f"   固定 block：verify OFF {mi.get('verify_off_median_ms'):.2f} ms → ON "
+                  f"{mi.get('verify_on_median_ms'):.2f} ms ⇒ {mi.get('verify_on_over_off'):.2f}×；"
+                  f"decode 单步 {mi.get('step_off_median_ms'):.2f} → {mi.get('step_on_median_ms'):.2f} ms "
+                  f"⇒ {mi.get('step_on_over_off'):.2f}×")
+        print(f"   overhead={json.dumps(s3.get('overhead'), ensure_ascii=False)}")
+        print(f"   net_value={json.dumps(s3.get('net_value'), ensure_ascii=False)}")
+        print(f"   P-state qualified={s3.get('pstate_qualified')}")
     else:
         print("   （无 Stage 3 产物 ⇒ Stage 3 未执行）")
 
