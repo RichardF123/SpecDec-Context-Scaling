@@ -4016,6 +4016,58 @@ AR 历史下 6702=20.125、6652=20.0 ⇒ 6702（**历史差异把 6652 挪了 1 
 
 ---
 
+## 9.62 分层正确性协议**冻结** + 未见数据验证（24 runs）⇒ **`ALGORITHMIC_GATE_FAIL`**（2026-10-03）
+
+> 协议（运行前冻结）：`docs/correctness_protocol_post_shape_localization_2026-10-03.md`（`post_shape_localization_v1`）；
+> 执行结果：`docs/correctness_protocol_validation_2026-10-03.md`。台账 §4.77。前置 §9.61（形状机制 = CHECK）。
+> **协议原文未被修改**；不启动正式 factorial/B6；不继续 L2–L27 算子级定位。
+
+### 9.62.1 两种模式（协议 §1）
+
+* **Production mode（`prod` = 原 `spec`）**：原始 `M=4` batched block verification、BF16、row-aligned **关闭**、
+  不改 acceptance/replacement/rollback/cache/greedy；**允许记录** AR/Spec 的 token 分歧，但**不得**自动解释为错误或无害。
+* **Diagnostic oracle mode（`diag` = 原 `aligned`）**：全层 row-aligned verify，**只**在 target block verification 生效
+  （AR/prefill/draft/普通 decode 不受影响），**不进入任何速度/吞吐声明**，输出带 **`diagnostic_only=true`**。
+
+### 9.62.2 预登记 family 与独立性（协议 §3）
+
+规则（先于结果）：四 stratum 各取 `family_id` 最小者，排除 **F13**（定位案例）与 **F06**（已参与对照）⇒
+**F01**(`S4_mixed`)、**F02**(`S2_high_markup`)、**F08**(`S1_low_entropy`)、**F10**(`S3_prose`)，覆盖 **4 个 stratum**。
+**独立性**：guard `verify_family_independence_cpu` **PASS 25/0**（`outside_authorized=[]`）；既有 101 条消费记录中
+**只有 F06/F13**；对 `output/g5/**/*.json` 全量检索这四个 family ⇒ **命中 0 个文件** ⇒ 未见数据。
+
+### 9.62.3 24 次运行结果（4 family × 3 mode × 2 独立进程；串行）
+
+| family | AR 可重复 | prod 可重复 | diag 可重复 | **diag == AR** | prod == AR | first div(prod→diag) | margin | 结构检查 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| F01 | ✓ | ✓ | ✓ | **✓（64/64）** | ✗ | 14 → **无** | 6.75 | 全过 |
+| F02 | ✓ | ✓ | ✓ | **✗** | ✗ | 7 → 9 | 0.125 | 全过 |
+| F08 | ✓ | ✓ | ✓ | **✗** | ✗ | 52 → 52 | 0.125 | 全过 |
+| F10 | ✓ | ✓ | ✓ | **✗** | ✗ | 8 → 17 | **0.0（完整并列）** | 全过 |
+
+* **全部结构检查通过**：finite、`gen_ids_in_vocab`、合法停止（全 `max_new_reached`、**无 `other_short`**）、
+  `gen_len=64`、逐轮不变量（`tgt_len==drf_len==pre+(m+1|Kp)`）、决策步覆盖、cache 结构/dtype、
+  `diagnostic_only` 标记正确、**hook 作用域**（diag 的 `applied` 计数 == `target_block_calls`）、无 OOM。
+* **三个 family 的 oracle 未能复现 AR 的 token IDs** ⇒ 协议 **Gate A FAIL**；
+  同时如实记录 oracle 的**部分有效**：F01 上完全一致，F02/F10 上把首分歧**推迟**。
+* 三处剩余分歧都在 **margin ≤ 0.125**（F10 为**完整并列 margin=0**）⇒ 与"近并列翻转"一致，
+  但说明**只对齐五类 GEMM 的执行几何不足以**在所有未见数据上恢复 token（**本轮不定位剩余来源**）。
+* 可选 profiler 收尾：本机无 `nsys`/`ncu`、`torch.profiler` 仍无 CUDA kernel 事件 ⇒ **`PROFILER_UNAVAILABLE`**
+  （**未安装软件、未重试、不阻塞**）。
+
+### 9.62.4 决策与产物
+
+**最终决策 = `ALGORITHMIC_GATE_FAIL`**（协议 §7 硬失败分支）⇒ **不启动正式 factorial/B6**；**B6 状态未改变**；
+acceptance/pilot/final 仍禁止。**下一步是项目级取舍**（本轮不执行）：接受"生产模式在近并列处偶发分歧"
+并把它作为**已知限制 + 一等指标（分歧率）**纳入后续协议；或把 verify 路径整体换成与 AR 同几何
+（已知 decode 1.26×、verify 1.69×，在本配置下 SpecDec 本身仅 AR 的 0.22× ⇒ 负收益）。
+**产物**（新 tag `div8209_proto`，无覆盖）：24 份运行 JSON/PT + `div8209_proto_aggregate_20261003T120349Z.{json,jsonl}`
++ `div8209_proto_margins_20261003T120234Z.json`；**GPU 进程 25 次**（24 runs + 1 margins 探针），全部一次通过、无失败 run。
+**工具**：`row_aligned_stage2.py`（加 `prod`/`diag` 别名、`diagnostic_only`、provenance、逐轮表——数值路径未改）、
+`correctness_protocol_aggregate.py`（只读聚合/判决，输出 JSON+JSONL）、`correctness_protocol_margins.py`（margins + profiler 状态）。
+
+---
+
 ## 9.61 CUDA BF16 形状敏感性的**机制确认**与修复候选评估（Step 0–4，2026-10-03）——**CHECK**
 
 > 全文 `docs/gemm_shape_sensitivity_mechanism_2026-10-03.md`；台账 §4.76。前置 §9.60（全层候选：CORRECT_BUT_NO_SPEED_VALUE）。
