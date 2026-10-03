@@ -37,6 +37,9 @@ REAL_SHA = dict(F09="e5dbe83616ea348a", F03="92755adeb5715d47",
                 F11="2c14a59130440e9a", F04="e9004b83814fe321",
                 F13="9a278731d744a859")
 RUNID = "20261004T000000Z"
+# 合成产物的 prompt 长度：真实产物 `smoke.end_state.prompt_len` 存在（如 F13 prod = 8192）。
+# 合成里统一取 8192，使"绝对位置 = prompt_len + 输出内下标"可被**精确断言**。
+PROMPT_LEN = 8192
 
 
 def _gen_for(family: str, mode: str, rep: int, *, variant: int = 0) -> list:
@@ -124,7 +127,15 @@ def _mk(tag: str, family: str, mode: str, rep: int, *, gen: list | None = None,
                                                         by_phase_model={"prefill/target": dict(ok=True),
                                                                         "verify/target": dict(ok=True)})),
                    end_state=dict(gen_hash=(self_hash or SV.AGG._gen_hash(gen)), gen_len=len(gen),
-                                  stop_reason=stop, eos_seen=False)))
+                                  stop_reason=stop, eos_seen=False,
+                                  # ⚠️ 忠实于真实产物：`end_state.prompt_len` / `max_new` /
+                                  #    `target_cache_len` / `draft_cache_len` / `n_rounds` 都存在
+                                  #    （见 output/g5/attn/div8209_so_F13_prod_rep1_*.json）。
+                                  #    首版合成缺这些字段 ⇒ GB6 的 `absolute_position` 永远推导不出，
+                                  #    属**测试夹具不忠实**（自测 CE4b 抓到）。
+                                  max_new=len(gen), prompt_len=PROMPT_LEN,
+                                  target_cache_len=PROMPT_LEN + len(gen),
+                                  draft_cache_len=PROMPT_LEN + len(gen), n_rounds=len(rounds))))
     return rec
 
 
@@ -223,11 +234,22 @@ def main() -> int:
            sF["per_family"]["F13"]["anchor_class"])
 
         # ---------- G) production 与 AR 分歧但结构正常 ----------
+        # ⚠️ 本轮规则收紧后：分歧**本身**仍不判失败（本用例要守的就是这一点），但分歧必须完成
+        #    GB6 记账（需独立诊断 pass）才能放行；故此处按新规则同时给出齐全诊断，
+        #    只验证"分歧不判失败"，"缺记账不放行"由 CE4/CE4a 覆盖。
         tmpG = tmp / "g"; tmpG.mkdir()
         _write(tmpG, _full_set(TAG_GOOD, prod_variant=1))
         sG = SV.evaluate(TAG_GOOD, list(NEW), list(MODES), REPS, outdir=tmpG)
         ck("G_分歧不判serial失败", not sG["serial_failures"], sG["serial_failures"][:2])
-        ck("G_判决仍PASS（分歧只记录）", sG["decision"] == "SERIAL_ORACLE_PASS", sG["decision"])
+        ck("G_缺GB6记账时不放行", sG["decision"] == "CHECK_NEEDS_REVIEW"
+           and not sG["serial_failures"] and not sG["baseline_failures"], sG["decision"])
+        sG2 = SV.evaluate(TAG_GOOD, list(NEW), list(MODES), REPS, outdir=tmpG,
+                          gb6_diagnostics={f: dict(family=f, ar_top1=1, ar_top2=2, margin=0.5,
+                                                   tied_at_max=1, cache_len_after=8255,
+                                                   position=7, prompt_len=PROMPT_LEN, runs_tag=TAG_GOOD)
+                                           for f in NEW})
+        ck("G_记账齐全后分歧只记录_判决PASS", sG2["decision"] == "SERIAL_ORACLE_PASS", sG2["decision"])
+        sG = sG2
         ck("G_分歧分类为NUMERICAL_DIVERGENCE_RECORDED",
            all(v["production_divergence_class"] == "NUMERICAL_DIVERGENCE_RECORDED"
                for v in sG["per_family"].values()),
@@ -255,7 +277,7 @@ def main() -> int:
         sJ2 = SV.evaluate(TAG_GOOD, list(NEW), list(MODES), REPS, outdir=tmpJ, allow_off_scope=True)
         ck("J_显式allow后可PASS", sJ2["decision"] == "SERIAL_ORACLE_PASS", sJ2["decision"])
 
-        # ---------- 环境拒绝 ⇒ 缺重复 ----------
+        # ---------- 环境拒绝 ⇒ 缺重复（旧用例 K，保留）----------
         tmpK = tmp / "k"; tmpK.mkdir()
         recs = [r for r in _full_set(TAG_GOOD)
                 if not (r["case"] == "F09" and r["mode"] == "ar" and r["rep"] == 2)]
@@ -264,6 +286,175 @@ def main() -> int:
         sK = SV.evaluate(TAG_GOOD, list(NEW), list(MODES), REPS, outdir=tmpK)
         ck("K_环境拒绝造成缺重复_不PASS", sK["decision"] == "CHECK_NEEDS_REVIEW", sK["decision"])
         ck("K_环境拒绝被单独报告", sK["n_env_blocked"] == 1, sK["n_env_blocked"])
+
+        # ================= 反例回归（CE1–CE5；旧实现在这些用例上会**通过**）=================
+        # ---- CE1：空 family 集合 + 不存在的 tag（旧实现：expected=0 ⇒ 空泛 PASS）----
+        sCE1 = SV.evaluate("definitely_missing_stage2b_tag", [], list(MODES), REPS)
+        ck("CE1_空family_不PASS", sCE1["decision"] != "SERIAL_ORACLE_PASS", sCE1["decision"])
+        ck("CE1_报参数非法", bool(sCE1["argument_errors"]), sCE1["argument_errors"])
+        ck("CE1_期望三元组为0但不放行", sCE1["n_triples_expected"] == 0
+           and sCE1["decision"] == "CHECK_NEEDS_REVIEW", sCE1["n_triples_expected"])
+        # ---- CE2：只给 AR×2 且 modes=[ar]（旧实现：prod/serial 为 0 仍 PASS）----
+        tmpCE2 = tmp / "ce2"; tmpCE2.mkdir()
+        _write(tmpCE2, [_mk(TAG_GOOD, "F13", "ar", 1), _mk(TAG_GOOD, "F13", "ar", 2)])
+        sCE2 = SV.evaluate(TAG_GOOD, ["F13"], ["ar"], REPS, outdir=tmpCE2)
+        ck("CE2_模式不全_不PASS", sCE2["decision"] != "SERIAL_ORACLE_PASS", sCE2["decision"])
+        ck("CE2_报模式非法", any("模式" in e for e in sCE2["argument_errors"]), sCE2["argument_errors"])
+        sCE2b = SV.evaluate(TAG_GOOD, ["F13"], list(MODES), REPS, outdir=tmpCE2, allow_off_scope=True)
+        ck("CE2b_三种模式齐全但缺prod_serial_不PASS",
+           sCE2b["decision"] == "CHECK_NEEDS_REVIEW", sCE2b["decision"])
+        ck("CE2b_逐模式存在性报缺",
+           any("prod 模式没有任何可用产物" in x for x in sCE2b["needs_review"])
+           and any("serial 模式没有任何可用产物" in x for x in sCE2b["needs_review"]),
+           sCE2b["needs_review"][:4])
+        # ---- CE3：stage_check 必须真跑硬门（历史 F13：D6 缺失 + 非 clean complete ⇒ STOP）----
+        try:
+            from . import stage_check as SC
+            r13 = SV.attach_internal(SV.load_runs("div8209_so")[-1]) if SV.load_runs("div8209_so") else None
+            f13_ser = [SV.attach_internal(x) for x in SV.load_runs("div8209_so")
+                       if x.get("case") == "F13" and x.get("mode") == "serial"
+                       and x.get("model_run_happened")]
+            if f13_ser:
+                for r in f13_ser:
+                    r["_ar_stop"] = "max_new_reached"
+                reasons13 = SC._gate_serial("F13", f13_ser, reps=2, ar_ref=None)
+                ck("CE3_历史F13_serial_被硬门拦下", bool(reasons13), reasons13[:2])
+                ck("CE3_理由含D6缺失",
+                   any("18_d6_mode_restored_after_cleanup" in x for x in reasons13),
+                   reasons13[:4])
+                ck("CE3_理由含非clean_complete",
+                   any("complete_with_selfcheck_failures" in x for x in reasons13), reasons13[:4])
+            else:
+                ck("CE3_历史F13_serial_被硬门拦下", False, "无真实 F13 serial 产物可测")
+        except Exception as e:                                            # noqa: BLE001
+            ck("CE3_历史F13_serial_被硬门拦下", False, f"{type(e).__name__}: {str(e)[:120]}")
+        # ---- CE4：production 分歧时 GB6 必需字段（来自独立诊断）缺失 ⇒ 不 PASS ----
+        tmpCE4 = tmp / "ce4"; tmpCE4.mkdir()
+        _write(tmpCE4, _full_set(TAG_GOOD, prod_variant=1))
+        sCE4a = SV.evaluate(TAG_GOOD, list(NEW), list(MODES), REPS, outdir=tmpCE4)   # 无诊断
+        ck("CE4_分歧但无GB6诊断_不PASS", sCE4a["decision"] == "CHECK_NEEDS_REVIEW", sCE4a["decision"])
+        ck("CE4_报缺诊断字段",
+           any("GB6 必需字段未齐全" in x for x in sCE4a["needs_review"]), sCE4a["needs_review"][:3])
+        gb6_full = {f: dict(family=f, ar_top1=1, ar_top2=2, margin=0.5, tied_at_max=1,
+                            cache_len_after=8255, position=7, prompt_len=PROMPT_LEN,
+                            runs_tag=TAG_GOOD)
+                    for f in NEW}
+        sCE4b = SV.evaluate(TAG_GOOD, list(NEW), list(MODES), REPS, outdir=tmpCE4,
+                            gb6_diagnostics=gb6_full)
+        ck("CE4b_诊断齐全_可PASS", sCE4b["decision"] == "SERIAL_ORACLE_PASS", sCE4b["decision"])
+        ck("CE4b_GB6记录含推导字段",
+           all(sCE4b["per_family"][f]["gb6"]["runs_derived"].get("first_divergence_index") == 7
+               for f in NEW),
+           {f: sCE4b["per_family"][f]["gb6"]["runs_derived"].get("first_divergence_index")
+            for f in NEW})
+        ck("CE4b_绝对位置=prompt_len+下标",
+           all(sCE4b["per_family"][f]["gb6"]["runs_derived"].get("absolute_position")
+               == PROMPT_LEN + 7 for f in NEW),
+           {f: sCE4b["per_family"][f]["gb6"]["runs_derived"].get("absolute_position") for f in NEW})
+        ck("CE4b_轮号与两侧token均记账",
+           all(isinstance(sCE4b["per_family"][f]["gb6"]["runs_derived"].get("round_index"), int)
+               and sCE4b["per_family"][f]["gb6"]["runs_derived"].get("ar_token") is not None
+               and sCE4b["per_family"][f]["gb6"]["runs_derived"].get("prod_token") is not None
+               for f in NEW),
+           {f: (sCE4b["per_family"][f]["gb6"]["runs_derived"].get("round_index"),
+                sCE4b["per_family"][f]["gb6"]["runs_derived"].get("ar_token"),
+                sCE4b["per_family"][f]["gb6"]["runs_derived"].get("prod_token")) for f in NEW})
+        ck("CE4b_无残留缺失字段",
+           all(not sCE4b["per_family"][f]["gb6"]["missing"] for f in NEW),
+           {f: sCE4b["per_family"][f]["gb6"]["missing"] for f in NEW})
+        gb6_wrongfam = {f: dict(gb6_full[f], family="F13") for f in NEW}       # 跨 family 迁移 ⇒ 拒绝
+        sCE4c = SV.evaluate(TAG_GOOD, list(NEW), list(MODES), REPS, outdir=tmpCE4,
+                            gb6_diagnostics=gb6_wrongfam)
+        ck("CE4c_跨family诊断被拒_不PASS", sCE4c["decision"] == "CHECK_NEEDS_REVIEW", sCE4c["decision"])
+        # ---- CE4d：诊断位置与产物推导**不一致** ⇒ 不 PASS（位置交叉核对必须生效）----
+        gb6_badpos = {f: dict(gb6_full[f], position=9) for f in NEW}
+        sCE4d = SV.evaluate(TAG_GOOD, list(NEW), list(MODES), REPS, outdir=tmpCE4,
+                            gb6_diagnostics=gb6_badpos)
+        ck("CE4d_诊断位置不符_不PASS", sCE4d["decision"] == "CHECK_NEEDS_REVIEW", sCE4d["decision"])
+        ck("CE4d_报位置不一致",
+           any("位置与产物推导不一致" in x for x in sCE4d["needs_review"]), sCE4d["needs_review"][:3])
+        # ---- CE4e：诊断 tag 不符 ⇒ 拒绝（禁止跨配置迁移旧记录）----
+        gb6_wrongtag = {f: dict(gb6_full[f], runs_tag="div8209_so") for f in NEW}
+        sCE4e = SV.evaluate(TAG_GOOD, list(NEW), list(MODES), REPS, outdir=tmpCE4,
+                            gb6_diagnostics=gb6_wrongtag)
+        ck("CE4e_跨tag诊断被拒_不PASS", sCE4e["decision"] == "CHECK_NEEDS_REVIEW", sCE4e["decision"])
+        # ---- CE4f/4g：`position` 的**坐标系**口径（生产者记的是输出序列内下标）----
+        gb6_idx = {f: {k: v for k, v in gb6_full[f].items() if k != "prompt_len"} for f in NEW}
+        sCE4f = SV.evaluate(TAG_GOOD, list(NEW), list(MODES), REPS, outdir=tmpCE4,
+                            gb6_diagnostics=gb6_idx)
+        ck("CE4f_下标坐标系一致_可PASS", sCE4f["decision"] == "SERIAL_ORACLE_PASS", sCE4f["decision"])
+        ck("CE4f_标注下标坐标系",
+           all(sCE4f["per_family"][f]["gb6"].get("position_frame") == "output_index" for f in NEW),
+           {f: sCE4f["per_family"][f]["gb6"].get("position_frame") for f in NEW})
+        gb6_idx_bad = {f: dict(gb6_idx[f], position=9) for f in NEW}
+        sCE4g = SV.evaluate(TAG_GOOD, list(NEW), list(MODES), REPS, outdir=tmpCE4,
+                            gb6_diagnostics=gb6_idx_bad)
+        ck("CE4g_下标坐标系不符_不PASS", sCE4g["decision"] == "CHECK_NEEDS_REVIEW", sCE4g["decision"])
+        # ---- CE4h：诊断**没有任何 tag** ⇒ 拒绝（不得默认"同配置"）----
+        gb6_notag = {f: {k: v for k, v in gb6_full[f].items() if k != "runs_tag"} for f in NEW}
+        sCE4h = SV.evaluate(TAG_GOOD, list(NEW), list(MODES), REPS, outdir=tmpCE4,
+                            gb6_diagnostics=gb6_notag)
+        ck("CE4h_无tag诊断被拒_不PASS", sCE4h["decision"] == "CHECK_NEEDS_REVIEW", sCE4h["decision"])
+        ck("CE4h_理由为无tag可核对",
+           any("没有可核对的 tag" in x for x in sCE4h["needs_review"]), sCE4h["needs_review"][:2])
+        # ---- CE4i：**文件顶层** runs_tag 必须下推到每条 family 记录（真实 margins 产物就是这个形态）----
+        fp = tmp / "margins_real_shape.json"
+        fp.write_text(json.dumps(dict(tool="correctness_protocol_margins", runs_tag=TAG_GOOD,
+                                      families={f: {k: v for k, v in gb6_full[f].items()
+                                                    if k != "runs_tag"} for f in NEW}),
+                                 ensure_ascii=False), encoding="utf-8")
+        loaded = SV.load_gb6_diagnostics(str(fp))
+        ck("CE4i_顶层tag下推到各family",
+           all((loaded.get(f) or {}).get("runs_tag") == TAG_GOOD for f in NEW),
+           {f: (loaded.get(f) or {}).get("runs_tag") for f in NEW})
+        sCE4i = SV.evaluate(TAG_GOOD, list(NEW), list(MODES), REPS, outdir=tmpCE4,
+                            gb6_diagnostics=loaded)
+        ck("CE4i_文件式诊断可PASS", sCE4i["decision"] == "SERIAL_ORACLE_PASS", sCE4i["decision"])
+        fp2 = tmp / "margins_wrong_tag.json"
+        fp2.write_text(json.dumps(dict(tool="correctness_protocol_margins", runs_tag="div8209_proto",
+                                       families={f: {k: v for k, v in gb6_full[f].items()
+                                                     if k != "runs_tag"} for f in NEW}),
+                                  ensure_ascii=False), encoding="utf-8")
+        sCE4j = SV.evaluate(TAG_GOOD, list(NEW), list(MODES), REPS, outdir=tmpCE4,
+                            gb6_diagnostics=SV.load_gb6_diagnostics(str(fp2)))
+        ck("CE4j_旧配置诊断(div8209_proto)被拒_不PASS",
+           sCE4j["decision"] == "CHECK_NEEDS_REVIEW"
+           and any("禁止跨配置迁移" in x for x in sCE4j["needs_review"]), sCE4j["decision"])
+        # ---- CE4k：诊断的 prompt_len 与产物不一致（不同输入配置）⇒ 不 PASS ----
+        gb6_badpl = {f: dict(gb6_full[f], prompt_len=4096) for f in NEW}
+        sCE4k = SV.evaluate(TAG_GOOD, list(NEW), list(MODES), REPS, outdir=tmpCE4,
+                            gb6_diagnostics=gb6_badpl)
+        ck("CE4k_prompt_len不符_不PASS", sCE4k["decision"] == "CHECK_NEEDS_REVIEW", sCE4k["decision"])
+        ck("CE4k_报输入配置不一致",
+           any("prompt_len 与产物不一致" in x for x in sCE4k["needs_review"]), sCE4k["needs_review"][:2])
+        # ---- CE4l：AR 模式产物**没有** `smoke.rounds`（真实情形）时，决策轮号必须取自
+        #      divergent（production）侧的 rounds，而**不是**变成 None ----
+        tmpCE4L = tmp / "ce4l"; tmpCE4L.mkdir()
+        recs = _full_set(TAG_GOOD, prod_variant=1)
+        for r in recs:
+            if r.get("mode") == "ar":
+                r["smoke"].pop("rounds", None)          # 真实 AR 产物就是没有 rounds
+        _write(tmpCE4L, recs)
+        sCE4l = SV.evaluate(TAG_GOOD, list(NEW), list(MODES), REPS, outdir=tmpCE4L,
+                            gb6_diagnostics=gb6_full)
+        rd_l = {f: sCE4l["per_family"][f]["gb6"]["runs_derived"] for f in NEW}
+        ck("CE4l_AR无rounds时轮号取自prod侧",
+           all(rd_l[f].get("round_index") is not None and rd_l[f].get("round_index_source") == "prod"
+               and rd_l[f].get("round_index_ar") is None for f in NEW),
+           {f: (rd_l[f].get("round_index"), rd_l[f].get("round_index_source"),
+                rd_l[f].get("round_index_ar")) for f in NEW})
+        ck("CE4l_该情形仍可PASS", sCE4l["decision"] == "SERIAL_ORACLE_PASS", sCE4l["decision"])
+        # ---- CE5：环境拒绝**只报告**；有完整有效重复时不得因此阻断 ----
+        tmpCE5 = tmp / "ce5"; tmpCE5.mkdir()
+        extra_eb = _mk(TAG_GOOD, "F09", "ar", 1, model_run=False, env_blocked=True)
+        extra_eb["run_id"] = "20261004T000009Z"
+        _write(tmpCE5, _full_set(TAG_GOOD) + [extra_eb])
+        sCE5 = SV.evaluate(TAG_GOOD, list(NEW), list(MODES), REPS, outdir=tmpCE5)
+        ck("CE5_环境拒绝不阻断（有效重复齐全）", sCE5["decision"] == "SERIAL_ORACLE_PASS", sCE5["decision"])
+        ck("CE5_环境拒绝被单列报告", sCE5["n_env_blocked"] == 1 and len(sCE5["env_blocked_records"]) == 1,
+           (sCE5["n_env_blocked"], sCE5["env_blocked_records"]))
+        ck("CE5_不再是needs_review噪声",
+           not any("环境拒绝" in x for x in sCE5["needs_review"]), sCE5["needs_review"][:3])
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
