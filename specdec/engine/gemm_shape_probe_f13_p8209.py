@@ -127,7 +127,10 @@ def _profile_call(fn, reps: int) -> dict:
     torch.cuda.synchronize()
     torch.cuda.reset_peak_memory_stats()
     base = torch.cuda.memory_allocated()
-    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CUDA]) as prof:
+    # ⚠️ torch 2.6：只给 CUDA activity 会退化成 legacy CUDA profiling 并报
+    #   "Legacy CUDA profiling requires use_cpu=True"（本工具首跑即此错）。必须**同时**开 CPU activity。
+    with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU,
+                                            torch.profiler.ProfilerActivity.CUDA]) as prof:
         for _ in range(reps):
             out = fn()
     torch.cuda.synchronize()
