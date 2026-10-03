@@ -100,7 +100,17 @@ OPT_IN_CONSUMERS = {"g5_8k_smoke_cudnn.py",      # fam16 授权轮（SMOKE_FAMIL
                     # 2026-10-01 经用户授权登记：L0 K 差异清单（只读派生，只引用既有 F13 产物）
                     "l0_k_diff_cpu.py",
                     # 2026-10-01 经用户授权登记：AR/Spec 一致性比较（只读派生，只引用既有 F13 产物）
-                    "ar_spec_consistency_cpu.py"}
+                    "ar_spec_consistency_cpu.py",
+                    # 2026-10-03 经**本轮任务**（分层正确性协议的未见数据验证）登记：
+                    # 决策位置 top-1/top-2/margin 提取 —— **注册范围仅限协议预登记的 4 个 family**
+                    # （F01/F02/F08/F10；由下方 scoped 检查把这一限制变成可判定条件）
+                    "correctness_protocol_margins.py"}
+
+# 2026-10-03：本轮协议**预登记**的未见数据 family（四 stratum 各取最小 id，排除 F13/F06）。
+# 授权来源 = **用户在本轮任务中明确指定**"从 manifest 选 4 个未参与 8209/F13 定位的 family，
+# 至少覆盖 3 个 stratum，运行前预登记"。它不是既有的 F06/F13 定点取证范围，
+# 因此必须**显式登记**（登记 + scoped 检查；**不放宽**任何既有检查）。
+PROTOCOL_ROUND_FAMILIES = ("F01", "F02", "F08", "F10")
 
 
 def _manifest_consumers() -> list:
@@ -281,14 +291,33 @@ def main() -> int:
     smoke_other = [u for u in used
                    if (u.get("tool") or "").startswith("g5_8k_smoke_cudnn")
                    and u["file"] not in fam16_files
-                   and (u.get("family") or {}).get("family_id") not in REGISTERED_DIAG_FAMILIES]
+                   and (u.get("family") or {}).get("family_id") not in REGISTERED_DIAG_FAMILIES
+                   and (u.get("family") or {}).get("family_id") not in PROTOCOL_ROUND_FAMILIES]
+    # 2026-10-03 协议验证轮：smoke 工具在该轮里**只允许**预登记的 4 个 family
+    smoke_protocol = [u for u in used
+                      if (u.get("tool") or "").startswith("g5_8k_smoke_cudnn")
+                      and u["file"] not in fam16_files
+                      and (u.get("family") or {}).get("family_id") in PROTOCOL_ROUND_FAMILIES]
+    smoke_protocol_bad = [u for u in smoke_protocol
+                          if (u.get("family") or {}).get("family_id") not in PROTOCOL_ROUND_FAMILIES]
     authorized_files = ({u["file"] for u in fam16} | {u["file"] for u in forensic}
-                        | {u["file"] for u in smoke_f06})
+                        | {u["file"] for u in smoke_f06}
+                        # 2026-10-03：协议验证轮（未见数据）——**只允许预登记的 4 个 family**
+                        | {u["file"] for u in smoke_protocol})
     outside = [u for u in used if u["file"] not in authorized_files]
-    check("★ **授权范围之外**没有任何 run 消费 manifest family（授权范围 = fam16 16 格 + F06/index25 定点取证）",
+    check("★ **授权范围之外**没有任何 run 消费 manifest family（授权范围 = fam16 16 格 + F06/index25 定点取证 "
+          "+ 2026-10-03 协议验证轮的 4 个预登记 family）",
           not outside, outside[:5])
-    check("★ smoke 工具的非 fam16 运行只允许已登记的定点诊断 family（F06 / F13）",
+    check("★ smoke 工具的非 fam16 运行只允许已登记的定点诊断 family（F06 / F13）或协议预登记 family（F01/F02/F08/F10）",
           not smoke_other, [u["file"] for u in smoke_other][:4])
+    check("★ 协议验证轮的 smoke 运行**只**消费预登记的 4 个 family（F01/F02/F08/F10）",
+          not smoke_protocol_bad, [u["file"] for u in smoke_protocol_bad][:4])
+    cm = [u for u in used if (u.get("tool") or "").startswith("correctness_protocol_margins")]
+    bad_cm = [u["file"] for u in cm
+              if (u.get("family") or {}).get("family_id") not in PROTOCOL_ROUND_FAMILIES]
+    check("★ 新登记消费方 `correctness_protocol_margins` 只引用协议预登记的 4 个 family"
+          "（注册范围仅限该工具 + F01/F02/F08/F10）",
+          not bad_cm, dict(n_scoped=len(cm), bad=bad_cm[:4]))
     scoped = [u for u in used if (u.get("tool") or "").startswith("prefill_sb_replay_f06")]
     bad_family = [u["file"] for u in scoped
                   if (u.get("family") or {}).get("family_id") != "F06"]

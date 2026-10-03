@@ -122,7 +122,37 @@ all-eager / target RoPE CPU-FP32 / greedy / 串行 / 不共享 cache / **每次�
      并在报告里始终标注 `NUMERICAL_DIVERGENCE_RECORDED`；
   4. 无论选哪条，**不得**把本轮结论写成 cuBLAS/PyTorch bug，也**不得**把数学等价写成逐位等价。
 
-## 7. 已证明 / 尚未证明 / 已排除（本轮）
+## 7. 治理：家族消费授权的**显式登记**（如实记录一次 guard FAIL）
+
+**运行前**：`verify_family_independence_cpu` = **PASS 25 / FAIL 0**（`outside_authorized=[]`），
+且 4 个 family 零消费 ⇒ 独立性成立、允许运行。
+
+**运行后**：同一个守卫变成 **PASS 21 / FAIL 4** —— 这是**正确**的判定，它发现：
+
+| 失败项 | 原因 |
+| --- | --- |
+| 预期之外的消费方 | 新增文件 `correctness_protocol_margins.py` 读取 manifest family 字段 |
+| 消费方集合 ≠ opt-in 集合 | 同上（多了一个文件） |
+| **授权范围之外有 run 消费 family** | 本轮 24 次 smoke 运行消费了 **F01**（及其它 3 个），而旧授权范围 = fam16 16 格 + F06/index25 定点取证 |
+| smoke 工具的非 fam16 运行只允许 F06/F13 | 同上 |
+
+**处置（按仓库纪律：新消费方必须"显式登记 + scoped 检查"，不得放宽既有检查）**：
+1. 把 `correctness_protocol_margins.py` 加入 `OPT_IN_CONSUMERS`，注明**授权来源 = 本轮任务**
+   （"从 manifest 选 4 个未参与定位的 family"），日期 `2026-10-03`；
+2. 新增常量 `PROTOCOL_ROUND_FAMILIES = ("F01","F02","F08","F10")`，把协议验证轮的 smoke 运行
+   纳入**受控授权集合**；
+3. 新增**两条 scoped 检查**：
+   * "协议验证轮的 smoke 运行**只**消费预登记的 4 个 family"；
+   * "`correctness_protocol_margins` 只引用协议预登记的 4 个 family"；
+4. **未放宽**任何既有检查；失败记录（21/4）已**落盘保留**：
+   `output/g5/attn/_guard_after_protocol_runs_FAIL_21_4.log`；登记后守卫 = **PASS 27 / FAIL 0**
+   （25 项原有 + 2 项新登记），另存 `_guard_after_registration.log`。
+
+**这说明什么**：守卫按设计工作 —— 任何新的 family 消费都必须**显式登记并限定范围**。
+本轮的登记**不是**对正确性判据的放宽（Guard A/B 与结构检查一字未改），只是把"本轮任务授权的消费"
+写进可审计的白名单。
+
+## 8. 已证明 / 尚未证明 / 已排除（本轮）
 
 **已证明（24 runs 实测）**
 1. 未见数据上，AR/production/diagnostic **各自的两次独立进程都可重复**（四 family、三模式全一致）。
