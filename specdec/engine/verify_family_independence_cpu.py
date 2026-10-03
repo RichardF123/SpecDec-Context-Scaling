@@ -384,7 +384,9 @@ def main() -> int:
     #    首版 `re.findall(r"F\d{2}")` 因此误报 F16 ⇒ 改为 `(?<![A-Za-z0-9_])F\d{2}`。
     #    **修的是本检查的写法，不是被测文件**（不得为让检查通过而改被测代码）。
     _so_src = "\n".join((ROOT / "specdec" / "engine" / n).read_text(encoding="utf-8", errors="ignore")
-                        for n in ("serial_oracle_gpu.py", "serial_oracle_aggregate.py")
+                        for n in ("serial_oracle_gpu.py", "serial_oracle_aggregate.py",
+                                  "serial_oracle_env_check.py",
+                                  "serial_oracle_env_check_selftest_cpu.py")
                         if (ROOT / "specdec" / "engine" / n).exists())
     _so_ids = sorted({m for m in re.findall(r"(?<![A-Za-z0-9_])F\d{2}\b", _so_src)})
     _so_out_of_scope = [f for f in _so_ids if f not in so_fams]
