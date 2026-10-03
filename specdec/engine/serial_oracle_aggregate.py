@@ -707,7 +707,284 @@ def main() -> int:
     a = ap.parse_args()
     if a.scope == "stage1":
         return aggregate_stage1()
-    return aggregate(a.scope)
+    return aggregate_final()
+
+
+# ===========================================================================
+# Stage 2（四个 protocol validation family + F13 合并判定）
+#
+# 判决词表（本轮任务书）：`SERIAL_ORACLE_PASS` / `SERIAL_ORACLE_FAIL` /
+#   `BASELINE_REGRESSION` / `CHECK_NEEDS_REVIEW`。
+# 判定次序（写死）：先"能否评估"（缺运行/环境拒绝/必需字段缺失/审计或复位证据不足 ⇒ NEEDS_REVIEW）
+#   ⇒ 再基线（本轮 AR 自身重复不一致，或与**上一轮 AR 产物**的完整 token IDs/hash/长度/停止不一致
+#     ⇒ BASELINE_REGRESSION）⇒ 再 serial 硬门（⇒ SERIAL_ORACLE_FAIL）⇒ 最后 PASS。
+#
+# 术语（本轮任务书要求）：F01/F02/F08/F10 在上一轮已被使用，统一称
+#   **protocol validation families**，**不**再称"未见数据"。
+#
+# ⚠️ 环境拒绝记录：**只报告**（`env_blocked_records`），仅当导致必需重复数不足时才计入 NEEDS_REVIEW；
+#    **不得**把旧的环境拒绝记录算成本轮失败。
+# ⚠️ D6（复位证据）：本轮的 4 个 family 运行**必须**记录"清理完成后模式已恢复 block"；
+#    F13 的 serial 产物产生于 D6 修正之前（记录里没有 `verify_mode_at_run_end`）⇒ 该项对 F13 记为
+#    **不适用（na）**并写明理由，而**不是**记为 False、也不是静默跳过。
+# ===========================================================================
+STAGE2_FAMILIES = ("F13", "F01", "F02", "F08", "F10")
+STAGE2_NEW_FAMILIES = ("F01", "F02", "F08", "F10")     # 本轮新跑；F13 引自 Stage 1 的原始产物
+STAGE2_PRIOR_TAG = "div8209_proto"                     # 上一轮协议验证轮的产物前缀
+STAGE2_REQUIRED_REPS = 2
+# 上一轮各 family 的 AR 锚点（**运行前登记**；由下面的 `_prior_ar()` 从原始产物**独立复算**并核对）
+STAGE2_AR_ANCHORS = dict(F13=dict(hash="6e7522bf2521ad7b", len=64, stop="max_new_reached"),
+                         F01=dict(hash="5645f0d6943dcb23", len=64, stop="max_new_reached"),
+                         F02=dict(hash="3889082e6a0f4594", len=64, stop="max_new_reached"),
+                         F08=dict(hash="4f4019d300256c2d", len=64, stop="max_new_reached"),
+                         F10=dict(hash="79ca5c727a671e9d", len=64, stop="max_new_reached"))
+
+
+def _prior_ar(family: str) -> dict:
+    """上一轮该 family 的 AR 参考（完整 token IDs + hash + 长度 + 停止原因）。
+
+    ⚠️ F13 **没有**上一轮的 `div8209_proto_F13_*` 产物（上一轮协议验证只用 F01/F02/F08/F10），
+    它的参考是**历史锚点** `6e7522bf2521ad7b`（Stage 1 已核对）。因此这里区分两种来源，
+    `available=False` 时只核对登记锚点，**绝不**把"没有产物"当成"不一致"。
+    """
+    fs = sorted(OUTDIR.glob(f"{STAGE2_PRIOR_TAG}_{family}_ar_rep*_*.json"))
+    a = STAGE2_AR_ANCHORS.get(family) or {}
+    if not fs:
+        return dict(available=False, source="registered_anchor_only（上一轮无该 family 的 AR 产物）",
+                    n_files=0, gens=[], hashes=[], lens=[], stops=[], files=[],
+                    tokens_identical=None, registered_anchor=a,
+                    agrees_with_registered_anchor=None)
+    out = dict(available=True, source="prior_round_artifact", n_files=len(fs), gens=[], hashes=[],
+               lens=[], stops=[], files=[f.name for f in fs], tokens_identical=None,
+               registered_anchor=a, agrees_with_registered_anchor=None)
+    for f in fs:
+        try:
+            d = json.loads(f.read_text(encoding="utf-8-sig"))
+        except Exception:                                                 # noqa: BLE001
+            continue
+        g = list(((d.get("smoke") or {}).get("gen")) or [])
+        out["gens"].append(g)
+        out["hashes"].append(_gen_hash(g))
+        out["lens"].append(len(g))
+        out["stops"].append((d.get("smoke") or {}).get("stop_reason"))
+    out["tokens_identical"] = bool(len({tuple(g) for g in out["gens"]}) == 1) if out["gens"] else None
+    out["agrees_with_registered_anchor"] = bool(
+        out["gens"] and all(h == a.get("hash") and ln == a.get("len") and st == a.get("stop")
+                            for h, ln, st in zip(out["hashes"], out["lens"], out["stops"])))
+    return out
+
+
+def _prior_context(family: str) -> dict:
+    """上一轮 production（文件名用映射后的 `spec`）与 row-aligned 相对其 AR 的首分歧（背景对照，只读）。"""
+    arf = sorted(OUTDIR.glob(f"{STAGE2_PRIOR_TAG}_{family}_ar_rep1_*.json"))
+    if not arf:
+        return dict(available=False)
+    arg = list(((json.loads(arf[-1].read_text(encoding="utf-8-sig")).get("smoke") or {})
+                .get("gen")) or [])
+    out: dict = dict(available=True, ar_file=arf[-1].name, ar_hash=_gen_hash(arg))
+    for mode, key in (("spec", "production"), ("aligned", "row_aligned")):
+        fs = sorted(OUTDIR.glob(f"{STAGE2_PRIOR_TAG}_{family}_{mode}_rep*_*.json"))
+        rows = []
+        for f in fs:
+            d = json.loads(f.read_text(encoding="utf-8-sig"))
+            g = list(((d.get("smoke") or {}).get("gen")) or [])
+            rows.append(dict(rep=d.get("rep"), file=f.name, hash=_gen_hash(g),
+                             len=len(g), first_divergence=_first_div(g, arg), equals_ar=(g == arg)))
+        out[key] = rows
+    return out
+
+
+def _serial_hard_checks2(r: dict, *, require_d6: bool) -> dict:
+    """Stage 2 的 serial 硬检查 = 既有 16 项 + **第 18 项 D6 复位证据**（本轮新跑的 family 必需）。"""
+    out = _serial_hard_checks(r)
+    post_fix = r.get("verify_mode_at_run_end") is not None
+    after = r.get("verify_mode_after_run")
+    if require_d6:
+        out["18_d6_mode_restored_after_cleanup"] = dict(
+            ok=bool(post_fix and after == "block"),
+            detail=f"清理后实际读取 target_verify_mode()={after}（运行结束时={r.get('verify_mode_at_run_end')}）；"
+                   f"该记录产生于 D6 修正之后={post_fix}")
+    else:
+        out["18_d6_mode_restored_after_cleanup"] = dict(
+            ok=None, na=True,
+            detail=("F13 的 serial 产物产生于 D6 修正**之前**（记录里没有 `verify_mode_at_run_end`，"
+                    "`verify_mode_after_run` 是复位前读的旧值）⇒ 该项对 F13 **不适用（na）**；"
+                    "D6 的复位证据由本轮的 16 次运行提供，不据此旧产物推断"))
+    return out
+
+
+def aggregate_final() -> int:
+    from .. import results_schema as S
+    runs = _load_runs()
+    rows_all = [_row(r) for r in runs]
+    for r, raw in zip(rows_all, runs):
+        r["_rounds"] = _stage1_rounds_fields(raw)
+        r["_trace"] = _trace_checks(raw)
+        r["_cross"] = (((raw.get("audit") or {}).get("cross_check")) or {})
+    by: dict = {}
+    env_blocked: list = []
+    for r in rows_all:
+        if r.get("blocked_by") == "environment" or r.get("model_run_happened") is False:
+            env_blocked.append(r)
+        else:
+            by.setdefault(r.get("case"), {}).setdefault(r.get("mode"), []).append(r)
+
+    needs_review: list = []
+    baseline_fail: list = []
+    serial_fail: list = []
+    per_family: dict = {}
+    for fam in STAGE2_FAMILIES:
+        d = by.get(fam, {})
+        ar, se = d.get("ar", []), d.get("serial", [])
+        pr = d.get("prod", [])
+        prior = _prior_ar(fam)
+        require_d6 = fam in STAGE2_NEW_FAMILIES
+        ar_ref = ar[0]["gen"] if ar else None
+        for r in se:
+            r["_ar_stop"] = (ar[0]["stop_reason"] if ar else None)
+            r["_first_div_vs_ar"] = (_first_div(r["gen"], ar_ref) if ar_ref is not None else None)
+        fam_rec: dict = dict(
+            family=fam, is_new_this_round=bool(require_d6),
+            n_reps=dict(ar=len(ar), prod=len(pr), serial=len(se)),
+            ar_hashes=[r["gen_hash"] for r in ar], ar_lens=[r["gen_len"] for r in ar],
+            ar_stops=[r["stop_reason"] for r in ar],
+            serial_hashes=[r["gen_hash"] for r in se], serial_lens=[r["gen_len"] for r in se],
+            serial_stops=[r["stop_reason"] for r in se],
+            first_divergence_vs_ar=[r["_first_div_vs_ar"] for r in se],
+            prior_ar=prior, prior_context=_prior_context(fam),
+            hard_checks={f"rep{r['rep']}": _serial_hard_checks2(r, require_d6=require_d6) for r in se})
+        # 1) 能否评估
+        if len(ar) < STAGE2_REQUIRED_REPS:
+            needs_review.append(f"{fam}: AR 可用运行 {len(ar)}/{STAGE2_REQUIRED_REPS} ⇒ 无法确认基线可重复")
+        if len(se) < STAGE2_REQUIRED_REPS:
+            needs_review.append(f"{fam}: serial 可用运行 {len(se)}/{STAGE2_REQUIRED_REPS} ⇒ 无法确认可重复")
+        if prior.get("tokens_identical") is False or prior.get("agrees_with_registered_anchor") is False:
+            needs_review.append(f"{fam}: **上一轮** AR 参考自身不一致或与登记锚点不符 ⇒ 参考不可用 {prior}")
+        # 2) 基线（本轮 AR 自重复 + 与参考核对）
+        ar_reps_ok = bool(len(ar) >= 2 and len({tuple(r["gen"]) for r in ar}) == 1)
+        anchor = STAGE2_AR_ANCHORS.get(fam) or {}
+        anchor_ok = bool(ar and all(r["gen_hash"] == anchor.get("hash")
+                                    and r["gen_len"] == anchor.get("len")
+                                    and r["stop_reason"] == anchor.get("stop") for r in ar))
+        selfhash_ok = bool(ar and all(r["gen_hash"] == r.get("end_state_gen_hash") for r in ar))
+        if prior.get("available"):
+            prior_gen = prior["gens"][0] if prior.get("gens") else None
+            ar_eq_prior = bool(ar_ref is not None and prior_gen is not None and ar_ref == prior_gen)
+            ar_hash_prior = bool(ar and all(r["gen_hash"] == prior["hashes"][0] for r in ar))
+            ar_len_prior = bool(ar and all(r["gen_len"] == prior["lens"][0] for r in ar))
+            ar_stop_prior = bool(ar and all(r["stop_reason"] == prior["stops"][0] for r in ar))
+            baseline_ok = bool(ar_reps_ok and ar_eq_prior and ar_hash_prior and ar_len_prior
+                               and ar_stop_prior and anchor_ok and selfhash_ok)
+        else:
+            # 无上一轮 token 产物 ⇒ 只核对**登记锚点**（hash/len/stop）；token 级对照记为不可用
+            ar_eq_prior = ar_hash_prior = ar_len_prior = ar_stop_prior = None
+            baseline_ok = bool(ar_reps_ok and anchor_ok and selfhash_ok)
+        fam_rec["ar_checks"] = dict(
+            reference_source=prior.get("source"), reps_identical=ar_reps_ok,
+            equals_registered_anchor=anchor_ok, self_reported_hash_agrees=selfhash_ok,
+            equals_prior_tokens=ar_eq_prior, equals_prior_hash=ar_hash_prior,
+            equals_prior_len=ar_len_prior, equals_prior_stop=ar_stop_prior)
+        if ar and not baseline_ok:
+            baseline_fail.append(f"{fam}: 本轮 AR 未复现基线（{fam_rec['ar_checks']}）")
+        # F13 额外要求 production 背景可用（不重跑；仅核对上一轮产物存在）
+        if fam == "F13":
+            fam_rec["prod_note"] = ("F13 的 production 锚点在 Stage 1 已复现（两次 hash e90dad2b3fcf1c65、"
+                                    "首分歧 index 47）；本轮**不重跑** production，仅引用")
+        # 3) serial 硬门
+        for key, checks in fam_rec["hard_checks"].items():
+            for name, dd in checks.items():
+                if dd["ok"] is False:
+                    serial_fail.append(f"{fam}/serial/{key}: `{name}` 失败 —— {dd['detail']}")
+                elif dd["ok"] is None and not dd.get("na"):
+                    needs_review.append(f"{fam}/serial/{key}: 无法评估 `{name}`（字段缺失）{dd['detail']}")
+        # 4) token equality + 重复性
+        eq = bool(se and ar_ref is not None and all(r["gen"] == ar_ref for r in se))
+        reps = bool(len(se) >= 2 and len({tuple(r["gen"]) for r in se}) == 1)
+        fam_rec["serial_equals_ar"] = eq
+        fam_rec["serial_reps_identical"] = reps
+        if se and ar_ref is not None and not eq:
+            serial_fail.append(f"{fam}: serial 与 AR token 不一致（首分歧 {fam_rec['first_divergence_vs_ar']}）")
+        if se and not reps:
+            serial_fail.append(f"{fam}: 两次 serial 不一致")
+        per_family[fam] = fam_rec
+
+    env_blocked_records = []
+    for r in env_blocked:
+        cg = r.get("commit_guard") or {}
+        env_blocked_records.append(dict(file=r["file"], mode=r["mode"], rep=r["rep"], case=r["case"],
+                                        stage=r.get("stage"), why=str(cg.get("why"))[:140],
+                                        note="环境拒绝记录（仅报告，不计入本轮失败）"))
+    for r in rows_all:
+        if r.get("stage") == "crashed" or r.get("post_processing_error"):
+            needs_review.append(f"{r['case']}/{r['mode']}/rep{r['rep']}: 运行器自身失败 "
+                                f"stage={r.get('stage')} {r.get('post_processing_error')}")
+
+    if needs_review:
+        decision = "CHECK_NEEDS_REVIEW"
+    elif baseline_fail:
+        decision = "BASELINE_REGRESSION"
+    elif serial_fail:
+        decision = "SERIAL_ORACLE_FAIL"
+    else:
+        decision = "SERIAL_ORACLE_PASS"
+
+    run_utc = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    n_new = sum(len(by.get(f, {}).get(m, [])) for f in STAGE2_NEW_FAMILIES for m in ("ar", "serial"))
+    summary = dict(
+        tool="serial_oracle_aggregate_stage2", tag=TAG, scope="final", run_utc=run_utc,
+        git=S.git_meta(ROOT),
+        terminology=("F01/F02/F08/F10 上一轮已被使用 ⇒ 本轮统一称 **protocol validation families**，"
+                     "不称'未见数据'"),
+        families=list(STAGE2_FAMILIES), new_families_this_round=list(STAGE2_NEW_FAMILIES),
+        decision_rule=("本轮任务书：PASS = F13 + 四个 family 全部与 AR 逐 token 一致、重复性一致、"
+                       "所有硬检查通过；FAIL = 基线正常但任一 family 的 serial token 或控制不变量失败；"
+                       "BASELINE_REGRESSION = 本轮 AR 无法复现自身重复或上一轮锚点；"
+                       "CHECK_NEEDS_REVIEW = 环境/审计/复位证据/必需字段不足。"
+                       "次序：先（能否评估）⇒ 再基线 ⇒ 再 serial 硬门 ⇒ 最后 PASS"),
+        n_runs_total=len(rows_all), n_new_round_runs=n_new, n_env_blocked=len(env_blocked),
+        ar_anchors_registered=STAGE2_AR_ANCHORS,
+        per_family=per_family, env_blocked_records=env_blocked_records,
+        needs_review=needs_review, baseline_failures=baseline_fail, serial_failures=serial_fail,
+        decision=decision, runs=rows_all,
+        next_round_allowed=(decision == "SERIAL_ORACLE_PASS"),
+        next_round_note=("PASS 只是**五个 family 的实证支持**；**不**授权 B6/pilot/正式 factorial，"
+                         "本轮也未启动它们"))
+    p = OUTDIR / f"{TAG}_stage2_aggregate_{run_utc}.json"
+    pj = OUTDIR / f"{TAG}_stage2_aggregate_{run_utc}.jsonl"
+    with pj.open("w", encoding="utf-8") as fh:
+        for r in rows_all:
+            fh.write(json.dumps(r, ensure_ascii=False, default=str) + "\n")
+    summary["artifact_json"] = str(p)
+    summary["artifact_jsonl"] = str(pj)
+    p.write_text(json.dumps(summary, ensure_ascii=False, indent=1, default=str), encoding="utf-8")
+
+    print("== Stage 2 聚合（F13 引用 + 四个 protocol validation family）==")
+    print(f"  运行：total={len(rows_all)} 本轮新增={n_new}/16 env拒绝(仅报告)={len(env_blocked)}")
+    for fam in STAGE2_FAMILIES:
+        f = per_family[fam]
+        print(f"  [{fam}] reps={f['n_reps']} AR={f['ar_hashes']} serial={f['serial_hashes']}")
+        print(f"        AR 参考={f['ar_checks']['reference_source']} 自身重复={f['ar_checks']['reps_identical']}"
+              f" 锚点={f['ar_checks']['equals_registered_anchor']}"
+              f" 与上一轮 tokens/hash/len/stop={f['ar_checks']['equals_prior_tokens']}/"
+              f"{f['ar_checks']['equals_prior_hash']}/{f['ar_checks']['equals_prior_len']}/"
+              f"{f['ar_checks']['equals_prior_stop']}")
+        print(f"        serial==AR：{f['serial_equals_ar']}（首分歧 {f['first_divergence_vs_ar']}）"
+              f" 两次一致={f['serial_reps_identical']}")
+        bad = {k: v for rep, ck in f["hard_checks"].items() for k, v in ck.items() if v["ok"] is False}
+        na = [k for ck in f["hard_checks"].values() for k, v in ck.items() if v.get("na")]
+        print(f"        硬检查失败={bad if bad else '无'}；不适用={na}")
+    for x in env_blocked_records:
+        print(f"  [环境拒绝·仅报告] {x['file']}（{x['case']}/{x['mode']}）{x['why']}")
+    for x in needs_review:
+        print(f"  [需复核] {x}")
+    for x in baseline_fail:
+        print(f"  [基线回归] {x}")
+    for x in serial_fail:
+        print(f"  [serial 硬门失败] {x}")
+    print(f"  ★ 判决 = {decision}")
+    print(f"\n[so-s2] RESULT_JSON={p}")
+    print(f"[so-s2] RESULT_JSONL={pj}")
+    return 0 if decision == "SERIAL_ORACLE_PASS" else 1
 
 
 if __name__ == "__main__":
