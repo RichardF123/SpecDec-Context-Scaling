@@ -188,9 +188,10 @@ def _capture_arm(tgt, H, dev, arm: str, mode: str, tag: str, *, cand: bool) -> d
         # 候选模式的分支计数：**必须**在上下文体内取（退出即恢复注册表）
         st_qk = M.serial_qk_state() if cand else None
         st_lin = M.serial_linear_state() if cand else None
-        log = RA.verify_log() if cand else []
         struct = _cache_struct(cache_after)
         norm_caps = LB.take()
+    # ⚠️ `verify_log()` 是 context 的 `finally` 里写入的 ⇒ 必须在**退出之后**取（首跑在体内取到空）。
+    log = RA.verify_log() if cand else []
     return dict(arm=arm, mode=mode, row_index=int(row_index), cand=bool(cand), chain=chain,
                 norm_caps=norm_caps, final_row=row.detach().to("cpu"),
                 cache_len_after=int(spec_cache.cache_length(cache_after)),
@@ -464,6 +465,7 @@ def _run(rec: dict, run_id: str) -> int:
                 sall_is_decode=True,
                 note="候选只包住 `spec_dec._verify` 的调用点（本工具四臂直接调用 `_verify`/`_step` 复现该作用域）"),
             causal_prefix=dict(qk_visible_examples=[v for v in (vr.get("qk_visible") or [])[:3]],
+                               n_qk_records=len(vr.get("qk_visible") or []),
                                expected_row0=[PRE + 1], expected_rows=[PRE + 1 + i for i in range(len(CANDS))],
                                all_rows_ok=bool(vr.get("qk_visible")
                                                 and all(v == [PRE + 1 + i for i in range(len(CANDS))]
