@@ -1,0 +1,68 @@
+# 待小组确认的协议决策（一页）（2026-10-04）
+
+> 本轮**只做只读审计与 CPU 自测**：未批准 v2、未改冻结判据、未运行 GPU、**未**声明 `READY_FOR_FORMAL_MEASUREMENT`。
+> 配套：`docs/specdec_correctness_protocol_v2_2026-10-04.md`（v2 草案）、
+> `docs/specdec_protocol_v2_evidence_inventory_2026-10-04.md`（条款审计）、
+> `docs/stage2b_executability_audit_2026-10-04.md`（family/命令/FP8 可执行性审计，本轮新增）。
+
+## 1. 一句话结论（必须写进小组纪要）
+
+**把 exact-token 检查的执行路径从 production batched verification（`M=4`）换到 serial oracle（逐 token `M=1`），
+是执行路径上的**实质调整**，不能只称为"不降低门槛"。**
+门槛的**数值**没有放松（Gate A 仍要求**完整 token IDs 逐 token 相等**），
+但**被检验的对象**变了：从"生产路径是否与 AR 相同"变为"**控制逻辑**在与 AR 同路径时是否与 AR 相同"。
+生产路径的 token 分歧则从"门"变成"**必须记录并解释的数值行为**"。
+因此需要在小组层面**明确确认**这一重新分层，而不是把它当成"换一个更准的测量工具"。
+
+## 2. 与旧判据、最终 proposal 的一致 / 冲突
+
+**说明**：`output/pdf/specdec_course_proposal_2026-10-04_final.tex` 与 `..._candidate_rev3_2026-10-04.tex`
+**逐字只差一行**（页眉 `candidate rev. 2026-10-04` → `2026-10-04`，已实测 diff）⇒ 其正确性表述**就是** rev3 的表述。
+
+| # | 判据 / 文件 | 关系 | 说明 |
+| --- | --- | --- | --- |
+| 1 | `design_freeze_g4_specdec.md:16`（`SpecDec ids == target-only greedy ids`） | **一致** | v2 Gate A 保留该要求 |
+| 2 | `design_freeze_g4_specdec.md:96`（"**B6 exact-token-id 门不可取消**"） | **一致** | v2 **不取消**该门，只改变其**兑现路径**（Gate A） |
+| 3 | `design_freeze_g4_specdec.md:83`（B6 判据，条件 `base_bf16` **与** `v_fp8`） | **冲突（须确认）** | 该条按 `§1.1` 字面语义指向 **production**（`M=4`）；v2 让生产层**不设 exact-id 门**。⇒ 需要小组确认这是"**重新分层**"而非"取消/放宽"；且 `v_fp8` 档要**各自**验证 |
+| 4 | `g5_measurement_protocol.md:268`（**主 Gate**：FP32 `B6` 逐 token 精确相等，PASS 20/20） | **一致（互补）** | FP32 口径证明**控制逻辑/索引/缓存语义**精确；BF16 生产路径的分歧属**数值行为** ⇒ 两者互为印证，不矛盾 |
+| 5 | `g5_measurement_protocol.md:159-164`（speedup 声明资格 10 条） | **一致** | 资格条件**不含** `ar_equal` ⇒ "不同 token 也能测速度"在冻结测量协议中**本来就成立** |
+| 6 | `production_correctness_decision_2026-09-29.md:54-60`（路线 B 建议稿） | **一致** | v2 = 该建议稿的形式化 + 仪器替换（该稿状态：**待小组批准**） |
+| 7 | `proposal_freeze_2026-10-01.md:31`（"严格 AR/Spec 输出一致性按各 KV 表示分别验证，不放宽门槛"） | **被新稿取代** | 新 `final` proposal 已改为分层表述；旧稿仍在仓库，**不改写**，但须在小组成员间明确"以 final 为准" |
+| 8 | `verification_readiness_2026-09-29.md:254,267`（未获准航线时按现行 B6 exact-id 判据、不放宽） | **须澄清** | 该条以"航线是否获准"为条件 ⇒ 需明确"路线 B 是否即获准航线" |
+| 9 | `final` proposal（2026-10-04）正确性段落 | **一致** | 已写明 layered correctness gate（Control logic / Production numerical behaviour）、`base_bf16` 与 `v_fp8` 各自验证、FP8 仍待验证、正式门未通过 |
+
+## 3. D-1 … D-9 逐项推荐决定
+
+| # | 事项 | **推荐** | 理由（要点） |
+| --- | --- | --- | --- |
+| **D-1** | 批准"路线 B + serial oracle 作为 Gate A 仪器" | **批准**，但纪要中必须写明这是**执行路径的实质调整** | exact-id 门不取消（`design_freeze:96`），只是改由**与 AR 同路径**的仪器兑现；生产分歧改为记录（`§2` 第 3 行） |
+| **D-2** | Gate A 扩到 9 family（新增 F09/F03/F11/F04）还是限定 5 窗口 | **扩到 9** | 四个新 family 已核验：manifest 条目齐全、`token_sha1` 复现（`hash_verified=True`）、窗口两两不重叠、**32-gram 零交集**（含与已用 5 family 及调试输入）、现有产物**零消费**。五窗口不足以支撑"控制逻辑正确"的系统级陈述 |
+| **D-3** | 授权把新 family 登记进守卫授权范围 | **批准登记**（只增检查） | **已实测**：F09/F03/F11/F04 当前**全部**会被判越界（`REGISTERED_DIAG_FAMILIES=("F06","F13")`、`PROTOCOL_ROUND_FAMILIES=("F01","F02","F08","F10")`、`SERIAL_ORACLE_ROUND.families` 不含它们）⇒ 不登记则**跑不了**（守卫会正确 FAIL） |
+| **D-4** | 分歧阈值 `首个分歧 index==0 ⇒ CHECK_NEEDS_REVIEW` | **删除自动阈值**（见 §4） | 无实测依据、且诱导事后选择；改为"全部记录 + 预登记解释规则" |
+| **D-5** | 质量口径与是否两条轨迹都评 | **沿用冻结口径**（WikiText-2 test、非重叠窗口、absolute PPL + relative ΔPPL），并明确"**不**用于声称分歧后生成质量等同"；是否两条轨迹都评由小组定 | `production_correctness_decision:103` 已明确"标准 AR PPL 不能直接当作 SpecDec 生成质量" |
+| **D-6** | `v_fp8` 是否也要各自的 Gate A | **必须单独做** | `design_freeze_g4:83` 把条件写成 `base_bf16` **与** `v_fp8`；现有 serial 证据**只有 BF16** ⇒ 不得外推（详见审计文档 §4） |
+| **D-7** | 新判决词条（`..._WITH_RECORDED_DIVERGENCE`、`PRODUCTION_RUNTIME_FAIL`） | **保留**（可改名以降低沟通成本） | 与"生产层不设 exact-id 门"配套；否则生产结构失败与算法失败会被混为一谈 |
+| **D-8** | `design_freeze_g4_specdec.md` 的状态 | **先确认状态再改** | 该文件自称 `DRAFT v0.3`、批准栏（`:103`）**未勾选**，却被多处以"权威/冻结判据"引用 ⇒ 决定 D-1 是"改冻结判据"还是"正式批准一份草案" |
+| **D-9** | 是否再补 FP32 口径 | **不重复** | `B6-fp32` 已 PASS（20/20 组合、216/348 token）；与 BF16-serial 的 PASS 互为印证 |
+
+## 4. 对"首个分歧 index == 0"阈值的专项审查（结论：建议删除）
+
+我原先在 v2 §5.2 里预登记了 `首个分歧 index == 0 ⇒ CHECK_NEEDS_REVIEW`。**审查后建议删除该自动阈值**：
+
+1. **没有可辩护的依据**：仓库内**没有任何**实测数据支持"index=0 与 index≥1 在解释上必须区别对待"；
+   该阈值是我提出的**判断性**设定，不是从证据推出的。
+2. **会诱导事后选择**：一旦有了新结果，自动阈值很容易被围绕解释（"刚好差一位"这类争论）。
+3. **替代方案（预登记的解释规则，不含"是否准入"的自动判定）**：
+   * **R1**：生产与 AR 的**每一处**分歧都必须完整记录（首位置、共同前缀长度 P、两侧 token、
+     决策位置 top-1/top-2 与 margin、两轨迹的接受率/轮数/target 调用数）——即 Gate B 的 GB6；
+   * **R2**：速度比**一律**标注为"**分歧轨迹上的比较**"，并同时报告 P、两侧接受统计与轮数；
+   * **R3**：若 `P < k（=4）`，即**首个验证轮内**就分歧 ⇒ 报告**必须**额外注明"该条件的 AR 分母与 Spec 分子
+     描述的是两条几乎从头不同的轨迹"，且**不得**把该条件当作主结论的代表值（仍可作为结果报告）；
+   * **R4（可选）**：若小组仍希望有数值阈值，只能在**看到下一轮结果之前**预登记，并写明依据与来源。
+   **我的推荐：采用 R1–R3；R4 由小组决定。**
+
+## 5. 需要你在批准前明确回答的三件事
+
+1. **D-1 + D-8**：是否确认"exact-id 门重新分层到 serial oracle"？（并澄清 `design_freeze_g4` 是冻结判据还是草案）
+2. **D-3**：是否授权登记 F09/F03/F11/F04 进守卫授权范围？（不授权则下一轮无法开始）
+3. **D-4**：是否接受"删除自动阈值 + R1–R3 解释规则"？
