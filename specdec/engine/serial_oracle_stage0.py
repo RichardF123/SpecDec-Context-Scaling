@@ -297,6 +297,39 @@ def main() -> int:
                _ck("c13_serial_trace_empty_in_block_mode", c["serial_trace"] == [],
                    c["serial_trace"])]
 
+    # 用例 16（**接入层等价性**，由"读 hook 安装点"发现的缺陷驱动）：
+    # `smoke_hooks.DecisionHooks` 是把 `spec_dec._verify` **换成自己的包装器**来推进轮次记账
+    # （`begin_round` / `on_verify_pre` / `verify` 阶段的 `rows` 有限性检查 / ALWAYS_REQUIRED 的
+    # `("verify","target")`）。因此 `_verify` 必须是**唯一分派点**：若主循环直接分支到 `_verify_serial`，
+    # 这些记账会**静默失效**（首版实现正是这样，纯逻辑 Stage 0 不会报错，只有核对 hook 安装点才暴露）。
+    # 本用例用与 `smoke_hooks` 相同的手法（替换模块属性）包装 `_verify`，核对：每轮恰好一次、序列路径真的跑了、
+    # 且结果与未包装时**逐位相同**。
+    orig_verify16 = spec_dec._verify
+    seen16: list = []
+
+    def _counting_verify(*a, **k):
+        seen16.append(1)
+        return orig_verify16(*a, **k)
+
+    spec_dec._verify = _counting_verify
+    try:
+        c16 = _case("hook_wrapped_verify_serial", prompt_len=2,
+                    tgt_seq=[3, 4, 5, 6, 7, 7, 7, 7, 7, 7, 7, 7, 7],
+                    drf_seq=[3, 4, 5, 6, SENT, SENT, SENT, SENT, SENT, SENT, SENT, SENT, SENT],
+                    max_new=6, k=4)
+    finally:
+        spec_dec._verify = orig_verify16
+    cases.append(c16)
+    checks += [_ck("c16_verify_called_once_per_round_under_wrapper",
+                   len(seen16) == len(c16["rounds"]) and len(seen16) > 0,
+                   dict(n_verify_calls=len(seen16), n_rounds=len(c16["rounds"]))),
+               _ck("c16_serial_path_still_ran",
+                   len(c16["serial_trace"]) == len(c16["rounds"]) and len(c16["serial_trace"]) > 0,
+                   dict(trace=len(c16["serial_trace"]), rounds=len(c16["rounds"]))),
+               _ck("c16_result_identical_to_unwrapped_serial", c16["gen"] == cS["gen"],
+                   (c16["gen"], cS["gen"])),
+               _ck("c16_verify_restored", spec_dec._verify is orig_verify16)]
+
     # 用例 14（**负对照**）：调用几何审计必须能**失败** —— block 模式 + 审计 ⇒ CallGeometryError
     r14 = _case_raise("audit_rejects_block_mode", prompt_len=2, tgt_seq=[3, 4, 5, 6, 7, 7, 7, 7],
                       drf_seq=[3, 4, 5, 6, 9, 9, 9, 9], max_new=5, k=4, mode="block", audit=True)
@@ -339,6 +372,28 @@ def main() -> int:
                                         "g[j]=a_target[P-1+j]；block 与 serial 消费同一批 kp 行"),
                diagnostic_only=True, gpu_used=False, model_loaded=False,
                first_run_fail_ref="output/g5/attn/serial_oracle_stage0_20261003T134138Z.json",
+               design_corrections=[
+                   dict(item="serial 分派点", kind="集成缺陷（Stage 0 纯逻辑无法发现）",
+                        found_by="在接入真实 harness 之前逐项核对 smoke_hooks 的挂载点",
+                        wrong=("首版让主循环直接分支到 `_verify_serial` ⇒ `smoke_hooks` 装在 "
+                               "`spec_dec._verify` 上的包装器不会被调用：`begin_round`/`on_round_start`"
+                               "（轮次不推进 ⇒ `round_invariants`/`rounds` 为空）、`on_verify_pre`/"
+                               "`on_verify_post`（跳过）、`verify` 阶段的 `rows` 有限性检查（跳过）、"
+                               "以及 `smoke_checks.ALWAYS_REQUIRED` 的 `(\"verify\",\"target\")`（缺失 ⇒ "
+                               "`checks.passed=False`）。"),
+                        fixed=("`_verify` 成为**唯一分派点**（`_VERIFY_MODE` 在 `_verify` 内部选择实现），"
+                               "主循环调用形式与生产逐字相同；互斥门保留在循环内。"),
+                        why_it_matters="不接好就会把 hook 记账静默掏空，产物与生产不可比（比数值错更难发现）。",
+                        test="用例 16：用与 smoke_hooks 相同手法包装 `spec_dec._verify`，核对每轮恰好一次调用"
+                             "且结果与未包装时逐位相同"),
+                   dict(item="逐 token 前向的实现路径", kind="记录可比性（非数值）",
+                        wrong=("首版 `_step_rows` 复用模块级 `_step` ⇒ 生产里 `_step` 被 smoke_hooks 包装为 "
+                               "`repair` 阶段 + `saved_next` 角色 ⇒ serial 每轮 kp 次校验被误标为 repair，"
+                               "并把 `(\"repair\",\"target\")` 计数从 1 次/轮抬到 kp+1 次/轮。"),
+                        fixed=("`_step_rows` 直接调用 `model._run`（数值语义与 `_step` 完全相同）⇒ serial 与 "
+                               "block 的插桩足迹逐项相同（每轮一次 `(\"verify\",\"target\")` 的 `rows` 检查）。"),
+                        why_it_matters="两条路径的 harness 记录必须同口径，否则 `checks`/覆盖统计不可比。"),
+               ],
                assertion_defects_fixed=[
                    dict(check="c05_m_is_0_then_eos", kind="test_expectation_wrong",
                         detail=("脚本索引约定决定 g[0]=a_t[P-1] 与 cands[0]=a_d[P-1] 相等 ⇒ m=1，"

@@ -70,22 +70,38 @@ def target_verify_mode() -> str:
 
 
 def _step_rows(model, cache, tokens: list):
-    """**逐 token** `_step`（每次 `s=1`）→ 收集每步的行与最终 cache；返回 `(rows, cache, lens)`。
+    """**逐 token** 前向（每次 `s=1`）→ 收集每步的行与 cache 长度；返回 `(rows, cache, lens)`。
 
     `rows[j]` = 喂入 `tokens[j]` 之后那一行（位置 `pre+j`）——与 block 版 `lg[0, -kp:]` 的**语义一致**。
     `lens[j]` = 喂入 `tokens[j]` 之后的 cache 长度（供 trace 核对"cache 长度 = pre+j+1"）。
+
+    ⚠️ **故意直接调用 `model._run`，而不是复用模块级 `_step`**：生产里 `_step` 会被
+    `smoke_hooks` 换成包装器（把该调用标成 `repair` 阶段、按 `saved_next` 角色计数）。
+    若本函数走 `_step`，serial 模式下每轮 `kp` 次逐 token 校验会被**误标为 repair**，并把
+    `("repair","target")` 的计数从 1 次/轮抬高到 kp+1 次/轮 ⇒ 与 block 路径的记录**不可比**。
+    直接 `_run` 让 serial 路径的插桩足迹与 block 路径**逐项相同**：每轮恰好一次
+    `("verify","target")` 的 `rows` 有限性检查（由 `_verify` 的包装器在 argmax **之前**完成）。
+    **数值语义与 `_step` 完全相同**（同一 `_run`、同一 `inference_mode`、同一 token 张量构造）。
     """
     rows, c = [], cache
     lens = []
-    for t in tokens:
-        lg, c = _step(model, t, c)
-        rows.append(lg[:, -1])
-        lens.append(cache_length(c))
+    with torch.inference_mode():
+        for t in tokens:
+            lg, c = model._run(
+                model.embed_tokens(
+                    torch.tensor([[int(t)]], device=cache[0]["k"].device)),
+                c, need_logits=True)
+            rows.append(lg[:, -1])
+            lens.append(cache_length(c))
     return rows, c, lens
 
 
 def _verify_serial(target, cache, cands):
-    """**串行 target verification**：与 `_verify` **同 contract**（`(rows, cache_blk)`），但全部 `s=1`。"""
+    """**串行 target verification**：与 `_verify` **同 contract**（`(rows, cache_blk)`），但全部 `s=1`。
+
+    只由 `_verify` 在 `_VERIFY_MODE == "serial"` 时分派（见 `_verify` 的说明：分派点必须在
+    `_verify` 内部，否则 `smoke_hooks` 的轮次记账/有限性检查会被绕过）。
+    """
     rows, c, lens = _step_rows(target, cache, list(cands))
     if not rows:
         raise VerifyModeError("_verify_serial 收到空候选")
@@ -142,6 +158,16 @@ def _propose(draft, cache, lg, k_eff, eos_id):
 
 
 def _verify(target, cache, cands):
+    """target verification 的**唯一分派点**（`block` = 生产原样；`serial` = 逐 token oracle）。
+
+    ⚠️ 分派**必须在这里**，不能在主循环里分支：`smoke_hooks.DecisionHooks` 是把
+    `spec_dec._verify` 换成自己的包装器来推进**轮次记账**的（`begin_round` / `on_round_start` /
+    `on_verify_pre` / `verify` 阶段的 `rows` 有限性检查 / `ALWAYS_REQUIRED` 的 `("verify","target")`）。
+    若主循环绕过 `_verify`，这些记账与检查会**静默失效** ⇒ 记录不可比。
+    两种模式的返回值 contract 完全一致：`(rows, cache_blk)`，`rows.shape == (kp, V)`。
+    """
+    if _VERIFY_MODE == "serial":
+        return _verify_serial(target, cache, cands)
     with torch.inference_mode():
         lg, cache_blk = target._run(
             target.embed_tokens(
@@ -186,14 +212,14 @@ def spec_decode_greedy(target, draft, prompt_ids, max_new_tokens, *, k=K,
             break
 
         # 默认（`_VERIFY_WRAP is None` 且 `_VERIFY_MODE == "block"`）：**原样**一行，生产路径逐位不变。
-        # 两个诊断分支（row-aligned wrapper / serial oracle）互斥；serial 时 target 的全部 generation
+        # 两个诊断机制（row-aligned wrapper / serial oracle）互斥；serial 时 target 的全部 generation
         # 前向都是 `s=1`（与 AR 完全相同）。
+        # ⚠️ **`_verify` 是唯一分派点**：模式选择在 `_verify` **内部**完成，主循环**不**分支。
+        #    否则 `smoke_hooks` 装在 `spec_dec._verify` 上的轮次记账/有限性检查会被静默绕过。
         _SERIAL_TRACE_PRE.append(pre)
-        if _VERIFY_MODE == "serial":
-            if _VERIFY_WRAP is not None:
-                raise VerifyModeError("serial 模式与 row-aligned wrapper 互斥")
-            rows, tgt_blk = _verify_serial(target, tgt_cache, cands)
-        elif _VERIFY_WRAP is None:
+        if _VERIFY_MODE == "serial" and _VERIFY_WRAP is not None:
+            raise VerifyModeError("serial 模式与 row-aligned wrapper 互斥")
+        if _VERIFY_WRAP is None:
             rows, tgt_blk = _verify(target, tgt_cache, cands)
         else:
             with _VERIFY_WRAP(target):
