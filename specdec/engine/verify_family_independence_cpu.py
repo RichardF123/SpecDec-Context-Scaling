@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import zipfile
 from pathlib import Path
 
@@ -112,6 +113,22 @@ OPT_IN_CONSUMERS = {"g5_8k_smoke_cudnn.py",      # fam16 授权轮（SMOKE_FAMIL
 # 因此必须**显式登记**（登记 + scoped 检查；**不放宽**任何既有检查）。
 PROTOCOL_ROUND_FAMILIES = ("F01", "F02", "F08", "F10")
 
+# 2026-10-03（**串行 target verification oracle 轮**）：授权来源 = 本轮任务书明确指定
+#   Stage 1 = F13；Stage 2 = 协议预登记的 F01/F02/F08/F10（**不重跑** production/row-aligned）。
+#   ⇒ 授权集合 = {"F13"} ∪ PROTOCOL_ROUND_FAMILIES。
+#
+# 为什么该轮的运行器**不**进 `OPT_IN_CONSUMERS`：
+#   * `OPT_IN_CONSUMERS` 的口径是"**直接**消费 manifest 字段的文件"，由 `_manifest_consumers()`
+#     按 `families_manifest/prompt_families/family_id/window_token_start` 这些**字面量**识别，
+#     并且有等式检查 `seen_files == sorted(OPT_IN_CONSUMERS)`（登记了但检测不到会直接判失败）。
+#   * `serial_oracle_gpu.py` 只是**驱动** harness（经 `SO_CASE` → `SMOKE_FAMILY`），真正的取数仍在
+#     已登记的 `g5_8k_smoke_cudnn` ⇒ 它产出的 `smoke8k_eager_*.json` 仍按 `smoke_f06`/`smoke_protocol`
+#     分类并被授权范围覆盖。
+#   * 但它自己的运行记录（family 嵌在 `smoke.input`）**不**被主检测器看到（主检测器只读顶层 `input`），
+#     因此**另加**下方专项 scoped 检查（**只增检查、不改既有**）。
+SERIAL_ORACLE_ROUND = dict(tag="div8209_so", tool="serial_oracle_gpu",
+                           families=("F13",) + PROTOCOL_ROUND_FAMILIES)
+
 
 def _manifest_consumers() -> list:
     """**区分大小写**扫描：除 manifest 机器本身外，是否还有工具读取 manifest 字段。
@@ -162,6 +179,30 @@ def _family_used_in_existing_runs() -> list:
             used.append(dict(file=p.name, family=inp.get("family"), kind=inp.get("source_kind"),
                              tool=j.get("tool"), run_id=j.get("run_id")))
     return used
+
+
+def _serial_oracle_run_records(tag: str, tool: str) -> list:
+    """读取**串行 oracle 轮**运行器自己写的记录（family 嵌在 `smoke.input`，主检测器看不到）。
+
+    ⚠️ 口径：本函数只读文件、只提取字段；**不**改任何检查的严格性。空集合会被**如实**报出
+    （GPU 运行开始之前必然为空 —— 不得把"空"说成"已验证"）。
+    """
+    out = []
+    for p in sorted((ROOT / "output" / "g5" / "attn").glob(f"{tag}_*_rep*_*.json")):
+        try:
+            j = json.loads(p.read_text(encoding="utf-8-sig"))
+        except Exception:                                        # noqa: BLE001
+            continue
+        if not isinstance(j, dict) or j.get("tool") != tool:
+            continue
+        inp = ((j.get("smoke") or {}).get("input") or {})
+        fam = inp.get("family") or {}
+        out.append(dict(file=p.name, case=j.get("case"), mode=j.get("mode"), rep=j.get("rep"),
+                        kind=inp.get("source_kind"), family_id=fam.get("family_id"),
+                        stage=j.get("stage"), blocked_by=j.get("blocked_by"),
+                        env_qualified=j.get("env_qualified"),
+                        model_run_happened=j.get("model_run_happened")))
+    return out
 
 
 def _this_round_run_ids() -> set:
@@ -318,6 +359,37 @@ def main() -> int:
     check("★ 新登记消费方 `correctness_protocol_margins` 只引用协议预登记的 4 个 family"
           "（注册范围仅限该工具 + F01/F02/F08/F10）",
           not bad_cm, dict(n_scoped=len(cm), bad=bad_cm[:4]))
+    # 2026-10-03（串行 target verification oracle 轮）：授权集合 = {"F13"} ∪ {F01,F02,F08,F10}。
+    # 记录级：读**运行器自己写的**记录（family 嵌在 `smoke.input`）。**空的含义要说清楚**：
+    # GPU 运行开始之前（或被环境门拒绝时）这里必然为空 —— 空**不**等于"已验证在范围内"。
+    so = _serial_oracle_run_records(SERIAL_ORACLE_ROUND["tag"], SERIAL_ORACLE_ROUND["tool"])
+    so_fams = SERIAL_ORACLE_ROUND["families"]
+    bad_so = [u["file"] for u in so
+              if (u.get("family_id") and u["family_id"] not in so_fams)
+              or (u.get("case") and u["case"] not in so_fams)]
+    n_so_ran = sum(1 for u in so if u.get("model_run_happened"))
+    n_so_env = sum(1 for u in so if u.get("blocked_by") == "environment")
+    check("★ 本轮运行器 `serial_oracle_gpu`（串行 target verification oracle）的 family 只在 "
+          "{F13} ∪ {F01,F02,F08,F10} 内（记录级；空集合**不算**证明，见 extra.note）",
+          not bad_so,
+          dict(n_scoped=len(so), n_model_runs=n_so_ran, n_env_blocked=n_so_env,
+               families=list(so_fams), bad=bad_so[:4],
+               note="记录级检查只覆盖**已存在**的运行记录；在 GPU 运行（且通过环境门）之前它为空，"
+                    "此时它不构成任何结论。本轮 Stage 1/2 的 family 范围另由**来源**保证："
+                    "`SO_CASE` 由调用方显式给定，本仓库的 `scripts/so_batch.ps1` 只被以 "
+                    "F13 与 F01/F02/F08/F10 调用。"))
+    # 源级：上述两个文件里**不得**出现授权集合之外的 family 字面量
+    # ⚠️ 必须加**词边界**：`F\d{2}` 会命中 `BF16`/`bf16` 中的 "F16"（本仓库里 bf16 出现极多）。
+    #    这正是本文件 `_manifest_consumers()` 注释里早已警告过的陷阱；本次仍踩了一次，
+    #    首版 `re.findall(r"F\d{2}")` 因此误报 F16 ⇒ 改为 `(?<![A-Za-z0-9_])F\d{2}`。
+    #    **修的是本检查的写法，不是被测文件**（不得为让检查通过而改被测代码）。
+    _so_src = "\n".join((ROOT / "specdec" / "engine" / n).read_text(encoding="utf-8", errors="ignore")
+                        for n in ("serial_oracle_gpu.py", "serial_oracle_aggregate.py")
+                        if (ROOT / "specdec" / "engine" / n).exists())
+    _so_ids = sorted({m for m in re.findall(r"(?<![A-Za-z0-9_])F\d{2}\b", _so_src)})
+    _so_out_of_scope = [f for f in _so_ids if f not in so_fams]
+    check("★ 本轮运行器/汇总器的**源码**里没有授权集合之外的 family 字面量（源级检查）",
+          not _so_out_of_scope, dict(found=_so_ids, out_of_scope=_so_out_of_scope))
     scoped = [u for u in used if (u.get("tool") or "").startswith("prefill_sb_replay_f06")]
     bad_family = [u["file"] for u in scoped
                   if (u.get("family") or {}).get("family_id") != "F06"]
@@ -403,6 +475,17 @@ def main() -> int:
                               outside_authorized=[u["file"] for u in outside],
                               rule="授权范围 = fam16 16 格 + F06/index25 定点取证；"
                                    "其他任何 run 消费 family 都算越界"),
+                          serial_oracle_round=dict(       # 2026-10-03：串行 target verification oracle 轮
+                              tag=SERIAL_ORACLE_ROUND["tag"], tool=SERIAL_ORACLE_ROUND["tool"],
+                              authorized_families=list(so_fams),
+                              n_records=len(so), n_model_runs=n_so_ran, n_env_blocked=n_so_env,
+                              records=so, out_of_scope=bad_so,
+                              source_family_literals=_so_ids, source_out_of_scope=_so_out_of_scope,
+                              vacuity_note="记录级检查在 GPU 运行（且通过环境门）之前为空；"
+                                           "空集合**不**构成任何结论，此处如实记录 n_model_runs/n_env_blocked",
+                              why_not_opt_in_consumer=("本运行器只驱动已登记的 g5_8k_smoke_cudnn"
+                                                       "（取数仍在后者），按 `OPT_IN_CONSUMERS` 的"
+                                                       "字面量口径它不进该集合；其 family 范围由本专项检查覆盖")),
                           scan_caveat="源码扫描只覆盖本仓库的 specdec/engine 与 scripts；"
                                       "不覆盖仓库外的手工运行，也不构成「从未使用」的证明。"),
         all_16_prefixes_reproduced=not bad,
