@@ -6,18 +6,19 @@
 
 ## 0. 结论速览
 
-**本报告包含同一轮 Stage 1 的两次尝试**（第二次在环境检查器判据修正之后）。两次都在**环境门**被拦下，
+**本报告包含同一轮 Stage 1 的三次尝试**（第 2 次在环境检查器判据修正之后）。三次都在**环境门**被拦下，
 **均未加载模型、均未执行 Stage 1 的任何一次运行**。
 
 | 尝试 | 时间（UTC） | 关键读数（available commit） | 判决 |
 | --- | --- | --- | --- |
 | 第 1 次 | 15:12:35Z | **14.441 GiB**（< harness 16 GiB 线） | **`ENVIRONMENT_BLOCKED`** |
-| 第 2 次 | 15:37:31Z | **17.374 GiB**（≥ 16 GiB，但 < 本轮 18 GiB 入口门槛，差 0.63 GiB） | **`ENVIRONMENT_MARGIN_TOO_LOW`** |
+| 第 2 次 | 15:37:31Z | **17.374 GiB**（≥ 16，< 18，差 0.63 GiB） | **`ENVIRONMENT_MARGIN_TOO_LOW`** |
+| 第 3 次 | 16:07:42Z | **17.190 GiB**（≥ 16，< 18，差 **0.81 GiB**） | **`ENVIRONMENT_MARGIN_TOO_LOW`** |
 
 | 项 | 结果 |
 | --- | --- |
-| **本轮最终判决** | **`ENVIRONMENT_MARGIN_TOO_LOW`**（尚未进入任何生成；详见 §12） |
-| 是否加载模型 | **否**（工作树 clean、未设置 `SMOKE_ALLOW_UNQUALIFIED`、未降低任何安全线） |
+| **本轮最终判决** | **`ENVIRONMENT_MARGIN_TOO_LOW`**（尚未进入任何生成；详见 §12、§13） |
+| 是否加载模型 | **否**（工作树 clean、未设置 `SMOKE_ALLOW_UNQUALIFIED`、未降低任何安全线、未结束任何用户进程） |
 | 是否执行 Stage 1 | **否**（0/6 次运行） |
 | 是否执行 Stage 2 | **否**，且**不允许建议**执行（只有 `SERIAL_ORACLE_STAGE1_PASS` 才可建议） |
 | 关于 serial oracle 的结论 | **无**（真实模型上一条数值证据都没有） |
@@ -269,3 +270,52 @@ CSV 解析（含名字里带逗号）· 分类逻辑逐类（空列表 / 纯桌�
 | 第二次环境检查 JSON | `output/g5/attn/serial_oracle_env_check_20261003T153731Z.json` | ✅（第一次的 `..._20261003T151235Z.json` **保留**） |
 | 治理守卫 | `specdec/engine/verify_family_independence_cpu.py`（源级检查扩到 4 个新模块） | ✅ 仍 **PASS 29/0** |
 | Stage 1 的 6 次运行 | — | ❌ **仍不存在**（按阶梯停止） |
+
+---
+
+# 13. 第三次尝试（2026-10-03 16:07:42Z）
+
+## 13.1 开跑前核对（对照冻结设计）
+
+* 工作树：commit `1d5f73175fb26ce38ff79222173f2c49a58b172f`，`dirty=False` ⇒ **clean** ✅
+* 预登记锚点核对（与 `docs/serial_target_oracle_design_2026-10-03.md` 冻结口径一致，**运行前登记，未修改**）：
+  AR `6e7522bf2521ad7b` / 64 / `max_new_reached`；production `e90dad2b3fcf1c65` / 64 / `max_new_reached` / 首分歧 47。
+
+## 13.2 运行前检查读数
+
+产物：`output/g5/attn/serial_oracle_env_check_20261003T160742Z.json`
+
+| 项 | 实测 | 判定 |
+| --- | --- | --- |
+| available commit | **17.190 GiB**（limit 55.64 GiB，used 38.45 GiB） | ⚠️ ≥16 但 **<18**，margin **−0.81 GiB** |
+| harness `commit_guard`（16 GiB，**未改**） | **通过**：`commit 可用 17.2 GiB ≥ 安全线 16 GiB` | ✅ |
+| 本轮入口门槛（18 GiB，**未改**） | 不通过 | ❌ |
+| P-state | `qualified=True`，`sm_median=2445 MHz`，`mem_median=8000 MiB` | ✅ |
+| GPU | 8188 MiB 总 / **387 MiB 已用 / 7571 MiB 可用**，8%，57 °C | — |
+| GPU 进程残留 | total 19：**本项目 0** · 非本项目 python 0 · 权限不可见 1 · 桌面 18 | ✅ clean |
+| 点名进程（只记录） | `FeverGamesService=False` / `FeverGames=False` / `FeverGamesLauncher=False` | — |
+| 物理内存 | 31.64 GiB 总 / 9.31 GiB 可用 | — |
+| `SMOKE_ALLOW_UNQUALIFIED` | 未设置 | ✅ |
+
+**判决 = `ENVIRONMENT_MARGIN_TOO_LOW`**（阶梯命中 `16 ≤ free < 18` 分支）⇒ **停止**：
+不加载模型、不执行任何一次运行、**不自动重试**、不做额外检查、**不结束任何用户进程**、不动任何门槛。
+
+## 13.3 与"只读瞬时读数 18.54 GiB"的差异
+
+用户此前的只读读数约 **18.54 GiB**，本轮**运行前检查实测 17.190 GiB**。两点观察：
+
+1. 差值约 **1.35 GiB**，说明瞬时读数**不能**代替运行前检查（这一点已被本轮实测证实）；
+2. 本机 commit 使用量在本轮期间**持续上升**：38.26 GiB（15:37Z）→ **38.45 GiB**（16:07Z），
+   即"等待"本身不会让余量变大；必须**实际释放**约 0.8–1.5 GiB 才能稳定越过 18 GiB。
+
+## 13.4 结论与下一步
+
+* 三次尝试的读数：**14.441 → 17.374 → 17.190 GiB**（用户关掉百度网盘/网易云音乐后的确提升了 ≈2.7 GiB，
+  但随后被别的程序吃掉了一部分）。
+* 仍**未测量**：Stage 1 的 17 项硬检查、serial 与 AR 的 token equality（一条都没有）。
+* 越过 18 GiB（建议目标 ≥19 GiB）后，需要**新的一次指示**再执行运行前检查并按固定顺序跑 6 次；
+  本轮只允许检查一次，已用掉，不重试。
+* 当前提交量前列（供你决定关哪个）：
+  `node` 3.04 · `DSH Desktop` 2.71（本会话环境，别关）· `ChatGPT`×3 ≈ **2.49** · `Doubao` 0.66 ·
+  `msedge` 0.61 · `QQMusic` 0.60 · `msedgewebview2` 0.59 · `mysqld` 0.57 · `MsMpEng` 0.50 ·
+  `steamwebhelper` 0.48 GiB。**只关 ChatGPT 三个进程就足够**（≈2.49 GiB ⇒ free commit 约 19.7 GiB）。
