@@ -1,3 +1,10 @@
+> **SUPERSEDED HISTORICAL DRAFT — NOT A CURRENT EXECUTION REQUIREMENT.**
+> This prompt-family draft was designed for the old 12-condition plan. Current
+> formal scope is governed by
+> [`proposal_freeze_2026-10-01.md`](proposal_freeze_2026-10-01.md); consult
+> [`README.md`](../README.md) and [`status_update_2026-10-02.md`](status_update_2026-10-02.md)
+> before reusing any part of it.
+
 # Prompt families（≥16 个 nested-prefix 族）— **草案 v1，待定稿**
 
 > 状态：**DRAFT**。构建脚本与 manifest 已入库，规则可复现；**需你确认后才作为正式实验输入**。

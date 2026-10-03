@@ -1,6 +1,6 @@
 # SpecDec 阶段状态同步（2026-10-02）
 
-本记录汇总截至 `f6335f5` 的已有结果与后续分析，不包含新 GPU 实验。不修改 proposal、生产默认、正式验收门槛或旧 FAIL/CHECK。
+本记录的原始主体汇总截至 `f6335f5` 的已有 correctness/status 结果与后续分析，原始主体本身不包含新 GPU 实验。文末后来追加的独立附录记录已经完成的 2026-10-02 KV Optimization Final GPU Closeout；该附录不修改 proposal 范围、生产默认、正式验收门槛或历史 FAIL/CHECK。
 
 ## 当前研究范围与状态
 

@@ -1,7 +1,9 @@
 # Final KV Optimization Ablation
 
-> **Completed 2026-10-02.** This runbook is retained as the execution protocol.
-> Canonical outputs are the `_final` artifacts in
+> **Completed 2026-10-02.** This runbook is retained as the historical
+> standalone execution protocol. Its runner writes the unsuffixed default
+> output names listed below. The authoritative closeout copies are separate
+> `_final` artifacts under
 > [`results/kv_closeout_2026-10-02/`](../results/kv_closeout_2026-10-02/).
 
 This is the freeze-point evaluation for the KV-optimization subtask.
@@ -70,12 +72,25 @@ chmod +x scripts/run_kv_final_ablation.sh
 bash scripts/run_kv_final_ablation.sh
 ```
 
-## Outputs
+## Historical/default runner outputs
+
+- `kv_final_ablation_raw.csv`
+- `kv_final_ablation_summary.csv`
+- `kv_final_ablation_report.md`
+- `kv_final_ablation_manifest.json`
+
+The Markdown file is intended to be directly usable when writing the project
+report/result section.
+
+## Canonical final-closeout copies
+
+The completed closeout archived authoritative copies under
+`results/kv_closeout_2026-10-02/` with these names:
 
 - `kv_final_ablation_raw_final.csv`
 - `kv_final_ablation_summary_final.csv`
 - `kv_final_ablation_report_final.md`
 - `kv_final_ablation_manifest_final.json`
 
-The Markdown file is intended to be directly usable when writing the project
-report/result section.
+The `_final` suffix identifies the authoritative closeout artifacts; it is not
+the default naming behavior of the historical standalone runner.

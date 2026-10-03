@@ -1,3 +1,9 @@
+> **SUPERSEDED HISTORICAL PLAN — NOT THE CURRENT PROJECT SCOPE.**
+> The v6 optimization ladder, 18-cell matrix, and related commitments below are
+> historical planning content. Current formal scope is governed by
+> [`proposal_freeze_2026-10-01.md`](proposal_freeze_2026-10-01.md); also consult
+> [`README.md`](../README.md) and [`status_update_2026-10-02.md`](status_update_2026-10-02.md).
+
 # SpecDec 方案 v6（架构完善版）—— 唯一权威
 
 > 在 v5 基础上：修复 D1–D8、落实 M0–M6、**完善方案架构（§2–§7）并重排时间节点表（§9，内部一致）**。不再包含致导师信。

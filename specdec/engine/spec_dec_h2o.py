@@ -441,7 +441,8 @@ def spec_decode_greedy_h2o(
     - paged_v0 cache;
     - batch size 1;
     - H2O score capture is reference/materialized;
-    - target verify itself remains the existing materialized attention path.
+    - eligible BF16/V-FP8 q_len=1..4 verify calls may use direct paged CUDA;
+      prefill remains outside the direct paged path.
     """
     if prompt_ids.ndim != 2 or prompt_ids.shape[0] != 1:
         raise ValueError(

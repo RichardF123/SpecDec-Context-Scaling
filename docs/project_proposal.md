@@ -1,3 +1,10 @@
+> **SUPERSEDED HISTORICAL PROPOSAL DRAFT — NOT THE CURRENT FORMAL SCOPE.**
+> This draft preserves an earlier optimization ladder and deliverable plan.
+> Current formal scope is governed by the frozen **6 main + 2 supplement**
+> design in [`proposal_freeze_2026-10-01.md`](proposal_freeze_2026-10-01.md);
+> also consult [`README.md`](../README.md) and
+> [`status_update_2026-10-02.md`](status_update_2026-10-02.md).
+
 # SpecDec —— 课程项目方案（Proposal Draft）
 
 > 用途：课程 10/7 提案初稿 + 组内/协作者对齐。权威技术细节见 `docs/plan_v6.md`；数据见 `docs/data_ledger.md`。

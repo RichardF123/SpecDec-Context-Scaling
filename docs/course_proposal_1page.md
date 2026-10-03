@@ -1,3 +1,10 @@
+> **SUPERSEDED HISTORICAL PROPOSAL DRAFT.** This early one-page proposal and
+> its weight-quantization / FP8-factorial ladder are planning history, not the
+> current formal project scope. Current scope is governed by
+> [`proposal_freeze_2026-10-01.md`](proposal_freeze_2026-10-01.md); also consult
+> [`README.md`](../README.md) and
+> [`status_update_2026-10-02.md`](status_update_2026-10-02.md) for current status.
+
 # Course Project Proposal — DSAI 4207
 
 **Project title:** SpecDec: Where Does Speculative Decoding Stop Paying Off on an 8 GB GPU — and Does KV-Cache Quantization Extend It?

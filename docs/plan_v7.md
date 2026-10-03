@@ -1,3 +1,9 @@
+> **SUPERSEDED HISTORICAL PLAN — NOT THE CURRENT PROJECT SCOPE.**
+> This v7 plan and its 12-condition design are retained as planning history.
+> Current formal scope is the frozen **6 main + 2 supplement** design in
+> [`proposal_freeze_2026-10-01.md`](proposal_freeze_2026-10-01.md); also consult
+> [`README.md`](../README.md) and [`status_update_2026-10-02.md`](status_update_2026-10-02.md).
+
 # SpecDec v7 —— 收敛式重构（研究方案总设计师 + 严格课程审稿人版）
 
 > 原则：**让项目更容易回答一个清楚的研究问题，而不是让系统看起来更复杂。**

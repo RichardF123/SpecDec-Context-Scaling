@@ -6,7 +6,7 @@ Configurations
 --------------
 A  BF16 contiguous baseline
 B  + paged KV storage (reference/materialized attention path)
-C  + direct page-aware q_len=1 attention
+C  + direct page-aware attention for q_len=1..4 (prefill excluded)
 D  + V-FP8 target cache
 E  BF16 + H2O 50% resident-token budget
 F  V-FP8 + H2O 50% resident-token budget
@@ -401,7 +401,7 @@ def _write_markdown(
         "## Interpretation boundaries",
         "",
         "- A→B evaluates paged storage semantics/allocated payload, not a speed claim.",
-        "- Direct PagedAttention latency should be supported by the dedicated repeated v1d benchmark (`materialized_cuda` vs `direct_cuda`), not inferred from this table.",
+        "- Direct PagedAttention performance is documented by the final `paged_attention_final_bench.csv` / `paged_attention_final_bench_raw.csv`: large attention-call temporary-allocation reduction, but no latency speedup in the tested RTX 4060 configurations.",
         "- D isolates the established V-FP8 target cache on these inputs.",
         "- E/F use the practical 50% H2O operating point.",
         "- G is an aggressive 25% stress setting; output changes are expected and must be reported rather than treated as a correctness failure.",
@@ -721,7 +721,7 @@ def main() -> int:
         "configs": list(CONFIGS),
         "claim_boundaries": [
             "Do not infer H2O speedup from this experiment.",
-            "Use the dedicated repeated v1d paired benchmark for PagedAttention latency.",
+            "Use the final paged_attention_final_bench.csv and paged_attention_final_bench_raw.csv: they show a large attention-call temporary-allocation reduction but no latency speedup in the tested RTX 4060 configurations.",
             "Treat H2O 25% as an aggressive stress regime, not a lossless operating point.",
             "Use the separate v3a paired audit for V-FP8 × H2O interaction claims.",
         ],

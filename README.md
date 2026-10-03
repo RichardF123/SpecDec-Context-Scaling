@@ -4,7 +4,7 @@
 
 > 从零实现 Qwen2 系推理引擎 + KV-cache 解码 + 优化阶梯（KV 压缩 → 投机解码），
 > 在 8GB 笔记本 GPU 上做可复现测量。
-> 权威文档：`docs/plan_v7_1_protocol_freeze.md`（实验协议冻结 + Amendment v7.2）、`docs/data_ledger.md`（数据台账）、
+> 历史执行协议：`docs/plan_v7_1_protocol_freeze.md`（旧 12 条件协议，正式范围已由 2026-10-01 proposal freeze 取代）；`docs/data_ledger.md`（数据台账）、
 > `docs/design_freeze_fp8_kv.md`（FP8 KV 设计冻结 v1.3）、`docs/design_freeze_g4_specdec.md`（G4 协议 v0.3）、
 > `docs/plan_g4_next_steps.md`（G4 阶段状态）。
 
@@ -177,7 +177,7 @@ python -m specdec.engine.g4_b6_tie_diag                 # 分歧位置的 signal
 ## 文档
 
 - [合作者 PR #2 / #3 评审与隔离研究归档](docs/collaborator_pr_review_2026-10-02.md) — 保留 KV 压缩、two-pass attention 和性能归因成果；未整包合并旧引擎，不改变现有默认或正式验收。
-- `docs/plan_v7_1_protocol_freeze.md` — 实验协议冻结（v7.1 + §0 **Amendment v7.2**：Compute=BF16、KV 因子、12 conditions）
+- `docs/plan_v7_1_protocol_freeze.md` — 历史实验协议（v7.1 + Amendment v7.2，旧 12 conditions；当前正式范围以 `proposal_freeze_2026-10-01.md` 的 6+2 为准）
 - `docs/plan_v7.md` — v7 方案（方向、承诺、裁剪序）；`docs/plan_v6.md` — v6/v6.1 历史方案
 - `docs/data_ledger.md` — 实测数据台账（§3.4 G1、§3.5.x FP8 KV、§4.5.1 G2、§4.5.2 B3、§4.5.3 B4、§4.5.4 B5、§4.5.5 B6-bf16、§4.5.6 B6-fp32）
 - `docs/status_note_fp8_v4.md` — FP8 KV：根因、修复、正式判定、G4 前置清单
