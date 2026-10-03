@@ -40,7 +40,11 @@ OUTDIR = ROOT / "output" / "g5" / "attn"
 
 TAG = os.environ.get("RA2_TAG", "div8209_ra2")
 CASE = os.environ.get("RA2_CASE", "F13").strip()
-MODE = os.environ.get("RA2_MODE", "ar").strip().lower()          # ar | spec | aligned
+MODE_RAW = os.environ.get("RA2_MODE", "ar").strip().lower()
+# 协议别名（2026-10-03 冻结）：`prod` = production（原 `spec`）；`diag` = diagnostic oracle（原 `aligned`）。
+# 旧名保持不变 ⇒ 既有产物与命令逐字可用；本改动只是**新增别名与字段**，不改任何数值路径。
+ALIAS = {"prod": "spec", "diag": "aligned"}
+MODE = ALIAS.get(MODE_RAW, MODE_RAW)
 REP = int(os.environ.get("RA2_REP", "1"))
 MAXNEW = int(os.environ.get("RA2_MAXNEW", "64"))
 CTX = int(os.environ.get("RA2_CTX", "8192"))
@@ -71,12 +75,21 @@ def run_one() -> int:
     env = _smoke_env()
     os.environ.update(env)
     run_id = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
-    rec: dict = dict(tool="row_aligned_stage2", tag=TAG, run_id=run_id, case=CASE, mode=MODE, rep=REP,
+    rec: dict = dict(tool="row_aligned_stage2", tag=TAG, run_id=run_id, case=CASE, mode=MODE,
+                     mode_requested=MODE_RAW, rep=REP,
+                     diagnostic_only=bool(MODE == "aligned"),
                      smoke_env=env, stage="start",
                      timestamp_utc=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
                      git=S.git_meta(ROOT),
                      rules="既有 F13 记录规则：ctx=8192/chunk=2048/k=4/max_new=64/base_bf16/eager/"
-                           "target_rope=cpu_fp32/bf16_red_red=1/struct_check=1；接受公式与停止条件未改")
+                           "target_rope=cpu_fp32/bf16_red_red=1/struct_check=1；接受公式与停止条件未改",
+                     protocol="docs/correctness_protocol_post_shape_localization_2026-10-03.md")
+    # family provenance（manifest 已登记记录；input token 由 harness 的 family_input 重建并校验 sha1）
+    try:
+        from . import family_input as FI
+        rec["provenance"] = FI.family_record(CASE)
+    except Exception as e:                                                # noqa: BLE001
+        rec["provenance"] = dict(error=f"{type(e).__name__}: {str(e)[:200]}")
     if MODE == "aligned":
         rec["verify_wrap_install"] = spec_dec.set_verify_wrap(RA.row_aligned_verify)
         RA.clear_verify_log()
@@ -113,6 +126,12 @@ def run_one() -> int:
                 input=(smoke.get("input") or {}),
                 mem_timeline_last=(smoke.get("mem_timeline") or [{}])[-1],
                 n_rounds=len(smoke.get("rounds") or []),
+                rounds=list(smoke.get("rounds") or []),
+                pstate=smoke.get("pstate"),
+                gpu_consumers_before=smoke.get("gpu_consumers_before"),
+                resident_models=smoke.get("resident_models"),
+                weights_bitmatch=smoke.get("weights_bitmatch"),
+                kv_format=smoke.get("kv_format"),
                 attention_stats=(smoke.get("run") or {}).get("attention_stats"))
     except Exception as e:                                            # noqa: BLE001
         rec["stage"] = "crashed"
