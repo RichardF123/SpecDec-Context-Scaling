@@ -110,16 +110,42 @@ def _versions() -> dict:
                              if hasattr(torch.backends.cuda, "preferred_blas_library") else None))
 
 
-def _kernels(prof, top: int = 10) -> list:
+def _cuda_kernels(prof, top: int = 12) -> list:
+    """**真正的 CUDA kernel** 名称（从原始事件里过滤 `device_type == CUDA`）。
+
+    ⚠️ 首跑用 `key_averages()` 拿到的是 **ATen 层**名字（`aten::mm`/`aten::bmm`），
+    因为那些行的 `self_cuda_time_total` 是**含子项的总和** ⇒ 名字完全不是 kernel。
+    这里改用 `prof.events()` 只取 CUDA 事件，并按 kernel 名聚合调用次数与设备时间。
+    """
+    agg: dict = {}
+    for e in prof.events():
+        try:
+            if e.device_type != torch.autograd.DeviceType.CUDA:
+                continue
+        except Exception:                                                 # noqa: BLE001
+            continue
+        d = agg.setdefault(e.name, dict(kernel=str(e.name), count=0, cuda_us=0.0, shapes=set()))
+        d["count"] += 1
+        d["cuda_us"] += float(getattr(e, "device_time_total", 0.0) or 0.0)
+        sh = getattr(e, "input_shapes", None)
+        if sh:
+            d["shapes"].add(str(sh)[:100])
+    out = sorted(agg.values(), key=lambda x: (-x["cuda_us"], -x["count"]))[:top]
+    for d in out:
+        d["shapes"] = sorted(d["shapes"])[:3]
+        d["tensor_core_likely"] = bool(any(t in d["kernel"].lower() for t in TC_RE))
+    return out
+
+
+def _aten_ops(prof, top: int = 6) -> list:
+    """ATen 层算子（辅助信息；**不是** kernel 名）。"""
     out = []
     for e in prof.key_averages():
-        name = str(e.key)
-        ct = float(getattr(e, "self_device_time_total", 0.0) or 0.0)
-        if ct <= 0 and "gemm" not in name.lower():
+        ct = float(getattr(e, "self_cuda_time_total", 0.0) or 0.0)
+        if ct <= 0:
             continue
-        out.append(dict(kernel=name, count=int(e.count), cuda_us=ct,
-                        tensor_core_likely=bool(any(t in name.lower() for t in TC_RE))))
-    out.sort(key=lambda d: (-d["cuda_us"], -d["count"]))
+        out.append(dict(op=str(e.key), count=int(e.count), cuda_us_total=ct))
+    out.sort(key=lambda d: -d["cuda_us_total"])
     return out[:top]
 
 
@@ -128,16 +154,20 @@ def _profile_call(fn, reps: int) -> dict:
     torch.cuda.reset_peak_memory_stats()
     base = torch.cuda.memory_allocated()
     # ⚠️ torch 2.6：只给 CUDA activity 会退化成 legacy CUDA profiling 并报
-    #   "Legacy CUDA profiling requires use_cpu=True"（本工具首跑即此错）。必须**同时**开 CPU activity。
+    #   "Legacy CUDA profiling requires use_cpu=True"。必须**同时**开 CPU activity，并开 record_shapes。
     with torch.profiler.profile(activities=[torch.profiler.ProfilerActivity.CPU,
-                                            torch.profiler.ProfilerActivity.CUDA]) as prof:
+                                            torch.profiler.ProfilerActivity.CUDA],
+                                record_shapes=True) as prof:
         for _ in range(reps):
             out = fn()
     torch.cuda.synchronize()
     peak = torch.cuda.max_memory_allocated()
     del out
-    return dict(reps=int(reps), kernels=_kernels(prof), alloc_delta_mib=float((peak - base) / 2 ** 20),
-                note="`alloc_delta_mib` = 显存增量（workspace 的**代理**）；`tensor_core_likely` 由 kernel 名**推断**")
+    return dict(reps=int(reps), cuda_kernels=_cuda_kernels(prof), aten_ops=_aten_ops(prof),
+                alloc_delta_mib=float((peak - base) / 2 ** 20),
+                note="`cuda_kernels` = 真实 CUDA kernel（device 事件聚合）；`alloc_delta_mib` = 显存增量"
+                     "（workspace 的**代理**）；`tensor_core_likely` 由 kernel 名**推断**")
+
 
 
 # ------------------------------------------------------------------ 五类算子的最小矩阵
@@ -425,14 +455,19 @@ def main() -> int:
             except Exception:                                             # noqa: BLE001
                 pass
         rec["step3_knobs"] = kn
-        print("[gp] Step 1 kernel 对照（L0，profiler）：", flush=True)
+        print("[gp] Step 1 kernel 对照（L0，profiler；**真实 CUDA kernel 名**）：", flush=True)
         for name in ("QK", "o_proj", "gate_proj", "up_proj", "down_proj"):
             d = rec["step1_op_matrix_L0"][name]
             ck = (d.get("M4row0_vs_M1_sameN") or d.get("M4row0_vs_M1"))
-            ka = ((d.get("profile_all") or {}).get("kernels") or [{}])[0].get("kernel")
-            kr = ((d.get("profile_row") or {}).get("kernels") or [{}])[0].get("kernel")
-            print(f"   {name:<10} M4row0_vs_M1 n_diff={ck['n_diff']:>5d} max|Δ|={ck['max_abs']:<10.6g}"
-                  f" | M4 kernel={str(ka)[:58]} | M1 kernel={str(kr)[:58]}", flush=True)
+            ka = ((d.get("profile_all") or {}).get("cuda_kernels") or [{}])
+            kr = ((d.get("profile_row") or {}).get("cuda_kernels") or [{}])
+            fa = ka[0].get("kernel")
+            fr = kr[0].get("kernel")
+            same = bool(fa == fr)
+            print(f"   {name:<10} M4row0_vs_M1 n_diff={ck['n_diff']:>5d} max|Δ|={ck['max_abs']:<11.6g}"
+                  f" | M4 kernel={str(fa)[:52]} | M1 kernel={str(fr)[:52]} | 同名={same}", flush=True)
+            print(f"              M4 kernels={[(k['kernel'][:44], k['count']) for k in ka[:3]]}", flush=True)
+            print(f"              M1 kernels={[(k['kernel'][:44], k['count']) for k in kr[:3]]}", flush=True)
         c = rec["step2_controls_L0"]
         print(f"[gp] Step 2（L0）：QK 四行同内容 vs M1 n_diff="
               f"{c['QK']['all_rows_same_vs_M1']['n_diff']}；改其他行后第 0 行 vs 真实 M4 第 0 行="
