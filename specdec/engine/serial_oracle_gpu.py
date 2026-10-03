@@ -165,7 +165,8 @@ def run_one() -> int:
                 kv_format=smoke.get("kv_format"),
                 prefill_digest=smoke.get("prefill_digest"),
                 target_rope_scope=smoke.get("target_rope_scope"),
-                attention_stats=run.get("attention_stats"))
+                attention_stats=run.get("attention_stats"),
+                commit_guard=smoke.get("commit_guard"))
     except Exception as e:                                                # noqa: BLE001
         rec["stage"] = "crashed"
         rec["failure"] = f"{type(e).__name__}: {str(e)}"
@@ -173,70 +174,99 @@ def run_one() -> int:
         rc = 2
 
     # ---- 3) 运行后：审计汇总 + 串行 trace + 模式/包装恢复核查 ----
-    rec["verify_mode_after_run"] = spec_dec.target_verify_mode()
-    rec["verify_wrap_after_run"] = spec_dec.verify_wrap_state()
-    rec["serial_verify_dispatched"] = bool(rec["verify_mode_before_run"] == "serial")
-    tr_ = spec_dec.serial_trace()
-    rec["serial_trace"] = tr_
-    rec["serial_trace_summary"] = dict(
-        n_rounds_traced=len(tr_),
-        kp_per_round=[t.get("kp") for t in tr_],
-        pre_per_round=[t.get("pre") for t in tr_],
-        step_cache_lens_progression=[t.get("step_cache_lens") for t in tr_],
-        step_argmax=[t.get("step_argmax") for t in tr_],
-        note="serial 模式下每轮恰好一条（由 `_verify` 内部追加）；prod/ar 恒为空")
-    trun = SO.run_audit_summary(aud["state"])
-    rec["audit"] = trun
-    rec["audit_uninstall"] = aud.uninstall()
+    # ⚠️ 后处理**不得**丢失运行记录：首版这里写成 `aud.uninstall`（应为 `aud["uninstall"]`）⇒
+    #    AttributeError 直接抛出、连 JSON 都没写。现在整段包起来，异常也照常落盘并标出。
     try:
-        spec_dec.set_target_verify_mode("block")
-    except Exception:                                                     # noqa: BLE001
-        pass
-    stats = ((rec.get("smoke") or {}).get("specdec_stats") or {})
-    end_state = ((rec.get("smoke") or {}).get("end_state") or {})
-    rec["accounting"] = _accounting(MODE, stats, end_state, trun)
-
-    # ---- 4) 本进程的自检（**每一步都必须为真**，否则本次运行结论无效）----
-    n_inst = int(trun.get("n_instances") or 0)
-    sr = rec["serial_trace_summary"]
-    n_rounds = int(((rec.get("smoke") or {}).get("n_rounds") or 0))
-    checks = dict(
-        audit_sane=bool(trun.get("sane")),
-        audit_instances_as_expected=bool(n_inst == EXPECTED_INSTANCES[MODE]),
-        audit_target_identified=bool(trun.get("target_identified")),
-        audit_no_violations=bool(not trun.get("violations")),
-        audit_certifies_target_generation_m1=(None if MODE == "prod"
-                                              else bool(trun.get("certifies_m1"))),
-        accounting_matches=bool(rec["accounting"]["matches"]),
-        serial_trace_present_iff_serial=bool((len(tr_) > 0) == (MODE == "serial")),
-        serial_trace_one_entry_per_round=(None if MODE != "serial"
-                                          else bool(n_rounds > 0 and len(tr_) == n_rounds)),
-        no_row_aligned_wrap=bool(not rec["row_aligned_wrap_active"]),
-        mode_restored_to_block=bool(rec["verify_mode_after_run"] == "block"),
-        smoke_checks_passed=bool(((rec.get("smoke") or {}).get("checks_passed")) is True),
-        smoke_rc_zero=bool(rc == 0),
-    )
+        rec["verify_mode_after_run"] = spec_dec.target_verify_mode()
+        rec["verify_wrap_after_run"] = spec_dec.verify_wrap_state()
+        rec["serial_verify_dispatched"] = bool(rec["verify_mode_before_run"] == "serial")
+        tr_ = spec_dec.serial_trace()
+        rec["serial_trace"] = tr_
+        rec["serial_trace_summary"] = dict(
+            n_rounds_traced=len(tr_),
+            kp_per_round=[t.get("kp") for t in tr_],
+            pre_per_round=[t.get("pre") for t in tr_],
+            step_cache_lens_progression=[t.get("step_cache_lens") for t in tr_],
+            step_argmax=[t.get("step_argmax") for t in tr_],
+            note="serial 模式下每轮恰好一条（由 `_verify` 内部追加）；prod/ar 恒为空")
+        trun = SO.run_audit_summary(aud["state"])
+        rec["audit"] = trun
+        rec["audit_uninstall"] = aud["uninstall"]()
+        try:
+            spec_dec.set_target_verify_mode("block")
+        except Exception:                                                 # noqa: BLE001
+            pass
+        stats = ((rec.get("smoke") or {}).get("specdec_stats") or {})
+        end_state = ((rec.get("smoke") or {}).get("end_state") or {})
+        rec["accounting"] = _accounting(MODE, stats, end_state, trun)
+        cg = ((rec.get("smoke") or {}).get("commit_guard") or {})
+        rec["env_gate"] = cg
+        rec["env_qualified"] = bool(cg.get("ok", True))
+        ran = bool((rec.get("smoke") or {}).get("run") or (rec.get("smoke") or {}).get("gen"))
+        rec["model_run_happened"] = bool(ran)
+        # ---- 4) 本进程的自检（**每一步都必须为真**，否则本次运行结论无效）----
+        n_inst = int(trun.get("n_instances") or 0)
+        n_rounds = int(((rec.get("smoke") or {}).get("n_rounds") or 0))
+        checks = dict(
+            environment_qualified=bool(rec["env_qualified"]),
+            model_run_happened=bool(ran),
+            audit_sane=(True if ran else None),
+            audit_instances_as_expected=(bool(n_inst == EXPECTED_INSTANCES[MODE]) if ran else None),
+            audit_target_identified=(bool(trun.get("target_identified")) if ran else None),
+            audit_no_violations=(bool(not trun.get("violations")) if ran else None),
+            audit_certifies_target_generation_m1=(None if (MODE == "prod" or not ran)
+                                                  else bool(trun.get("certifies_m1"))),
+            accounting_matches=(bool((rec.get("accounting") or {}).get("matches")) if ran else None),
+            serial_trace_present_iff_serial=(bool((len(tr_) > 0) == (MODE == "serial")) if ran else None),
+            serial_trace_one_entry_per_round=((None if MODE != "serial"
+                                               else bool(n_rounds > 0 and len(tr_) == n_rounds))
+                                              if ran else None),
+            no_row_aligned_wrap=bool(not rec["row_aligned_wrap_active"]),
+            mode_restored_to_block=bool(rec["verify_mode_after_run"] == "block"),
+            smoke_checks_passed=(bool(((rec.get("smoke") or {}).get("checks_passed")) is True)
+                                 if ran else None),
+            smoke_rc_zero=bool(rc == 0),
+        )
+    except Exception as e:                                                # noqa: BLE001
+        checks = dict(post_processing_failed=False)
+        trun = {}
+        rec["post_processing_error"] = f"{type(e).__name__}: {str(e)}"
+        rec["post_processing_traceback"] = traceback.format_exc()
     rec["self_checks"] = checks
     rec["self_checks_all_ok"] = bool(all(v is not False for v in checks.values()))
-    rec["stage"] = ("complete" if (rc == 0 and rec["self_checks_all_ok"]) else
-                    ("complete_with_selfcheck_failures" if rc == 0 else "smoke_rc_nonzero"))
-    # ★ 生成 IDs 先落盘，再写摘要
+    if rc == 0 and rec["self_checks_all_ok"]:
+        rec["stage"] = "complete"
+    elif not rec.get("env_qualified", True):
+        rec["stage"] = "env_unqualified"
+        rec["blocked_by"] = "environment"
+    elif rc == 0:
+        rec["stage"] = "complete_with_selfcheck_failures"
+    elif not rec.get("model_run_happened", False):
+        rec["stage"] = "no_model_run"
+        rec["blocked_by"] = rec.get("blocked_by") or "unknown_no_run"
+    else:
+        rec["stage"] = "smoke_rc_nonzero"
+    # ★ 生成 IDs 先落盘，再写摘要（后处理失败时也照常写，字段缺失不影响记录存在）
+    acc = rec.get("accounting") or {}
     torch.save(dict(gen=(rec.get("smoke") or {}).get("gen"), case=CASE, mode=MODE, rep=REP,
                     meta=dict(run_id=run_id, smoke_artifact=rec.get("smoke_artifact"),
                               stop_reason=((rec.get("smoke") or {}).get("stop_reason")),
                               gen_len=((rec.get("smoke") or {}).get("gen_len")),
-                              target_generation_calls=rec["accounting"]["target_generation_calls_measured"],
-                              verify_mode=rec["verify_mode_before_run"])),
+                              target_generation_calls=acc.get("target_generation_calls_measured"),
+                              verify_mode=rec.get("verify_mode_before_run"),
+                              env_qualified=rec.get("env_qualified"),
+                              stage=rec.get("stage"))),
                str(fallback_pt))
     rec["artifact_pt"] = str(fallback_pt)
     p = OUTDIR / f"{TAG}_{CASE}_{MODE}_rep{REP}_{run_id}.json"
     rec["artifact_json"] = str(p)
     p.write_text(json.dumps(rec, ensure_ascii=False, indent=1, default=str), encoding="utf-8")
     g = (rec.get("smoke") or {}).get("gen") or []
-    print(f"[so] case={CASE} mode={MODE} rep={REP} rc={rc} gen_len={len(g)} "
+    print(f"[so] case={CASE} mode={MODE} rep={REP} rc={rc} stage={rec.get('stage')} "
+          f"env_qualified={rec.get('env_qualified')} gen_len={len(g)} "
           f"stop={(rec.get('smoke') or {}).get('stop_reason')} "
-          f"tgt_gen_calls={rec['accounting']['target_generation_calls_measured']}"
-          f"/{rec['accounting']['expected']} m1={trun.get('target_all_generation_m1')} "
+          f"tgt_gen_calls={acc.get('target_generation_calls_measured')}/{acc.get('expected')} "
+          f"m1={(rec.get('audit') or {}).get('target_all_generation_m1')} "
           f"selfchk={rec['self_checks_all_ok']} -> {p.name}", flush=True)
     return int(rc)
 
