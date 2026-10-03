@@ -3582,6 +3582,57 @@ mismatch 轮 `trim` 后把保留区间 `pre..pre+m-1` **逐个单步重放**（�
 其状态以其产物与 `docs/` 报告为准；手册**不**因"未重跑"而标注任何通过或失败。
 
 
+### 4.76 CUDA BF16 形状敏感性的机制确认与修复候选评估（Step 0–4）= **CHECK**（2026-10-03）
+
+报告 §9.61；全文 `docs/gemm_shape_sensitivity_mechanism_2026-10-03.md`。前置 §4.75（全层候选：CORRECT_BUT_NO_SPEED_VALUE）。
+**不是正式性能实验、不启动正式 factorial/B6**；不重新检查已排除的 cache/mask/accept/rollback/logit-index/RoPE。
+
+**冻结与复现（Step 0）**：torch **2.6.0+cu124** / CUDA 12.4 / cuDNN 90100 / **RTX 4060 Laptop sm_89（8 GiB）**；
+`allow_tf32=False`、`allow_bf16_red=True`、`deterministic=False`、`preferred_blas=Cublas`；只加载 target（338/338 位级一致）；
+`H(8208)`（`0440d98c533ae3ed`，纯切片 8237→8208）；位置 8209；all-eager。
+**复现通过**：单步 `M=1` → **323**（**323 与 659 的 logit 都是 23.75**，并列）；四行块 `M=4` → **659**（323=**23.625**、659=23.75）。
+
+**五算子最小复现 + profiler（Step 1）**：`M=4` 第 0 行 vs 独立 `M=1` ⇒ **QK `n_diff=3`（max|Δ|=4）**、
+`o_proj` 2（3.8e-6）、`gate_proj` 6（0.0039）、`up_proj` 11（0.0020）、`down_proj` 6（0.0020）；
+`M=1` 内部 view vs copy **0**。
+**profiler 结论（环境限制，CHECK 条件）**：本机 `torch.profiler` 在 CUDA activity 下 **`n_cuda_events = 0`**、
+chrome trace 只有 `cpu_op`、legacy API 设备时间为 0（`cupti64_2024.1.0.dll` 存在但活动静默失效）
+⇒ **拿不到 kernel 名/tile/split-K/workspace 的直接证据**。PyTorch 侧算子相同
+（`F.linear`→`aten::linear`；4 维 `torch.matmul`→`aten::bmm`）⇒ PyTorch 层**没有换算法**。
+
+**layout/content 控制（Step 2）**：同内容填满 `M=4` ⇒ **仍不同**（3/2/6/11/6）；只改其他三行 ⇒ 第 0 行 **0**；
+stride 变体 **0**；`M=1` view vs copy **0** ⇒ **是"形状本身"**。
+**旋钮（Step 3④）全部无效**：`allow_bf16_reduced_precision_reduction=False`、`preferred_blas_library=cublaslt/ck`、
+`use_deterministic_algorithms(True, warn_only=True)` ⇒ `gate` 仍 6、QK 仍 3（`prefer_blas` 状态仍显示 `Cublas`
+⇒ 该 setter **可能需重启进程**，未做跨进程验证）。
+
+**修复候选（Step 3）**：① 原始块 `M=4`：L0 **111**、token 659；② **五类算子逐行 `M=1`**：L0 **111→0**、token **323**，
+代价 decode **1.26×** / 固定 block verify **1.69×**（上一轮**非 profiler** 测量）；③ 全部 Linear（含 q/k/v）+QK 逐行：
+L0 也 323、**无额外收益**；④ 旋钮：不可用；⑤ `cudnn_prefill`：**在本路径未参与**（`fused_by_phase={}`，decode/verify 全 eager）、
+`sdpa` 本仓库不存在 ⇒ 不构成候选。
+
+**跨层（Step 4）**：L0 输入 `n_diff=0`/输出 111/边界 `['qk_matmul_scale']`；L1 111→1234、L14 1351→1383、L27 1327→1320
+（**边界 `[]`：输入已不同 ⇒ 判据结构上无法触发**）；该层最小 `M1vsM4`（QK/o/gate/up/down）：
+L0 **3/2/6/11/6**、L1 **6/2/5/9/6**、L14 **2/3/5/5/6**、L27 **12/1/6/6/14**
+⇒ **五类算子在四层上都表现同类形状非不变性**（受限版"全层同类机制"；只测四层与五类算子，不外推）。
+
+**验收**：**PASS-A 未满足**（缺 kernel 级直接证据）；**PASS-B 未满足**（同类持续边界在四层都在，代价已测量且不利）⇒ 综合 **CHECK**。
+**负结果（必须记录）**：严格 token equality 需全层五类算子逐行 `M=1`，而 SpecDec 在同配置下只有 AR 的 **0.22×** 吞吐
+⇒ 该修复**可能抵消（本就不存在的）性能收益**。
+**建议**：**不**在当前状态启动正式 factorial/B6；先解决执行效率前提。措辞只能是"**有限精度下形状相关的数值非不变性**"，
+**不**得写成 cuBLAS/PyTorch bug。**B6 未改变**。
+
+**产物**：`output/g5/attn/div8209_gemm_20261003T105817Z.{json,pt}`（Step 0–4，`stage=complete`）、
+`gemm_shape_summary_20261003T110456Z.{json,jsonl}`、`div8209_backend_20261003T110242Z.json`；
+**保留的失败 run**：`div8209_gemm_20261003T105300Z.json`（序列化，**未加载模型**）、`…T105334Z`（profiler 活动）、
+`…T105423Z`（探针全局槽）、`…T105706Z`（kernel 抽取/打印）、`div8209_backend_20261003T110204Z.json`（非法策略名）。
+**工具**：`gemm_shape_probe_f13_p8209.py`、`attention_backend_shape_probe.py`、`scripts/gemm_shape_summary_cpu.py`（只读，输出 JSON+JSONL）。
+**缺陷（全部为我的实现缺陷，均已修）**：① JSON 序列化 `_BlasBackend`（零 GPU 代价）；② torch 2.6 只给 CUDA activity；
+③ `OP.capture` 单探针全局槽；④ `key_averages` 取到 ATen 名；⑤ 设备过滤静默失败 + 打印占位；
+⑥ **环境事实**（CUPTI 失效，非我的缺陷）；⑦ `torch.load` 需 `weights_only=False`；⑧ 后端探针用了不存在的 `sdpa`。
+**GPU 进程共 8 次**（5 次我的缺陷 + 1 次环境限制 + 2 次后端探针）。
+
+
 ### 4.75 项目级候选：全层 **row-aligned verify** 候选模式（Stage 0–3）= **CORRECT_BUT_NO_SPEED_VALUE**（2026-10-03）
 
 报告 §9.60；全文 `docs/row_aligned_candidate_report_2026-10-03.md`。前置 §4.74（L0 全闭合）。

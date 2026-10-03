@@ -4016,6 +4016,86 @@ AR 历史下 6702=20.125、6652=20.0 ⇒ 6702（**历史差异把 6652 挪了 1 
 
 ---
 
+## 9.61 CUDA BF16 形状敏感性的**机制确认**与修复候选评估（Step 0–4，2026-10-03）——**CHECK**
+
+> 全文 `docs/gemm_shape_sensitivity_mechanism_2026-10-03.md`；台账 §4.76。前置 §9.60（全层候选：CORRECT_BUT_NO_SPEED_VALUE）。
+> **不是正式性能实验、不启动正式 factorial/B6**；不重新检查已排除的 cache/mask/accept/rollback/logit-index/RoPE。
+
+### 9.61.1 冻结与复现（Step 0）
+
+**torch 2.6.0+cu124 / CUDA 12.4 / cuDNN 90100 / RTX 4060 Laptop sm_89（8 GiB）**；
+`allow_tf32=False`、`allow_bf16_red=True`、`deterministic=False`、`preferred_blas=Cublas`；
+只加载 target（338/338 位级一致）；`H(8208)`（`0440d98c533ae3ed`，纯切片 8237→8208）；位置 8209；all-eager。
+**复现通过**：单步 `M=1` → **323**（323 与 659 的 logit **都是 23.75**，并列）；四行块 `M=4` → **659**
+（323=**23.625**、659=23.75）——与任务书事实逐项一致。
+
+### 9.61.2 五算子最小复现 + profiler（Step 1）
+
+`M=4` 的**第 0 行** vs 独立跑 `M=1`（真实捕获张量，重复 5 次）：
+**QK `n_diff=3`（max|Δ|=4）**、**`o_proj` 2**（3.8e-6）、**`gate_proj` 6**（0.0039）、**`up_proj` 11**（0.0020）、
+**`down_proj` 6**（0.0020）；`M=1` 内部 view vs contiguous copy **逐位一致（0）**。
+**profiler 结论（环境限制）**：本机 `torch.profiler` 在 CUDA activity 下 **`n_cuda_events = 0`**，
+`chrome trace` 只有 `cpu_op`、legacy API 设备时间为 0（`cupti64_2024.1.0.dll` 存在但活动静默失效）
+⇒ **拿不到 kernel 名 / tile / split-K / workspace 的直接证据**（任务的 **CHECK** 条件）。
+PyTorch 侧算子相同（`F.linear`→`aten::linear`；4 维 `torch.matmul`→`aten::bmm`），
+**PyTorch 层没有"换算法"** ⇒ 差异只能来自库内按形状选择的 kernel/tile/归约。
+
+### 9.61.3 layout / content 控制（Step 2）与旋钮（Step 3④）
+
+* **同一段数据填满 `M=4`**（第 0 行复制 4 次，内容与 `M=1` 相同）⇒ **仍然不同**（3/2/6/11/6）⇒ **不是内容**；
+* **只改其他三行内容**（第 0 行不动）⇒ 第 0 行 vs 真实 `M=4` 第 0 行 = **0** ⇒ 无串扰；
+* **stride 变体**（同一数据放非连续视图）⇒ **0**；`M=1` 的 view vs contiguous copy ⇒ **0** ⇒ **不是布局**；
+* **旋钮全部无效**：`allow_bf16_reduced_precision_reduction=False`、`preferred_blas_library=cublaslt/ck`、
+  `use_deterministic_algorithms(True, warn_only=True)` ⇒ `gate_proj` 仍 6、QK 仍 3
+  （且状态快照显示 `prefer_blas` 仍为 `Cublas` ⇒ 该 setter **可能需重启进程**，未做跨进程验证，如实标注）。
+⇒ **是"形状本身"**：`M` 决定库内执行/归约路径。
+
+### 9.61.4 修复候选对照（Step 3）
+
+| 候选 | L0 闭合 | token | 代价（**非 profiler**） | 结论 |
+| --- | --- | --- | --- | --- |
+| ① 原始块 `M=4` | ✗（111） | 659 | 1.0× | 与 AR 不一致 |
+| ② 五类形状敏感算子逐行 `M=1` | **✓（111→0）** | **323** | decode **1.26×**、固定 block verify **1.69×**（上一轮） | **能修，但代价明确** |
+| ③ 全部 Linear（含 q/k/v）+ QK 逐行 | ✓ | 323 | ≥ ②（未单独计时） | 在 L0 **无额外收益** |
+| ④ 精度/确定性旋钮 | ✗（不变） | 659 | ~0 | **不可用** |
+| ⑤ 其它已有 attention 后端 | 不适用 | 659 | — | `cudnn_prefill` **在本路径未参与**（`fused_by_phase={}`，decode/verify 全 eager）；`sdpa` 本仓库不存在 ⇒ 不构成候选 |
+
+### 9.61.5 跨层（Step 4）
+
+| 层 | 输入 `n_diff`(B0vsBALL) | 输出 `n_diff` | 首个持续边界 | 该层最小 `M1vsM4`（QK/o/gate/up/down） |
+| --- | --- | --- | --- | --- |
+| L0 | **0** | 111 | `['qk_matmul_scale']` | 3 / 2 / 6 / 11 / 6 |
+| L1 | 111 | 1234 | `[]`（输入已不同 ⇒ 判据无法触发） | 6 / 2 / 5 / 9 / 6 |
+| L14 | 1351 | 1383 | `[]` | 2 / 3 / 5 / 5 / 6 |
+| L27 | 1327 | 1320 | `[]` | 12 / 1 / 6 / 6 / 14 |
+
+⇒ **五类算子在四层上都表现同类形状非不变性** ⇒ **受限版"全层同类机制"**（只测这四层、只测这五类算子、不外推）；
+L1/L14/L27 的"首个持续边界"**结构上无法归因**（输入已不同），如实记录、**不用"传递"掩盖**。
+
+### 9.61.6 验收与建议
+
+* **PASS-A（机制确认）未满足**：没有 kernel/算法级直接证据（环境限制）；
+  受控实验 + 代码事实 + 干预 + 近并列 token 翻转构成**一致**证据链，但按验收只能记 **CHECK**。
+* **PASS-B（候选修复）未满足**：F13/F06 token equality 与 L0 逐位闭合成立，但"L0/L1/L14/L27 不再出现同类
+  持续边界"**不成立**（四层都有），且代价已测量（1.26×/1.69×）并与"。**CHECK**。
+* **负结果（必须记录）**：严格的 token equality 需要**全层、五类算子逐行 M=1 执行**，
+  而 SpecDec 在同配置下只有 AR 的 **0.22×** 吞吐 ⇒ 该修复**可能抵消（本就不存在的）性能收益**。
+* **建议**：**不**在当前状态启动正式 factorial/B6；先解决执行效率前提；措辞只能用
+  "**有限精度下形状相关的数值非不变性**"，**不**得写成 cuBLAS/PyTorch bug。**B6 状态未改变**。
+
+### 9.61.7 产物与缺陷
+
+产物：`div8209_gemm_20261003T105817Z.{json,pt}`（Step 0–4，`stage=complete`）、
+`gemm_shape_summary_20261003T110456Z.{json,jsonl}`、`div8209_backend_20261003T110242Z.json`；
+**保留的失败 run** 5 个（序列化、profiler 活动、探针槽、kernel 抽取、非法策略名）。
+**缺陷（全部为我的实现缺陷，均已修）**：① JSON 序列化 `_BlasBackend`（**未加载模型**，零 GPU 代价）；
+② torch 2.6 只给 CUDA activity；③ `OP.capture` 单探针全局槽导致 Step 4 KeyError；
+④ `key_averages` 取到 ATen 名；⑤ 设备过滤静默失败 + 打印占位；⑥ **环境事实**：CUPTI 活动失效（非我的缺陷）；
+⑦ `torch.load` 需 `weights_only=False`；⑧ 后端探针用了不存在的策略名 `sdpa`。
+**GPU 进程共 8 次**（5 次我的缺陷 + 1 次环境限制 + 2 次后端探针）。
+
+---
+
 ## 9.60 项目级候选：全层 **row-aligned verify** 候选模式（Stage 0–3，2026-10-03）
 
 > 全文 `docs/row_aligned_candidate_report_2026-10-03.md`；台账 §4.75。前置 §9.59（L0 全闭合）。
