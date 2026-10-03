@@ -177,6 +177,12 @@ def _row(rec: dict) -> dict:
                 self_checks_all_ok=rec.get("self_checks_all_ok"),
                 verify_mode=rec.get("verify_mode_before_run"),
                 verify_mode_after=rec.get("verify_mode_after_run"),
+                # ⚠️ 缺陷 D9：`_row` 首版**没有**暴露这两个原始字段名，而 `_serial_hard_checks2`
+                #    读的是 `verify_mode_at_run_end` / `verify_mode_after_run` ⇒ 恒为 None
+                #    ⇒ D6 硬检查被**误判为失败**（假阴性）。这里按原始字段名如实暴露。
+                verify_mode_after_run=rec.get("verify_mode_after_run"),
+                verify_mode_at_run_end=rec.get("verify_mode_at_run_end"),
+                verify_wrap_after_run=rec.get("verify_wrap_after_run"),
                 row_aligned_wrap_active=rec.get("row_aligned_wrap_active"),
                 serial_trace_len=len(rec.get("serial_trace") or []),
                 wall_s=sm.get("wall_s"),
@@ -797,12 +803,14 @@ def _prior_context(family: str) -> dict:
 def _serial_hard_checks2(r: dict, *, require_d6: bool) -> dict:
     """Stage 2 的 serial 硬检查 = 既有 16 项 + **第 18 项 D6 复位证据**（本轮新跑的 family 必需）。"""
     out = _serial_hard_checks(r)
-    post_fix = r.get("verify_mode_at_run_end") is not None
-    after = r.get("verify_mode_after_run")
+    # ⚠️ 字段名必须与 `_row` 暴露的一致（缺陷 D9 就是这里读错了名字 ⇒ 假阴性）
+    at_end = r.get("verify_mode_at_run_end")
+    after = r.get("verify_mode_after_run", r.get("verify_mode_after"))
+    post_fix = at_end is not None
     if require_d6:
         out["18_d6_mode_restored_after_cleanup"] = dict(
             ok=bool(post_fix and after == "block"),
-            detail=f"清理后实际读取 target_verify_mode()={after}（运行结束时={r.get('verify_mode_at_run_end')}）；"
+            detail=f"清理后实际读取 target_verify_mode()={after}（运行结束时={at_end}）；"
                    f"该记录产生于 D6 修正之后={post_fix}")
     else:
         out["18_d6_mode_restored_after_cleanup"] = dict(
