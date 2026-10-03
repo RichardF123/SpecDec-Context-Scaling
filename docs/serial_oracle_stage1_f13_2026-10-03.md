@@ -6,10 +6,17 @@
 
 ## 0. 结论速览
 
+**本报告包含同一轮 Stage 1 的两次尝试**（第二次在环境检查器判据修正之后）。两次都在**环境门**被拦下，
+**均未加载模型、均未执行 Stage 1 的任何一次运行**。
+
+| 尝试 | 时间（UTC） | 关键读数（available commit） | 判决 |
+| --- | --- | --- | --- |
+| 第 1 次 | 15:12:35Z | **14.441 GiB**（< harness 16 GiB 线） | **`ENVIRONMENT_BLOCKED`** |
+| 第 2 次 | 15:37:31Z | **17.374 GiB**（≥ 16 GiB，但 < 本轮 18 GiB 入口门槛，差 0.63 GiB） | **`ENVIRONMENT_MARGIN_TOO_LOW`** |
+
 | 项 | 结果 |
 | --- | --- |
-| **本轮判决** | **`ENVIRONMENT_BLOCKED`** |
-| 原因 | 开跑前环境门实测 available commit = **14.441 GiB**，低于 harness 安全线 16 GiB（更低于本轮 18 GiB 入口门槛） |
+| **本轮最终判决** | **`ENVIRONMENT_MARGIN_TOO_LOW`**（尚未进入任何生成；详见 §12） |
 | 是否加载模型 | **否**（工作树 clean、未设置 `SMOKE_ALLOW_UNQUALIFIED`、未降低任何安全线） |
 | 是否执行 Stage 1 | **否**（0/6 次运行） |
 | 是否执行 Stage 2 | **否**，且**不允许建议**执行（只有 `SERIAL_ORACLE_STAGE1_PASS` 才可建议） |
@@ -192,3 +199,73 @@ target-only AR 完全相同的 token IDs"）**本轮没有得到任何真实模�
 * 在拿到 `SERIAL_ORACLE_STAGE1_PASS` 之前，**不得**建议或执行 F01/F02/F08/F10 Stage 2，
   更不得启动 B6 / pilot / factorial。
 * 本轮**未**修改 serial oracle 算法、未修改任何阈值、未覆盖任何历史产物。
+
+---
+
+# 12. 第二次尝试（环境检查器判据修正之后，2026-10-03 15:37:31Z）
+
+## 12.1 先修 `gpu_residue.clean` 判据（本轮任务明确要求）
+
+**旧判据**：`clean = (GPU 进程数 == 0)` ⇒ 在本机**永远为 false**（正常桌面就有约 19–22 个持有 GPU 上下文的
+程序；历史成功的 24 轮协议与 F13 基线运行时同样如此）⇒ 该判据实际失效。
+
+**新判据**：`clean = 不存在**本项目**（`RealDSH\specdec` / `.venv`）的 GPU 进程残留`，同时：
+* **如实记录全部** GPU 进程（分成"本项目残留 / 非本项目 python / 权限不可见 / 桌面其它"四类）；
+* 记录**可用显存**（本轮 7544 MiB，**只记录、不作门槛** —— 不新增未经登记的门槛）；
+* 点名进程（`FeverGamesService` 等）**只记录不干预**，**不为通过检查而结束任何用户进程**；
+* **未改动**：16 GiB harness 安全线、18 GiB 入口门槛、判定顺序；
+* **旧的环境检查产物保留不删**（新运行写新时间戳文件，从不覆盖）。
+
+**针对性自测**：`serial_oracle_env_check_selftest_cpu.py` ⇒ **PASS 24/0**
+（产物 `output/g5/attn/serial_oracle_env_check_selftest_20261003T153642Z.json`），覆盖：
+CSV 解析（含名字里带逗号）· 分类逻辑逐类（空列表 / 纯桌面 / 本项目 venv python / 本项目非 python exe /
+非本项目 python / 权限不可见 / 混合）· **用旧产物里那 21 行真实进程做旧判据 vs 新判据对照** ·
+判定阶梯逐分支（<16 / 16–18 / =18 / 19.22 / 残留 / P-state / harness 门 / 树不 clean）·
+**常量与预登记锚点未被改动**（16.0 / 18.0 / `6e7522bf2521ad7b` / `e90dad2b3fcf1c65` / index 47 / len 64）。
+
+## 12.2 第二次（也是本轮唯一一次）运行前检查的读数
+
+产物：`output/g5/attn/serial_oracle_env_check_20261003T153731Z.json`
+
+| 项 | 实测 | 判定 |
+| --- | --- | --- |
+| 工作树 | commit `82089ffeac492658ac6fe87be8bee330ed7f1756`，`dirty=False` | ✅ clean |
+| available commit | **17.374 GiB**（limit 55.64 GiB，used 38.26 GiB） | ⚠️ ≥16 但 **<18**，margin **−0.63 GiB** |
+| harness `commit_guard`（16 GiB 线，**未改**） | **通过**：`commit 可用 17.4 GiB ≥ 安全线 16 GiB` | ✅ |
+| 本轮入口门槛（18 GiB） | 不通过 | ❌ |
+| P-state | `qualified=True`，`sm_median=2460 MHz`，`mem_median=8000 MiB` | ✅ |
+| GPU | RTX 4060 Laptop，driver 555.97，8188 MiB 总 / **414 MiB 已用 / 7544 MiB 可用**，0% 利用率，59 °C | — |
+| GPU 进程 | total **19**：本项目残留 **0** · 非本项目 python **0** · 权限不可见 **1** · 桌面其它 **18** | ✅ clean |
+| 点名进程（只记录） | `FeverGamesService=False`、`FeverGames=False`、`FeverGamesLauncher=False`（**未运行**；即便在跑也只记录、不结束） | — |
+| 物理内存 | 31.64 GiB 总 / 9.10 GiB 可用 | — |
+| `SMOKE_ALLOW_UNQUALIFIED` | 未设置 | ✅ |
+| 版本 | torch 2.6.0+cu124 · CUDA 12.4 · cuDNN 90100 · transformers 5.16.1 | — |
+| 预登记锚点 | AR `6e7522bf2521ad7b` / prod `e90dad2b3fcf1c65` / 首分歧 47（**运行前登记，未修改**） | — |
+
+**判决 = `ENVIRONMENT_MARGIN_TOO_LOW`**（阶梯命中 `16 ≤ free < 18` 分支）。
+
+## 12.3 处置（严格按任务书）
+
+* **停止**：不加载模型、不执行 Stage 1 的任何一次运行、**不自动重试**、不做第二次运行前检查。
+* 值得注意：harness 自己的 16 GiB 门本轮**已经通过**（17.4 ≥ 16）——也就是说若直接启动 harness 它会开跑；
+  但**本轮的入口门槛是 18 GiB**，17.374 < 18 ⇒ 仍然**不执行**。门槛不因"差得不多"而下调。
+* 未产生新的运行记录，因此 §5/§6 的"未测量"结论**不变**：Stage 1 的 17 项硬检查、serial 与 AR 的
+  token equality 仍然**一条都没有测**。
+* 用户报告的 19.22 GiB 是**上一次的瞬时读数**；本轮实测 17.374 GiB。这正说明"运行前必须重新测量"是必要的。
+
+## 12.4 距离可执行还差多少
+
+* 需要再腾出 **0.63 GiB** 才能越过 18 GiB 入口门槛（建议留出余量：目标 ≥19 GiB 更稳）。
+* 参考：当前 commit used 38.26 GiB；关掉一个约 0.6–1.4 GiB 的程序（例如 `BaiduNetdiskUnite` 1.44 GiB、
+  或 `QQMusic` 0.60 GiB + `mysqld` 0.57 GiB）即可越过。
+* 越过之后需要**你给出新一轮的指示**再执行一次运行前检查（本轮只允许一次，且不自动重试）。
+
+## 12.5 本次尝试新增/更新的产物
+
+| 类型 | 路径 | 状态 |
+| --- | --- | --- |
+| 修正后的环境检查器 | `specdec/engine/serial_oracle_env_check.py` | ✅ 提交 `82089ff` |
+| 判据针对性自测（24/0） | `specdec/engine/serial_oracle_env_check_selftest_cpu.py` + `output/g5/attn/serial_oracle_env_check_selftest_20261003T153642Z.json` | ✅ |
+| 第二次环境检查 JSON | `output/g5/attn/serial_oracle_env_check_20261003T153731Z.json` | ✅（第一次的 `..._20261003T151235Z.json` **保留**） |
+| 治理守卫 | `specdec/engine/verify_family_independence_cpu.py`（源级检查扩到 4 个新模块） | ✅ 仍 **PASS 29/0** |
+| Stage 1 的 6 次运行 | — | ❌ **仍不存在**（按阶梯停止） |
