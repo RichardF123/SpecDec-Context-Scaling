@@ -1,6 +1,6 @@
 # SpecDec — 从零实现的小型 LLM 推理引擎（课程项目）
 
-> **当前 proposal 定稿（2026-10-01）**：[版本与范围记录](docs/proposal_freeze_2026-10-01.md)。主实验 6 条件 + 8K V-only FP8 补充 2 条件；保留已有 FP8 成果。以下旧日期的 12 条件描述是历史计划，不代表当前提交范围。定稿不等于正确性通过，执行协议与工具仍需配套同步。
+> **2026-10-04 状态**：五页[课程 proposal 提交版](docs/pdf/specdec_course_proposal_2026-10-04_final.pdf)已生成，**尚未确认已提交**。主实验 6 个 BF16 条件 + 8K V-only FP8 补充 2 条件；旧文档中的 12 条件是历史计划。[给协作者的阶段报告](docs/collaborator_status_2026-10-04.md)（[PDF](docs/pdf/collaborator_status_2026-10-04.pdf)）汇总了数字、证据边界与下一步。
 
 > 从零实现 Qwen2 系推理引擎 + KV-cache 解码 + 优化阶梯（KV 压缩 → 投机解码），
 > 在 8GB 笔记本 GPU 上做可复现测量。
@@ -8,23 +8,22 @@
 > `docs/design_freeze_fp8_kv.md`（FP8 KV 设计冻结 v1.3）、`docs/design_freeze_g4_specdec.md`（G4 协议 v0.3）、
 > `docs/plan_g4_next_steps.md`（G4 阶段状态）。
 
-## 当前状态（2026-10-02 更新）
+## 当前状态（2026-10-04 更新）
 
-**引擎、V-only FP8 KV、greedy SpecDec 和测量工具已有实现；当前阻塞项是生产 BF16 路径的 AR/Spec 严格生成一致性。正式实验尚未开始，不声明 SpecDec 已加速。**
+**引擎、V-only FP8 KV、greedy SpecDec 与测量工具已有实现；五个 BF16 family 的 serial target oracle 与 AR 逐 token 一致，但 production batched verification 仍可能分歧。分层正确性协议尚待小组批准，正式 pilot/benchmark 未通过入口门槛，不声明 SpecDec 已加速。**
 
-当前提交范围为 **6 个主条件（2K/4K/8K × AR/Spec，base BF16）+ 2 个补充条件（8K V-only FP8 × AR/Spec）**，不是历史 12 条件矩阵。定稿范围不等于执行协议、后端和正确性已全部验收。
+当前提案范围为 **6 个主条件（2K/4K/8K × AR/Spec，base BF16）+ 2 个补充条件（8K V-only FP8 × AR/Spec）**，不是历史 12 条件矩阵。提案定稿不等于执行协议、后端和正确性已全部验收。
 
 | 最新进展 | 已验证结果 | 结论边界 |
 |---|---|---|
-| RoPE 来源定位与 C1 对齐 | 诊断中统一 target 的 CPU FP32 inv_freq 来源后，所测 8K prefill 的 56/56 KV 张量和末位置 logits 与 HF 逐位一致 | 局部参考对齐完成；不是全流程正确性通过，也未改变生产默认 |
-| 真实 F13 AR/Spec 复现 | all-eager、BF16、8K、k=4、64 tokens；仅索引 47 不同：AR=6702，Spec=6652；本轮捕获复现上一轮序列 | 在没有 cuDNN 的配置下仍出现分歧；不能直接归咎于 cuDNN |
-| 同前缀四格定位 | AR 历史下 single/block 都选 6702；Spec 历史下两者都选 6652；真实路径重放逐元素吻合，格内重复一致 | 缓存历史影响本位置选择；当前形状仍改变 logits，但未改变这四格中的选择 |
-| 缓存与决策检查 | prefill 段逐位相同；生成缓存最早在位置 8192 出现差异；本决策点的行映射、替换规则和尾部泄漏检查未发现问题 | 最早产生差异的具体算子、其他家族及全流程严格一致性尚未确认 |
-| 已有 FP8 成果 | V-only 独立 40 窗 relative ΔPPL +0.040%；target 8K 逻辑 KV 约 1.32× 压缩 | 保留为补充研究；不等于整机显存同比下降或解码加速 |
+| Serial oracle（BF16） | F13/F01/F02/F08/F10 各 64 token 与 target-only AR 完整一致，独立重复；生成期 target `s=1`、零次 block verify | 只支持这五个输入上的控制逻辑；serial 耗时不进性能结果，V-only FP8 尚无同口径 Gate A |
+| Production BF16 | 上述 family 仍有可重复的首 token 分歧位置：F13@47、F01@14、F02@7、F08@52、F10@8 | 不等于控制逻辑错误，也不等于“无害”；历史 B6-bf16 CHECK 19/20 保留 |
+| 局部机制实验 | 同一历史样本上，attention QK 与四个 projection 受 `M=1`/`M=4` 执行形状影响 | 未获得 kernel 级证据；不能外推为所有 production 分歧的唯一原因 |
+| V-only FP8 | 独立 40 窗 `Delta NLL +0.000397`、relative `Delta PPL +0.040%`；8K target 逻辑 KV 约 `1.32x` | K 仍 BF16；不是整机峰值或性能同比收益；质量数不自动迁移到新 backend |
 
-**下一步（尚未执行）**：做一次默认关闭的串行历史重建诊断，覆盖全接受轮和拒绝轮；从轮前缓存重放已提交 token，并同步刷新 saved_next。优先检查同前缀历史是否逐位一致、原位置 8239 的选择是否恢复，再观察完整生成。该实验用于验证因果，不是免费性能优化，也不保证其他位置不会产生新的形状敏感分歧。正式矩阵仍等待严格正确性及测量准备验收，不放宽门槛。
+**下一步**：先决定[分层正确性协议 v2 草案](docs/specdec_correctness_protocol_v2_2026-10-04.md)的执行路径与 production 分歧解释口径；再对预登记新 family 和 V-only FP8 分别补 Gate A/B 证据，之后做四-family pilot。不得把 serial oracle 的 PASS 写成 production exact-id PASS，也不得在协议尚待批准时启动正式 16-family 速度矩阵。
 
-详见：[本次状态与结论边界](docs/status_update_2026-10-02.md)、[RoPE 对齐](docs/c1_rope_source_alignment_2026-10-01.md)、[真实生成对照](docs/ar_spec_aligned_rope_2026-10-01.md)、[第 47 位四格定位](docs/divasc_index47_localization_2026-10-01.md)。定位报告的原下一步建议需按本次状态说明修正，尚未据此执行新实验。
+详见：[完整阶段报告](docs/collaborator_status_2026-10-04.md)、[serial oracle 实测](docs/serial_oracle_stage2_2026-10-03.md)、[协议待决事项](docs/specdec_correctness_protocol_v2_2026-10-04.md)。下方旧状态快照作为历史保留，其当时的“下一步”不再是当前任务。
 
 ## 历史状态快照（2026-09-27）
 
@@ -85,7 +84,7 @@
 **在做什么**：从零手写 Qwen2 架构推理引擎（RMSNorm / RoPE / GQA attention /
 SwiGLU / KV-cache 解码 / 贪心生成），目前沿 **KV-cache → V-only FP8 KV
 压缩 → 投机解码** 进行实现与验证，用可复现测量表回答研究问题：
-> 投机解码在 8GB 小卡上随上下文变长到哪里失效？KV 量化能否延长它的获利区间？
+> 固定模型对、精度和配置时，上下文长度如何影响 8GB 小卡上 greedy 投机解码相对 AR 的解码速度？V-only FP8 只作为 8K 补充消融。
 
 **意义**：课程要求"原创 + hands-on LLM system"——我们交付自写引擎 + 质量×成本
 测量表（decode tokens/s / 显存 / 接受率 / ppl），而不是跑教程报一个数字；结果
