@@ -412,6 +412,45 @@ def _serial_mlp_section() -> None:
           "⇒ 可进入 GPU 运行")
 
 
+def _row_aligned_section() -> None:
+    """全层 row-aligned verify 候选模式（Stage 1 工具）的飞行前检查（纯 CPU、只读）。"""
+    from specdec.engine import row_aligned_stage1_f13_p8209 as QT
+    from specdec.engine import row_aligned as RA
+    from specdec.engine import model_self as M
+    from specdec.engine import spec_dec
+    print("\n================ 全层 row-aligned verify 候选（Stage 1）================")
+    plan = [list(p) for p in QT.PLAN]
+    print(f"  配置：LAYER={QT.LAYER} PRE={QT.PRE} VIS={QT.VIS} REPEAT={QT.REPEAT} "
+          f"ROPE={QT.TARGET_ROPE}；四臂={plan}")
+    assert [p[0] for p in plan] == ["S0", "B0", "BALL", "SALL"], "四臂定义不符"
+    assert [(p[1], p[2]) for p in plan] == [("decode", False), ("verify", False),
+                                            ("verify", True), ("decode", True)], "臂的相位/开关不符"
+    assert QT.REPEAT >= 2 and QT.LAYER == 0
+    assert M.serial_qk_state()["active"] is False and M.serial_linear_state()["active"] is False
+    assert spec_dec.verify_wrap_state()["active"] is False, "进入实验前 verify 包装必须未安装"
+    for fn in ("all_qk_modules", "all_linear_modules", "expected_counts", "coverage_check",
+               "row_aligned_verify", "verify_log", "clear_verify_log"):
+        assert hasattr(RA, fn), f"row_aligned 缺少 {fn}"
+    src = (ROOT / "specdec" / "engine" / "row_aligned.py").read_text(encoding="utf-8")
+    for pat in ("int(n)", "int(4 * n)", "int(5 * n)"):
+        assert pat in src, f"row_aligned 的预期数量公式缺少 {pat}"
+    prev = torch.load(QT.PREV_PT, map_location="cpu")
+    pj = json.loads(Path(QT.PREV_JSON).read_text(encoding="utf-8"))
+    assert "rows_BQOGUD" in prev and pj["H4"]["class_"] == "L0_restored"
+    print(f"  上一轮 L0 闭环参考：L0 输出逐位恢复={pj['H4']['class_']}、"
+          f"H5 后续第一处分歧层=L{pj['H5']['first_layer_with_equal_input_and_different_output']} ✔")
+    l0ops = torch.load(QT.L0OPS_PT, map_location="cpu")
+    for k in ("final_row_S", "final_row_B", "L0_output_row_S", "x0_row_S"):
+        assert k in l0ops, f"历史 L0 算子 run 缺少 {k}"
+    cap = C._load_cap(Path(QT.CAP_H))
+    H, t = C._truncate(cap["snapshot_cpu"], QT.PRE, "H")
+    assert t["is_pure_slice"] and C._cache_len(H) == QT.PRE and len(H) == 28
+    print(f"  H：{Path(QT.CAP_H).name} {t['source_len']} → {t['pre']} 纯切片={t['is_pure_slice']}"
+          f"（{len(H)} 层 ⇒ 预期 QK=28、Linear=112）✔")
+    print("  [ra1-preflight] 四臂定义/默认关闭/verify 包装未安装/API/数量公式/上一轮参考/历史行/H "
+          "全部符合预期 ⇒ 可进入 GPU 运行")
+
+
 def main() -> int:
     print(f"配置：PRE={C.PRE} TARGET={C.TARGET_POS} DEC_SLOT={C.DEC_SLOT} ROW_INDEX={C.ROW_INDEX} "
           f"CTX={C.CTX} FEED={C.FEED} CANDS={C.CANDS} WATCH={C.WATCH}")
@@ -480,6 +519,7 @@ def main() -> int:
     _serial_qk_section()
     _serial_align_section()
     _serial_mlp_section()
+    _row_aligned_section()
     return 0
 
 

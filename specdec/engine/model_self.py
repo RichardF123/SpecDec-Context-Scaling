@@ -102,12 +102,20 @@ def _label_of(m) -> str:
 
 @contextlib.contextmanager
 def serial_qk_for(*modules, label: str = "serial_qk"):
-    """`with serial_qk_for(target.layers[0].self_attn): ...` —— 退出（含异常）必定关闭。"""
+    """`with serial_qk_for(target.layers[0].self_attn): ...` —— 退出（含异常）必定恢复。
+
+    ⚠️ **嵌套语义（2026-10-02 修正）**：进入时**保存**上一个注册表，退出时**恢复**它，
+    而不是无条件清空 —— 否则同类 context 内层退出会把外层的注册清掉
+    （Stage 0 的"多 context 嵌套"门抓到的正是这个缺陷）。最外层退出后仍是 `None` ⇒
+    "默认关闭"与"关闭时逐位不变"两条性质不变。
+    """
+    global _SERIAL_QK
+    prev = _SERIAL_QK
     info = set_serial_qk(*modules, label=label)
     try:
         yield info
     finally:
-        clear_serial_qk()
+        _SERIAL_QK = prev
 
 
 def _serial_qk_branch(self, q, k_rep, s: int, T: int):
@@ -180,12 +188,17 @@ def serial_linear_state() -> dict:
 
 @contextlib.contextmanager
 def serial_linear_for(*modules, label: str = "serial_linear"):
-    """`with serial_linear_for(target.layers[0].self_attn.o_proj): ...` —— 退出（含异常）必定关闭。"""
+    """`with serial_linear_for(*mods): ...` —— 退出（含异常）必定恢复。
+
+    ⚠️ 嵌套语义与 `serial_qk_for` 一致：进入保存、退出**恢复**上一个注册表（见该函数的说明）。
+    """
+    global _SERIAL_LINEAR
+    prev = _SERIAL_LINEAR
     info = set_serial_linear(*modules, label=label)
     try:
         yield info
     finally:
-        clear_serial_linear()
+        _SERIAL_LINEAR = prev
 
 
 def _serial_linear_branch(mod, x):

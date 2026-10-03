@@ -1,11 +1,38 @@
 from __future__ import annotations
 
+import contextlib
+
 import torch
 
 from . import spec_cache
 
 K = 4
 FMT = {"base_bf16": "fp16", "v_fp8": "v_fp8"}
+
+# ---------------------------------------------------------------------------
+# **默认关闭**的 verify 包装点（全层 row-aligned verify 候选模式的唯一挂载处）
+#
+# 为什么放在这里：候选模式**只允许**作用于 SpecDec 的 **target block verify**（`_verify` 那一次
+# s=Kp 的 `_run`），不得影响 AR/decode（`_step`）与 prefill。把挂载点放在 `_verify` 的调用处
+# 是"作用域最小"的做法：AR 路径根本不经过这里。
+#
+# 默认 `None` ⇒ `spec_decode_greedy` 走**原样的一行**（`rows, tgt_blk = _verify(...)`），
+# 生产路径逐位不变（由 Stage 0/1 的开关对照与既有 F13 记录的复现共同证明）。
+# ---------------------------------------------------------------------------
+_VERIFY_WRAP = None
+
+
+def set_verify_wrap(fn) -> dict:
+    """安装 verify 包装（`fn(target)` 返回上下文管理器）；传 `None` 卸载。默认不安装。"""
+    global _VERIFY_WRAP
+    prev = _VERIFY_WRAP
+    _VERIFY_WRAP = fn
+    return dict(installed=bool(fn is not None), had_previous=bool(prev is not None))
+
+
+def verify_wrap_state() -> dict:
+    return dict(active=bool(_VERIFY_WRAP is not None),
+                note="默认 `None` ⇒ target block verify 走生产原样路径")
 
 
 def _fmt(kv):
@@ -76,7 +103,13 @@ def spec_decode_greedy(target, draft, prompt_ids, max_new_tokens, *, k=K,
         if kp == 0:
             break
 
-        rows, tgt_blk = _verify(target, tgt_cache, cands)
+        # 默认（`_VERIFY_WRAP is None`）：**原样**一行，生产路径逐位不变。
+        # 安装包装时：候选模式**只**包住这一次 block verify（AR/decode 不经过这里）。
+        if _VERIFY_WRAP is None:
+            rows, tgt_blk = _verify(target, tgt_cache, cands)
+        else:
+            with _VERIFY_WRAP(target):
+                rows, tgt_blk = _verify(target, tgt_cache, cands)
         st["target_block_calls"] += 1
         st["proposed"] += kp
 
