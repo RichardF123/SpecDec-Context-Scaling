@@ -5,6 +5,19 @@ import contextlib
 import torch
 
 from . import spec_cache
+from .spec_cache import cache_length
+
+
+def serial_trace() -> list:
+    """串行 verifier 的逐轮 trace（默认空列表；**只读**、不参与计算）。"""
+    return list(_SERIAL_TRACE)
+
+
+def clear_serial_trace() -> dict:
+    global _SERIAL_TRACE, _SERIAL_TRACE_PRE
+    n = len(_SERIAL_TRACE)
+    _SERIAL_TRACE, _SERIAL_TRACE_PRE = [], []
+    return dict(cleared=n)
 
 K = 4
 FMT = {"base_bf16": "fp16", "v_fp8": "v_fp8"}
@@ -20,6 +33,75 @@ FMT = {"base_bf16": "fp16", "v_fp8": "v_fp8"}
 # 生产路径逐位不变（由 Stage 0/1 的开关对照与既有 F13 记录的复现共同证明）。
 # ---------------------------------------------------------------------------
 _VERIFY_WRAP = None
+
+# ---------------------------------------------------------------------------
+# **可插拔 target verifier**（2026-10-03）：默认 `"block"` = 生产路径**一字不变**。
+#
+# `"serial"` = **串行 target verification oracle**（**仅诊断**）：把本轮那一次 `s=Kp` 的 block 前向
+# 换成**逐 token 的 `_step`（`s=1`）**，其余一切（accept/replacement/rollback/emitted/EOS/截断）**逐字复用**。
+# 它回答的唯一问题：若 target verification 完全走与 AR 相同的逐 token 路径，
+# SpecDec 的控制逻辑能否生成与 target-only AR 完全相同的 token IDs。
+#
+# 与 `_VERIFY_WRAP`（row-aligned）**互斥**：同时开启直接报错（禁止"内部先算 M=4 再切第 0 行"）。
+# ---------------------------------------------------------------------------
+_VERIFY_MODE = "block"
+VERIFY_MODES = ("block", "serial")
+
+
+class VerifyModeError(RuntimeError):
+    """verifier 模式相关的实现/契约错误（不是引擎错误）。"""
+
+
+def set_target_verify_mode(mode: str) -> dict:
+    """设置 target verifier 模式：`"block"`（默认，生产）或 `"serial"`（仅诊断）。"""
+    global _VERIFY_MODE
+    m = str(mode).strip().lower()
+    if m not in VERIFY_MODES:
+        raise VerifyModeError(f"未知 target verify 模式 {mode!r}（可选 {VERIFY_MODES}）")
+    if m == "serial" and _VERIFY_WRAP is not None:
+        raise VerifyModeError("serial 模式与 row-aligned wrapper 互斥：请先 set_verify_wrap(None)")
+    prev = _VERIFY_MODE
+    _VERIFY_MODE = m
+    return dict(previous=prev, mode=_VERIFY_MODE, diagnostic_only=bool(m == "serial"))
+
+
+def target_verify_mode() -> str:
+    return _VERIFY_MODE
+
+
+def _step_rows(model, cache, tokens: list):
+    """**逐 token** `_step`（每次 `s=1`）→ 收集每步的行与最终 cache；返回 `(rows, cache, lens)`。
+
+    `rows[j]` = 喂入 `tokens[j]` 之后那一行（位置 `pre+j`）——与 block 版 `lg[0, -kp:]` 的**语义一致**。
+    `lens[j]` = 喂入 `tokens[j]` 之后的 cache 长度（供 trace 核对"cache 长度 = pre+j+1"）。
+    """
+    rows, c = [], cache
+    lens = []
+    for t in tokens:
+        lg, c = _step(model, t, c)
+        rows.append(lg[:, -1])
+        lens.append(cache_length(c))
+    return rows, c, lens
+
+
+def _verify_serial(target, cache, cands):
+    """**串行 target verification**：与 `_verify` **同 contract**（`(rows, cache_blk)`），但全部 `s=1`。"""
+    rows, c, lens = _step_rows(target, cache, list(cands))
+    if not rows:
+        raise VerifyModeError("_verify_serial 收到空候选")
+    # ⚠️ contract 必须与 `_verify` **完全一致**：`_verify` 返回 `lg[0, -kp:]`，形状 `(kp, V)`
+    #   （二维：第 j 行就是位置 pre+j 的 logits 行）。首版写成 `(1, kp, V)` ⇒ 主循环 `rows[1]` 越界。
+    out = torch.cat([r.reshape(1, -1) for r in rows], dim=0)     # (kp, V)
+    _SERIAL_TRACE.append(dict(kp=len(cands), pre=_SERIAL_TRACE_PRE[-1] if _SERIAL_TRACE_PRE else None,
+                              step_cache_lens=lens, step_argmax=[int(r.reshape(-1).argmax()) for r in rows],
+                              mode="serial"))
+    return out, c
+
+
+# 诊断 trace（默认空；仅在 serial 模式下写入；**不参与任何计算**）
+_SERIAL_TRACE: list = []
+_SERIAL_TRACE_PRE: list = []
+
 
 
 def set_verify_wrap(fn) -> dict:
@@ -103,9 +185,15 @@ def spec_decode_greedy(target, draft, prompt_ids, max_new_tokens, *, k=K,
         if kp == 0:
             break
 
-        # 默认（`_VERIFY_WRAP is None`）：**原样**一行，生产路径逐位不变。
-        # 安装包装时：候选模式**只**包住这一次 block verify（AR/decode 不经过这里）。
-        if _VERIFY_WRAP is None:
+        # 默认（`_VERIFY_WRAP is None` 且 `_VERIFY_MODE == "block"`）：**原样**一行，生产路径逐位不变。
+        # 两个诊断分支（row-aligned wrapper / serial oracle）互斥；serial 时 target 的全部 generation
+        # 前向都是 `s=1`（与 AR 完全相同）。
+        _SERIAL_TRACE_PRE.append(pre)
+        if _VERIFY_MODE == "serial":
+            if _VERIFY_WRAP is not None:
+                raise VerifyModeError("serial 模式与 row-aligned wrapper 互斥")
+            rows, tgt_blk = _verify_serial(target, tgt_cache, cands)
+        elif _VERIFY_WRAP is None:
             rows, tgt_blk = _verify(target, tgt_cache, cands)
         else:
             with _VERIFY_WRAP(target):
