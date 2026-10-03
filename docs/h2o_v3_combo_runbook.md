@@ -1,5 +1,9 @@
 # H2O v3 — canonical V-FP8 target combination
 
+> **Final-status note (2026-10-02).** This runbook records the v3 execution
+> stage. Canonical `_final` results are archived under
+> [`results/kv_closeout_2026-10-02/`](../results/kv_closeout_2026-10-02/).
+
 ## Purpose
 
 Combine the project's established asymmetric target cache:
@@ -63,3 +67,12 @@ It reports:
 
 This remains a quality + payload experiment, not an H2O speed benchmark.
 Reference H2O score collection and compaction still materialize tensors.
+
+## Final closeout interpretation
+
+The final six-case A–G ablation measured exact output for V-FP8 without H2O
+and quality changes once 50% H2O pruning was active. V-FP8 + H2O 50% reached a
+combined final payload ratio of `0.37995302` versus the BF16 contiguous
+baseline, with exact rate `0.6666667` and mean token agreement `0.875`. The 25%
+retention arm was an aggressive stress condition, not a lossless operating
+point. See the authoritative closeout for the full table and claim boundaries.

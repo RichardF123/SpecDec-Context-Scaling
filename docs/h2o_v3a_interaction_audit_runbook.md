@@ -1,5 +1,9 @@
 # H2O v3a — controlled V-FP8 × H2O interaction audit
 
+> **Final-status note (2026-10-02).** The paired audit has completed. The
+> canonical outputs are the `_final` files archived under
+> [`results/kv_closeout_2026-10-02/`](../results/kv_closeout_2026-10-02/).
+
 ## Why this audit is necessary
 
 The earlier v2 and v3 smoke tests used different prompt strings. Therefore,
@@ -80,3 +84,16 @@ Outputs:
 
 - `h2o_v3a_interaction_summary.csv`
 - `h2o_v3a_interaction_detail.json`
+
+## Final result
+
+All 12 paired cases retained quantization-only exact output (`12/12`), while
+all `12/12` showed a retention-state or keep-set change. Classification was:
+
+- `retention_diverged_before_output`: 3 cases, all at aggressive ratio `0.25`;
+- `retention_changed_output_same`: 9 cases.
+
+This is retention-mediated interaction evidence: V-FP8 can change the H2O
+score/retention trajectory, and in some aggressive-retention cases the
+retention divergence precedes output divergence. It does not prove that V-FP8
+always changes H2O output or establish a complete causal mechanism.

@@ -1,0 +1,13 @@
+family,context,ratio,budget,steps,quant_only_exact,quant_only_first_output_diff,bf16_h2o_rounds,vfp8_h2o_rounds,bf16_h2o_accepted,vfp8_h2o_accepted,first_h2o_output_diff,first_score_diff_round,first_score_diff_layer,first_score_max_abs_delta,first_heavy_rank_diff_round,first_heavy_rank_diff_layer,first_heavy_set_jaccard,first_keep_diff_round,first_keep_diff_layer,first_keep_set_jaccard,keep_generated_after,retention_before_output,classification
+systems,128,0.25,32,16,1,,6,8,11,9,6,0,1,0.011522740125656128,0,1,1.0,0,2,0.8823529411764706,4,1,retention_diverged_before_output
+systems,128,0.5,64,16,1,,6,6,11,11,,0,1,0.011522740125656128,0,1,0.9393939393939394,0,1,0.9692307692307692,4,,retention_changed_output_same
+systems,256,0.25,64,16,1,,5,5,14,14,,0,1,0.0034101009368896484,0,1,0.9393939393939394,0,1,0.9692307692307692,4,,retention_changed_output_same
+systems,256,0.5,128,16,1,,4,4,16,16,,0,1,0.0034101009368896484,0,1,0.9692307692307692,0,1,0.9844961240310077,4,,retention_changed_output_same
+reasoning,128,0.25,32,16,1,,7,6,12,14,8,0,1,0.005531340837478638,0,1,1.0,0,4,0.9393939393939394,4,1,retention_diverged_before_output
+reasoning,128,0.5,64,16,1,,4,4,16,16,,0,1,0.005531340837478638,0,1,0.9393939393939394,0,1,0.9692307692307692,4,,retention_changed_output_same
+reasoning,256,0.25,64,16,1,,6,6,11,11,,0,1,0.004050910472869873,0,1,0.9393939393939394,0,1,0.9692307692307692,4,,retention_changed_output_same
+reasoning,256,0.5,128,16,1,,4,4,15,15,,0,1,0.004050910472869873,0,1,0.9692307692307692,0,1,0.9844961240310077,4,,retention_changed_output_same
+code,128,0.25,32,16,1,,6,6,11,11,,0,1,0.0019204914569854736,0,1,1.0,0,2,0.9393939393939394,4,,retention_changed_output_same
+code,128,0.5,64,16,1,,4,4,15,15,,0,1,0.0019204914569854736,0,1,1.0,0,2,0.9692307692307692,4,,retention_changed_output_same
+code,256,0.25,64,16,1,,6,7,12,11,12,0,1,0.003271937370300293,0,1,1.0,0,2,0.9104477611940298,4,1,retention_diverged_before_output
+code,256,0.5,128,16,1,,4,4,16,16,,0,1,0.003271937370300293,0,1,0.9692307692307692,0,1,0.9844961240310077,4,,retention_changed_output_same

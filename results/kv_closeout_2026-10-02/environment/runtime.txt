@@ -1,0 +1,7 @@
+python = 3.12.14 (main, Sep  2 2026, 23:27:36) [GCC 15.3.0]
+torch = 2.11.0+cu128
+cuda = 12.8
+transformers = 4.57.3
+cuda_available = True
+gpu = NVIDIA GeForce RTX 4060
+capability = (8, 9)

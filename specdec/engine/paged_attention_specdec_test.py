@@ -1,18 +1,16 @@
-"""PagedAttention v1c SpecDec integration gate.
+"""PagedAttention final SpecDec direct-route parity gate.
 
 Scope:
 - paged_v0 storage
-- direct page-aware CUDA only for BF16 q_len=1
-- phases: propose / repair are eligible
-- verify is explicitly excluded, including kp == 1
+- direct page-aware CUDA for BF16 and asymmetric V-FP8, q_len=1..4
+- phases: decode / propose / verify / repair / other are eligible
 - prefill remains on the existing materialized path
-- V-FP8 remains on the existing materialized path
 
 Two parity cases are exercised:
 1. canonical: target=v_fp8, draft=base_bf16
-   -> direct path is used by the BF16 draft propose/repair calls.
+   -> direct path covers target verification and eligible draft calls.
 2. all_bf16: target=base_bf16, draft=base_bf16
-   -> direct path can also cover BF16 target repair.
+   -> direct path covers eligible target and draft calls.
 
 The comparison baseline is materialized_cuda, so attention math is identical;
 the intended variable is only paged K/V addressing.

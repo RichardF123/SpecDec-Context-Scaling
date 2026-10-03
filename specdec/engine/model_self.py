@@ -96,17 +96,17 @@ _ATTENTION_STATS: dict | None = None
 _MAX_FALLBACK_LOGGED = 32
 
 # ---------------------------------------------------------------------------
-# PagedAttention v1d routing/usage statistics.
+# PagedAttention final routing/usage statistics.
 #
-# Direct page-aware CUDA is deliberately narrow:
+# Direct page-aware CUDA supports:
 #   - paged_v0 cache
-#   - BF16/base K/V (fmt == "fp16")
-#   - q_len == 1
+#   - BF16/base K/V (fmt == "fp16") and asymmetric V-FP8
+#   - q_len == 1..4
 #   - CUDA
-#   - phase in decode/propose/repair/other
+#   - phase in decode/propose/verify/repair/other
 #
-# In particular, `verify` is excluded even when kp == 1 so SpecDec target
-# verification stays on the already-validated materialized/reference path.
+# Prefill stays on the existing materialized/fused path.  Attention math and
+# backend policy outside the eligible direct paged calls are unchanged.
 PAGED_ATTENTION_MODES = ("off", "materialized_cuda", "direct_cuda")
 PAGED_DIRECT_PHASES = ("decode", "propose", "verify", "repair", "other")
 _PAGED_ATTENTION_STATS: dict | None = None
@@ -679,17 +679,17 @@ class QwenLM(nn.Module):
             normal engine attention path is used.
 
         materialized_cuda:
-            For BF16 q_len=1 decode with an existing paged cache, materialize
-            K/V and run the existing contiguous CUDA online-softmax attention.
+            For eligible paged decode/block calls, materialize K/V and run the
+            existing contiguous CUDA online-softmax attention.
 
         direct_cuda:
-            For the same case, read paged K/V directly with the page-aware
+            For the same calls, read paged K/V directly with the page-aware
             CUDA kernel and do not materialize full-history K/V.
 
-        Direct/materialized CUDA comparison paths are used only for
-        q_len=1 BF16 paged calls in decode/propose/repair/other phases.
-        Prefill, verify, V-FP8, multi-token, and CPU calls keep the existing
-        materialized engine path.
+        Direct/materialized CUDA comparison paths cover q_len=1..4 BF16 and
+        asymmetric V-FP8 paged calls in decode/propose/verify/repair/other
+        phases.  Prefill and CPU calls keep the existing materialized/fused
+        engine path.
         """
         allowed = PAGED_ATTENTION_MODES
         if mode not in allowed:

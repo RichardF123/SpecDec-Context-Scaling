@@ -1,0 +1,43 @@
+family,context,config_id,config_name,steps,page_size,target_kv,backend,attention_mode,h2o_ratio,token_agreement_vs_A,common_prefix_vs_A,exact_match_vs_A,first_output_diff_vs_A,payload_mib,payload_ratio_vs_A,target_resident,draft_resident,seen_tokens,resident_ratio,rounds,proposed,accepted,mismatch_rounds,rollbacks,prune_rounds,discarded_speculative_rows
+systems,128,A,BF16 contiguous baseline,16,16,base_bf16,contiguous,off,,1.0,16,1,,5.625,1.0,144,144,144,1.0,4,16,16,0,0,0,0
+systems,128,B,+ Paged KV storage,16,16,base_bf16,paged_v0,off,,1.0,16,1,,5.625,1.0,144,144,144,1.0,4,16,16,0,0,0,0
+systems,128,C,+ Direct PagedAttention,16,16,base_bf16,paged_v0,direct_cuda,,1.0,16,1,,5.625,1.0,144,144,144,1.0,4,16,16,0,0,0,0
+systems,128,D,+ V-FP8 target,16,16,v_fp8,paged_v0,direct_cuda,,1.0,16,1,,4.67138671875,0.83046875,144,144,144,1.0,4,16,16,0,0,0,0
+systems,128,E,BF16 + H2O 50%,16,16,base_bf16,paged_v0,direct_cuda,0.5,0.3125,5,0,5,2.5,0.4444444444444444,64,64,144,0.4444444444444444,6,23,11,5,5,6,24
+systems,128,F,V-FP8 + H2O 50%,16,16,v_fp8,paged_v0,direct_cuda,0.5,0.3125,5,0,5,2.076171875,0.36909722222222224,64,64,144,0.4444444444444444,6,23,11,5,5,6,24
+systems,128,G,V-FP8 + H2O 25% (stress),16,16,v_fp8,paged_v0,direct_cuda,0.25,0.375,5,0,5,1.0380859375,0.18454861111111112,32,32,144,0.2222222222222222,8,28,9,7,7,8,38
+systems,256,A,BF16 contiguous baseline,16,16,base_bf16,contiguous,off,,1.0,16,1,,10.625,1.0,272,272,272,1.0,4,16,16,0,0,0,0
+systems,256,B,+ Paged KV storage,16,16,base_bf16,paged_v0,off,,1.0,16,1,,10.625,1.0,272,272,272,1.0,4,16,16,0,0,0,0
+systems,256,C,+ Direct PagedAttention,16,16,base_bf16,paged_v0,direct_cuda,,1.0,16,1,,10.625,1.0,272,272,272,1.0,4,16,16,0,0,0,0
+systems,256,D,+ V-FP8 target,16,16,v_fp8,paged_v0,direct_cuda,,1.0,16,1,,8.82373046875,0.83046875,272,272,272,1.0,4,16,16,0,0,0,0
+systems,256,E,BF16 + H2O 50%,16,16,base_bf16,paged_v0,direct_cuda,0.5,1.0,16,1,,5.0,0.47058823529411764,128,128,272,0.47058823529411764,4,16,16,0,0,4,0
+systems,256,F,V-FP8 + H2O 50%,16,16,v_fp8,paged_v0,direct_cuda,0.5,1.0,16,1,,4.15234375,0.39080882352941176,128,128,272,0.47058823529411764,4,16,16,0,0,4,0
+systems,256,G,V-FP8 + H2O 25% (stress),16,16,v_fp8,paged_v0,direct_cuda,0.25,0.4375,7,0,7,2.076171875,0.19540441176470588,64,64,272,0.23529411764705882,5,18,14,2,2,5,8
+reasoning,128,A,BF16 contiguous baseline,16,16,base_bf16,contiguous,off,,1.0,16,1,,5.625,1.0,144,144,144,1.0,4,16,16,0,0,0,0
+reasoning,128,B,+ Paged KV storage,16,16,base_bf16,paged_v0,off,,1.0,16,1,,5.625,1.0,144,144,144,1.0,4,16,16,0,0,0,0
+reasoning,128,C,+ Direct PagedAttention,16,16,base_bf16,paged_v0,direct_cuda,,1.0,16,1,,5.625,1.0,144,144,144,1.0,4,16,16,0,0,0,0
+reasoning,128,D,+ V-FP8 target,16,16,v_fp8,paged_v0,direct_cuda,,1.0,16,1,,4.67138671875,0.83046875,144,144,144,1.0,4,16,16,0,0,0,0
+reasoning,128,E,BF16 + H2O 50%,16,16,base_bf16,paged_v0,direct_cuda,0.5,1.0,16,1,,2.5,0.4444444444444444,64,64,144,0.4444444444444444,4,16,16,0,0,4,0
+reasoning,128,F,V-FP8 + H2O 50%,16,16,v_fp8,paged_v0,direct_cuda,0.5,1.0,16,1,,2.076171875,0.36909722222222224,64,64,144,0.4444444444444444,4,16,16,0,0,4,0
+reasoning,128,G,V-FP8 + H2O 25% (stress),16,16,v_fp8,paged_v0,direct_cuda,0.25,0.375,5,0,5,1.0380859375,0.18454861111111112,32,32,144,0.2222222222222222,6,22,14,2,2,6,16
+reasoning,256,A,BF16 contiguous baseline,16,16,base_bf16,contiguous,off,,1.0,16,1,,10.625,1.0,272,272,272,1.0,4,16,16,0,0,0,0
+reasoning,256,B,+ Paged KV storage,16,16,base_bf16,paged_v0,off,,1.0,16,1,,10.625,1.0,272,272,272,1.0,4,16,16,0,0,0,0
+reasoning,256,C,+ Direct PagedAttention,16,16,base_bf16,paged_v0,direct_cuda,,1.0,16,1,,10.625,1.0,272,272,272,1.0,4,16,16,0,0,0,0
+reasoning,256,D,+ V-FP8 target,16,16,v_fp8,paged_v0,direct_cuda,,1.0,16,1,,8.82373046875,0.83046875,272,272,272,1.0,4,16,16,0,0,0,0
+reasoning,256,E,BF16 + H2O 50%,16,16,base_bf16,paged_v0,direct_cuda,0.5,0.9375,15,0,15,5.0,0.47058823529411764,128,128,272,0.47058823529411764,4,16,15,1,1,4,2
+reasoning,256,F,V-FP8 + H2O 50%,16,16,v_fp8,paged_v0,direct_cuda,0.5,0.9375,15,0,15,4.15234375,0.39080882352941176,128,128,272,0.47058823529411764,4,16,15,1,1,4,2
+reasoning,256,G,V-FP8 + H2O 25% (stress),16,16,v_fp8,paged_v0,direct_cuda,0.25,0.4375,7,0,7,2.076171875,0.19540441176470588,64,64,272,0.23529411764705882,6,23,11,5,5,6,24
+code,128,A,BF16 contiguous baseline,16,16,base_bf16,contiguous,off,,1.0,16,1,,5.625,1.0,144,144,144,1.0,4,16,16,0,0,0,0
+code,128,B,+ Paged KV storage,16,16,base_bf16,paged_v0,off,,1.0,16,1,,5.625,1.0,144,144,144,1.0,4,16,16,0,0,0,0
+code,128,C,+ Direct PagedAttention,16,16,base_bf16,paged_v0,direct_cuda,,1.0,16,1,,5.625,1.0,144,144,144,1.0,4,16,16,0,0,0,0
+code,128,D,+ V-FP8 target,16,16,v_fp8,paged_v0,direct_cuda,,1.0,16,1,,4.67138671875,0.83046875,144,144,144,1.0,4,16,16,0,0,0,0
+code,128,E,BF16 + H2O 50%,16,16,base_bf16,paged_v0,direct_cuda,0.5,1.0,16,1,,2.5,0.4444444444444444,64,64,144,0.4444444444444444,4,16,15,1,1,4,2
+code,128,F,V-FP8 + H2O 50%,16,16,v_fp8,paged_v0,direct_cuda,0.5,1.0,16,1,,2.076171875,0.36909722222222224,64,64,144,0.4444444444444444,4,16,15,1,1,4,2
+code,128,G,V-FP8 + H2O 25% (stress),16,16,v_fp8,paged_v0,direct_cuda,0.25,0.6875,11,0,11,1.0380859375,0.18454861111111112,32,32,144,0.2222222222222222,6,22,11,5,5,6,22
+code,256,A,BF16 contiguous baseline,16,16,base_bf16,contiguous,off,,1.0,16,1,,10.625,1.0,272,272,272,1.0,4,16,16,0,0,0,0
+code,256,B,+ Paged KV storage,16,16,base_bf16,paged_v0,off,,1.0,16,1,,10.625,1.0,272,272,272,1.0,4,16,16,0,0,0,0
+code,256,C,+ Direct PagedAttention,16,16,base_bf16,paged_v0,direct_cuda,,1.0,16,1,,10.625,1.0,272,272,272,1.0,4,16,16,0,0,0,0
+code,256,D,+ V-FP8 target,16,16,v_fp8,paged_v0,direct_cuda,,1.0,16,1,,8.82373046875,0.83046875,272,272,272,1.0,4,16,16,0,0,0,0
+code,256,E,BF16 + H2O 50%,16,16,base_bf16,paged_v0,direct_cuda,0.5,1.0,16,1,,5.0,0.47058823529411764,128,128,272,0.47058823529411764,4,16,16,0,0,4,0
+code,256,F,V-FP8 + H2O 50%,16,16,v_fp8,paged_v0,direct_cuda,0.5,1.0,16,1,,4.15234375,0.39080882352941176,128,128,272,0.47058823529411764,4,16,16,0,0,4,0
+code,256,G,V-FP8 + H2O 25% (stress),16,16,v_fp8,paged_v0,direct_cuda,0.25,0.6875,11,0,11,2.076171875,0.19540441176470588,64,64,272,0.23529411764705882,7,25,11,5,5,7,28

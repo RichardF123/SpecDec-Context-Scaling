@@ -26,6 +26,24 @@
 
 详见：[本次状态与结论边界](docs/status_update_2026-10-02.md)、[RoPE 对齐](docs/c1_rope_source_alignment_2026-10-01.md)、[真实生成对照](docs/ar_spec_aligned_rope_2026-10-01.md)、[第 47 位四格定位](docs/divasc_index47_localization_2026-10-01.md)。定位报告的原下一步建议需按本次状态说明修正，尚未据此执行新实验。
 
+## KV optimization engineering extension closeout（2026-10-02）
+
+这条 supplementary engineering study 已完成最终 GPU closeout，数据见
+[`results/kv_closeout_2026-10-02/`](results/kv_closeout_2026-10-02/)，权威总结见
+[`docs/kv_optimization_closeout_2026-10-02.md`](docs/kv_optimization_closeout_2026-10-02.md)。
+
+- Paged KV storage：closed；paged storage parity 通过。
+- Direct page-aware CUDA：closed；覆盖 BF16 / V-FP8、`q_len=1..4`，以及
+  decode/propose/verify/repair direct route；prefill 保持既有 materialized/fused path。
+- V-FP8 direct paged attention 与 SpecDec target verify direct route：closed，最终 parity 通过。
+- Direct paged path 的实测收益是 attention-call temporary allocation/peak delta
+  显著下降；本次 RTX 4060 microbenchmark **没有 latency speedup**。
+- H2O committed-history integration：作为 reference retention implementation
+  closed；完成 quality/payload 和 interaction audit，但**没有 H2O latency claim**。
+
+这次 closeout 没有重定义正式课程实验的 6+2 范围，也没有解决生产 BF16
+AR/Spec 严格逐 token correctness；后者仍是独立、未解决/进行中的问题。
+
 ## 历史状态快照（2026-09-27）
 
 以下保留当时记录，后续状态以上方 2026-10-02 更新为准；其中“下一步”及 12 条件范围均为历史计划。

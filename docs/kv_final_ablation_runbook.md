@@ -1,5 +1,9 @@
 # Final KV Optimization Ablation
 
+> **Completed 2026-10-02.** This runbook is retained as the execution protocol.
+> Canonical outputs are the `_final` artifacts in
+> [`results/kv_closeout_2026-10-02/`](../results/kv_closeout_2026-10-02/).
+
 This is the freeze-point evaluation for the KV-optimization subtask.
 
 ## ADD only
@@ -16,7 +20,7 @@ No core implementation file is replaced.
 |---|---|
 | A | BF16 contiguous SpecDec baseline |
 | B | + paged KV storage |
-| C | + direct page-aware q_len=1 attention |
+| C | + direct page-aware attention (`q_len=1..4`) |
 | D | + V-FP8 target |
 | E | BF16 + H2O 50% |
 | F | V-FP8 + H2O 50% |
@@ -55,8 +59,9 @@ The current H2O controller still uses reference attention-score capture and
 reference materialize/gather/repack compaction.  Timing it would mix algorithmic
 retention behavior with intentionally unoptimized controller overhead.
 
-Use the already-completed PagedAttention v1d repeated benchmark for the direct
-paged-attention latency result.
+Use the final PagedAttention benchmark for the direct paged-attention latency
+result. It found a large attention-call temporary-allocation reduction but no
+latency speedup in the reported RTX 4060 configurations.
 
 ## Run
 
@@ -67,10 +72,10 @@ bash scripts/run_kv_final_ablation.sh
 
 ## Outputs
 
-- `kv_final_ablation_raw.csv`
-- `kv_final_ablation_summary.csv`
-- `kv_final_ablation_report.md`
-- `kv_final_ablation_manifest.json`
+- `kv_final_ablation_raw_final.csv`
+- `kv_final_ablation_summary_final.csv`
+- `kv_final_ablation_report_final.md`
+- `kv_final_ablation_manifest_final.json`
 
 The Markdown file is intended to be directly usable when writing the project
 report/result section.

@@ -1,5 +1,10 @@
 # PagedAttention v1d — pointer-table reuse + repeated benchmark
 
+> **Historical stage record.** The scope below is the v1d boundary, not the
+> current implementation boundary. The 2026-10-02 final closeout subsequently
+> added BF16 `q_len=1..4` verification and asymmetric V-FP8 direct paged CUDA.
+> See [the authoritative closeout](kv_optimization_closeout_2026-10-02.md).
+
 This batch continues from the already-passing v1c state:
 
 - Paged KV v0 storage parity: PASS

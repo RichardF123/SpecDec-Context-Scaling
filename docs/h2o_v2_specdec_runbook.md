@@ -1,5 +1,12 @@
 # H2O v2 — SpecDec committed-history integration
 
+> **Historical stage record.** This file preserves the v2 gate and its
+> then-current exclusions. The final closeout also covers the V-FP8 target,
+> final quality/payload evaluation, and the paired interaction audit. H2O score
+> capture and compaction remain reference/materialized implementations; no H2O
+> latency improvement is claimed. See
+> [the authoritative closeout](kv_optimization_closeout_2026-10-02.md).
+
 ## Scope
 
 This batch integrates H2O with speculative decoding without allowing

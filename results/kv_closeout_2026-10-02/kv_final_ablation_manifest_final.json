@@ -1,0 +1,88 @@
+{
+  "purpose": "Final quality/memory/SpecDec-behavior ablation. H2O latency intentionally excluded.",
+  "target_model": "Qwen/Qwen2.5-1.5B-Instruct",
+  "draft_model": "Qwen/Qwen2.5-0.5B-Instruct",
+  "contexts": [
+    128,
+    256
+  ],
+  "prompt_families": [
+    "systems",
+    "reasoning",
+    "code"
+  ],
+  "steps": 16,
+  "page_size": 16,
+  "specdec_k": 4,
+  "configs": [
+    {
+      "id": "A",
+      "name": "BF16 contiguous baseline",
+      "kind": "standard",
+      "backend": "contiguous",
+      "attention_mode": "off",
+      "target_kv": "base_bf16",
+      "h2o_ratio": null
+    },
+    {
+      "id": "B",
+      "name": "+ Paged KV storage",
+      "kind": "standard",
+      "backend": "paged_v0",
+      "attention_mode": "off",
+      "target_kv": "base_bf16",
+      "h2o_ratio": null
+    },
+    {
+      "id": "C",
+      "name": "+ Direct PagedAttention",
+      "kind": "standard",
+      "backend": "paged_v0",
+      "attention_mode": "direct_cuda",
+      "target_kv": "base_bf16",
+      "h2o_ratio": null
+    },
+    {
+      "id": "D",
+      "name": "+ V-FP8 target",
+      "kind": "standard",
+      "backend": "paged_v0",
+      "attention_mode": "direct_cuda",
+      "target_kv": "v_fp8",
+      "h2o_ratio": null
+    },
+    {
+      "id": "E",
+      "name": "BF16 + H2O 50%",
+      "kind": "h2o",
+      "backend": "paged_v0",
+      "attention_mode": "direct_cuda",
+      "target_kv": "base_bf16",
+      "h2o_ratio": 0.5
+    },
+    {
+      "id": "F",
+      "name": "V-FP8 + H2O 50%",
+      "kind": "h2o",
+      "backend": "paged_v0",
+      "attention_mode": "direct_cuda",
+      "target_kv": "v_fp8",
+      "h2o_ratio": 0.5
+    },
+    {
+      "id": "G",
+      "name": "V-FP8 + H2O 25% (stress)",
+      "kind": "h2o",
+      "backend": "paged_v0",
+      "attention_mode": "direct_cuda",
+      "target_kv": "v_fp8",
+      "h2o_ratio": 0.25
+    }
+  ],
+  "claim_boundaries": [
+    "Do not infer H2O speedup from this experiment.",
+    "Use the dedicated repeated v1d paired benchmark for PagedAttention latency.",
+    "Treat H2O 25% as an aggressive stress regime, not a lossless operating point.",
+    "Use the separate v3a paired audit for V-FP8 \u00d7 H2O interaction claims."
+  ]
+}

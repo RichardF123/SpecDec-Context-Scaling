@@ -1,0 +1,5 @@
+# Preserve verified closeout measurements and environment snapshots byte-for-byte.
+# Several source CSV/snapshot files intentionally retain their original CRLF or
+# trailing spaces, so suppress textual diff/whitespace normalization for them.
+results/kv_closeout_2026-10-02/*.csv -text -diff
+results/kv_closeout_2026-10-02/environment/* -text -diff

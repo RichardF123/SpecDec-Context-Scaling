@@ -1,5 +1,11 @@
 # PagedAttention v1c bundle
 
+> **Historical stage record.** This runbook describes the v1c support boundary
+> at that time. It is superseded by the 2026-10-02 final closeout, which covers
+> BF16 and asymmetric V-FP8 direct paged CUDA for `q_len=1..4`, including
+> SpecDec target verification. See
+> [the authoritative closeout](kv_optimization_closeout_2026-10-02.md).
+
 This bundle continues from the already-passing v1b state.
 
 ## What this batch adds
@@ -115,7 +121,7 @@ Optional 1.5B run:
 python -m specdec.engine.paged_attention_bench   --model target   --contexts 128,512,1024   --steps 16   --page-size 16   --csv paged_attention_bench_target.csv
 ```
 
-## What may be claimed if all correctness gates pass
+## Historical v1c claims if its gates pass
 
 - paged_v0 storage semantics remain preserved.
 - BF16 q_len=1 page-aware CUDA attention matches the materialized CUDA path in operator and real-model tests.
