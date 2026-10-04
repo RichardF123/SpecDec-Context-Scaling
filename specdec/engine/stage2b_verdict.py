@@ -114,6 +114,33 @@ def _manifest_token_sha1(family: str, *, ctx: int = 8192) -> str | None:
 
 
 # ---------------------------------------------------------------- 各阶段检查
+def _as_rep(v):
+    """把 `rep` 解析成整数；**不可解析返回 None**（绝不抛异常）。
+
+    ⚠️ 缺陷（本轮修复）：判决工具与逐阶段核对器原先都在多处 `int(r.get("rep") or 0)`；
+    一旦记录里 `rep` 是非法值（如字符串 `'bad'`）就直接抛 `ValueError` ⇒ **工具崩溃**，
+    而不是给出明确的"编号非法 ⇒ 不得判 PASS / 判 STOP"。
+    规则（单一实现来源，`stage_check` 直接复用本函数以避免两处口径漂移）：
+    只接受 `int`（**排除 `bool`**）与纯数字字符串；`float`/`None`/其它类型一律视为不可解析
+    （`int(1.5)` 会静默截断成 1，故不接受 float）。
+    """
+    if isinstance(v, bool) or v is None:
+        return None
+    if isinstance(v, int):
+        return v
+    if isinstance(v, str):
+        s = v.strip()
+        if s.isdigit() or (s.startswith("-") and s[1:].isdigit()):
+            return int(s)
+    return None
+
+
+def _rep_sort_key(r: dict) -> tuple:
+    """排序键：**不可解析的编号排到最后且不抛异常**（合法性由覆盖性检查明确报出）。"""
+    v = _as_rep(r.get("rep"))
+    return (0, v, str(r.get("file"))) if v is not None else (1, 0, str(r.get("file")))
+
+
 def validate_arguments(tag: str, families: list, modes: list, reps) -> list:
     """**参数合法性**（CLI 与 `evaluate()` 两层都会调用；任何一条不满足即不可能 PASS）。
 
@@ -604,10 +631,17 @@ def evaluate(tag: str, families: list, modes: list, reps: int, *, outdir: Path =
         else:
             usable.append(r)
     rows, raw_by_key = [], {}
+    bad_rep: list = []
     for rec_i in usable:
         row = attach_internal(rec_i)
         rows.append(row)
-        raw_by_key[(row.get("case"), row.get("mode"), int(row.get("rep") or 0))] = rec_i
+        rv = _as_rep(row.get("rep"))
+        if rv is None:
+            # ⚠️ 缺陷（本轮修复）：非法 `rep`（如 `'bad'`）原先会在 `int(...)` 处抛
+            #    `ValueError` ⇒ 判决工具**崩溃**而不是给出明确判决。现在单列报出并阻断。
+            bad_rep.append(dict(file=row.get("file"), case=row.get("case"),
+                                mode=row.get("mode"), rep=row.get("rep")))
+        raw_by_key[(row.get("case"), row.get("mode"), rv)] = rec_i
     needs_review: list = []
     baseline_fail: list = []
     serial_fail: list = []
@@ -625,9 +659,12 @@ def evaluate(tag: str, families: list, modes: list, reps: int, *, outdir: Path =
                            for r in env_blocked]
 
     # ---- 0) 覆盖性：缺 family/mode/rep、重复编号、超范围三元组 ----
+    for b in bad_rep:
+        needs_review.append(f"**rep 字段非法**：{b['rep']!r}（family={b['case']} mode={b['mode']} "
+                            f"文件={b['file']}）⇒ 编号不可解析，不得判 PASS")
     found: dict = {}
     for r in rows:
-        found.setdefault((r.get("case"), r.get("mode"), int(r.get("rep") or 0)), []).append(r)
+        found.setdefault((r.get("case"), r.get("mode"), _as_rep(r.get("rep"))), []).append(r)
     expected = [(f, m, rep) for f in families for m in modes for rep in range(1, int(reps) + 1)]
     for key in expected:
         got = found.get(key)
@@ -654,7 +691,7 @@ def evaluate(tag: str, families: list, modes: list, reps: int, *, outdir: Path =
     per_family: dict = {}
     for fam in families:
         by_mode = {m: sorted([r for r in rows if r.get("case") == fam and r.get("mode") == m],
-                             key=lambda r: int(r.get("rep") or 0)) for m in modes}
+                             key=_rep_sort_key) for m in modes}
         # ⚠️ 逐模式**存在性**检查（独立于 `expected` 三元组）：避免"某模式 0 次却被跳过"的放行漏洞
         #    （反例 CE2：只给 AR×2 + modes=['ar'] ⇒ 旧实现直接 PASS）。
         for m in REQUIRED_MODES:
@@ -683,8 +720,8 @@ def evaluate(tag: str, families: list, modes: list, reps: int, *, outdir: Path =
         reps_ok = bool(len(se) >= 2 and len({tuple(r["gen"]) for r in se}) == 1)
         # ---- GB6：分歧时的记账完整性（可直接取得 vs 需独立诊断）----
         # ⚠️ 走 `_gb6_run_view`（`gen` 与 `_row` 同一路径 `smoke.gen`），不再直接读 runner 顶层 `gen`。
-        ar_view = [_gb6_run_view(r, raw_by_key.get((fam, "ar", int(r["rep"])))) for r in ar]
-        pr_view = [_gb6_run_view(r, raw_by_key.get((fam, "prod", int(r["rep"])))) for r in pr]
+        ar_view = [_gb6_run_view(r, raw_by_key.get((fam, "ar", _as_rep(r.get("rep"))))) for r in ar]
+        pr_view = [_gb6_run_view(r, raw_by_key.get((fam, "prod", _as_rep(r.get("rep"))))) for r in pr]
         diag = (gb6_diagnostics or {}).get(fam)
         gb6 = _gb6_record(fam, ar_view, pr_view, diag)
         if gb6.get("artifact_inconsistency"):

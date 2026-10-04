@@ -109,6 +109,10 @@ python -X utf8 -m specdec.engine.serial_oracle_env_check                   # 期
 ```
 
 ### 4.1 逐 family：AR×2 → production×2 → serial×2（**GPU；需 D-1/D-3**）
+> **编号覆盖（2026-10-04 收紧）**：`stage_check` 要求每个请求模式**恰好** `rep1..rep2` 各一份；
+> 两个 `rep1` / `rep1+rep3` / 同一产物计入两次 / 缺号 / `rep` 非法值 ⇒ 一律 **STOP**（不再只看份数），
+> 且非法值不会再让工具崩溃。它保证的是"**记录层**编号正确"，**不能**证明 GPU 真的独立跑了两次。
+
 ```powershell
 $tag='div8209_p2'; $reps=2; $py='.\.venv\Scripts\python.exe'
 foreach ($f in 'F09','F03','F11','F04') {
@@ -139,6 +143,11 @@ python -X utf8 -m specdec.engine.correctness_protocol_margins --stage2b --runs-t
     不得手工填数、不得从旧 tag 迁移 margin；
   * 某 family 状态为 `TOKEN_EQUAL` ⇒ 该 family **不需要**诊断（无分歧），如实记录即可；
   * 退出码 5 ⇒ 检查失败（载入输入长度与 `prompt_len` 不符等），同样停。
+* **⚠️ 覆盖范围限制（2026-10-04 字段审计结论）**：本工具**只重建 AR 口径**的决策行 ⇒ 它的
+  `ar_top1/ar_top2/margin/tied_at_max` 与 `cache_len_after` **属于 AR 侧**（`cache_len_after` 还是**重建**出来的
+  cache 长度，不是该 run 的实际长度）。**它不能给出 serial / production 的实际决策行** ⇒
+  **不得**用 AR 单侧 logits 推断另一侧是否并列；精确并列的双侧分类在补证（决策单 §1A-T-6 的 P-1/P-2）落地前
+  **一律记 TIE-C（证据不足）**。诊断产物**不进入**任何计时/加速比结论。
 
 ### 4.3 最终判决（只读）
 ```powershell

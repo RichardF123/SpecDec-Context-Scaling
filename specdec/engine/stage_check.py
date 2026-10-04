@@ -87,38 +87,53 @@ def _gate_serial(fam: str, rows: list, *, reps: int, ar_ref=None) -> list:
     return reasons
 
 
+# 编号解析的**单一实现来源**放在 `stage2b_verdict`（`stage_check` 本来就依赖它，
+# 反向 import 会成环）。两处共用同一函数 ⇒ 不会出现"一个工具报 STOP、另一个崩溃"的口径漂移。
+_as_rep = SV._as_rep
+
+
+def _rep_sort_key(r: dict) -> tuple:
+    """排序键：**不可解析的编号排到最后且不抛异常**（合法性由 `_rep_coverage` 明确报出）。"""
+    return SV._rep_sort_key(r)
+
+
 def _rep_coverage(mrows: list, *, reps: int) -> list:
     """核对**重复编号的精确覆盖**：请求的每个模式必须**恰好**是 `rep1..rep{reps}`，各一份。
 
-    ⚠️ 缺陷（本轮修复）：旧实现只有一条 `len(mrows) < reps` 检查 ⇒ 下面三种都**能返回 OK**：
+    ⚠️ 缺陷（上一轮修复）：旧实现只有一条 `len(mrows) < reps` 检查 ⇒ 下面三种都**能返回 OK**：
       * 两个 `rep1`（份数仍 = 2，长度检查看不见）；
       * `rep1 + rep3`（份数 = 2，且 rep3 不在预登记集合里）；
       * 同一份产物被计入两次（文件名相同）。
-    本函数按"编号集合 + 计数 + 产物身份"三层核对，返回问题清单（空 = 通过）：
-      ① **多个同号**：某个 `rep` 有 ≥2 份不同产物；
-      ② **缺号**：某个 `rep` 一份也没有；
-      ③ **越界/非法号**：出现 `rep1..rep{reps}` 之外的编号，或 `rep` 缺失/非法；
-      ④ **产物身份重复**：同一文件名在本次核对里出现两次。
+    ⚠️ 缺陷（本轮修复）：`rep` 为**非法值**（如 `'bad'`）时必须给出**明确的 STOP 原因**，
+      不得抛 `ValueError` 使工具崩溃 ⇒ 解析改为 `_as_rep`（不抛异常）并**只解析一次**。
+
+    返回问题清单（空 = 通过）：
+      ① **非法/缺失编号**：`rep` 无法解析成整数；
+      ② **多个同号**：某个 `rep` 有 ≥2 份不同产物；
+      ③ **缺号**：某个 `rep` 一份也没有；
+      ④ **越界号**：出现 `rep1..rep{reps}` 之外的编号；
+      ⑤ **产物身份重复**：同一文件名在本次核对里出现两次。
     """
     want = list(range(1, int(reps) + 1))
     problems: list = []
-    seen: list = []
+    parsed: list = []                       # [(rep_int, row)]
     for r in mrows:
         raw = r.get("rep")
-        try:
-            seen.append(int(raw))
-        except (TypeError, ValueError):
-            problems.append(f"rep 字段缺失或非法：{raw!r}（文件 {r.get('file')}）")
-            seen.append(0)
+        v = _as_rep(raw)
+        if v is None:
+            problems.append(f"rep 字段**非法或缺失**：{raw!r}（文件 {r.get('file')}）"
+                            f" ⇒ 编号不可解析，判 STOP（不得当成任意重复号继续核对）")
+            continue
+        parsed.append((v, r))
     for rep in want:
-        got = [r for r in mrows if int(r.get("rep") or 0) == rep]
+        got = [r for v, r in parsed if v == rep]
         if not got:
             problems.append(f"缺 rep{rep} ⇒ 不能判 OK（预登记要求每个模式恰有 "
                             f"rep1..rep{int(reps)} 各一份；若确为该阶段尚未跑完，请补齐后再核对）")
         elif len(got) > 1:
             problems.append(f"rep{rep} 有 {len(got)} 份产物 ⇒ **重复编号**："
                             f"{[g.get('file') for g in got]}")
-    extra = sorted({s for s in seen if s not in want})
+    extra = sorted({v for v, _ in parsed if v not in want})
     if extra:
         problems.append(f"出现预登记之外的编号 {extra}（只允许 rep1..rep{int(reps)}）")
     files = [r.get("file") for r in mrows]
@@ -180,7 +195,7 @@ def main() -> int:
         print("   ★ 该 family 在本 tag 内**没有任何可用产物** ⇒ PENDING（不要继续下一阶段）")
         return 2
 
-    ar = sorted([r for r in fam_rows if r.get("mode") == "ar"], key=lambda r: int(r.get("rep") or 0))
+    ar = sorted([r for r in fam_rows if r.get("mode") == "ar"], key=_rep_sort_key)
     ar_ref = ar[0]["gen"] if ar else None
     # ⚠️ `_serial_hard_checks2` 的第 15 项要比较 `_ar_stop`；不设置会对 serial 行产生**假失败**
     for r in fam_rows:
@@ -190,7 +205,7 @@ def main() -> int:
     problems: list = []
     pending = False
     for mode in modes:
-        mrows = sorted([r for r in fam_rows if r.get("mode") == mode], key=lambda r: int(r.get("rep") or 0))
+        mrows = sorted([r for r in fam_rows if r.get("mode") == mode], key=_rep_sort_key)
         if not mrows:
             print(f"   [{mode}] 0/{a.reps} 次 ⇒ **PENDING**（该阶段未跑）")
             pending = True

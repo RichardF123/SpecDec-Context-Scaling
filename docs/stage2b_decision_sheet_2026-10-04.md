@@ -11,8 +11,8 @@
 | 预检 | `python -X utf8 -m specdec.engine.stage2b_preflight_cpu` | **exit 3** → `PREFLIGHT_OK_TOOLS_BUT_FAMILIES_UNREGISTERED`；F09/F03/F11/F04 四项均 `会被判越界=True` |
 | 治理守卫 | `python -X utf8 -m specdec.engine.verify_family_independence_cpu` | **31/0**；其中两条相关检查为 `Stage 2b 工具的源码里只有'已授权 ∪ 候选'的 family 字面量`、`Stage 2b 候选 family **尚未被任何 run 消费**（D-3 批准前不得跑）` |
 | 环境门 | `python -X utf8 -m specdec.engine.serial_oracle_env_check` | **ENVIRONMENT_OK**；commit 可用 20.3 GiB ≥ 安全线 16 GiB；入口 free 20.31 GiB ≥ 18 GiB（margin +2.31） |
-| 工具自测（**仅工具证据**） | 8 个 CPU 自测 | 合计 **276/0**（verdict 92 · diag 25 · **stage_check 22** · agg 21 · guard 31 · audit 19 · env 24 · stage0 42） |
-| 编号覆盖反例（本轮修复） | `stage_check_selftest_cpu` | 两个 `rep1` / `rep1+rep3` / 同一产物计入两次 / 缺 `rep2` ⇒ 均**不得 OK**（旧实现只查份数，前三种会误判 OK）；缺 `rep2` 场景下 `stage2b_verdict` 既有判决**不变** |
+| 工具自测（**仅工具证据**） | 8 个 CPU 自测 | 合计 **282/0**（verdict 92 · diag 25 · **stage_check 28** · agg 21 · guard 31 · audit 19 · env 24 · stage0 42） |
+| 编号覆盖反例（已修） | `stage_check_selftest_cpu` | 两个 `rep1` / `rep1+rep3` / 同一产物计入两次 / 缺 `rep2` / **`rep='bad'`（非法值，旧实现崩溃）** ⇒ 均**不得 OK**；同一批夹具下 `stage2b_verdict` 既有判决**不变**（V1–V5） |
 | 历史产物只读复核 | AR vs production 首分歧 | 输出下标 **47**（旧实现误取末位 63）；运行侧 GB6 字段全齐，仍缺 5 个诊断字段 |
 
 **结论：GPU 阶段被"协议未批准"硬阻断；工具侧不再是阻断项。**
@@ -102,19 +102,22 @@
 * 与 `g5_measurement_protocol:270-275` 的 `BF16_NEAR_TIE`（**近似**并列，需结构不变量 / off-by-one / 邻位更远 / `|fp32 margin| ≤ own_max_abs` 四条件）**是两件事**：本规则**不引入**那四个条件，**不得**用 near-tie 的 `NEEDS_INSPECTION` 代替本规则，**也不得**用"精确并列"去满足 near-tie。
 
 **T-1 如何从 logits 判断并列**（对"做出该 token 决策的那一行"：block 臂 = production 块验证行；serial 臂 = 逐 token 单步行；AR 臂 = 其自身 decode 行）
-1. 取该行**决策所用**的 dtype 与设备上的 logits —— **不得**先 upcast 再判并列（upcast 会改变并列计数，等于换了一把尺子）；
+1. 取该行**决策所用**的 dtype 与设备上的 logits 来判并列。**⚠️ 技术澄清（本轮修正）**：把**已有的 BF16 logits 单纯 cast 成 FP32 不会改变任何相等关系** —— BF16 的每个值都能被 FP32 **精确表示**，cast 是单射 ⇒ 并列集合（以及"是否并列"）在 cast 前后**完全相同**。因此 cast **既不能**用来判"是否真并列"，**也不能**用来当"FP32 对照"。
 2. `m = row.max()`；`tied_at_max = int((row == m).sum())`；**并列 ⇔ `tied_at_max >= 2`**；
 3. 记录 `top1`/`top2`（token id + 值）、`margin = v1 - v2`（并列时 `0.0`）、`argmax`；并列时框架 `argmax` 取**最小下标**，必须与该 run **实际选出的 token 一致** —— 不一致即"记录与实现不一致"，**判 STOP**（不得当作并列解释掉）；
-4. FP32 对照行（诊断 pass 可选提供）在同位置按同法单独记录，**仅作解释证据，不作为放行条件**，用于区分"真语义并列"与"bf16 舍入造成的并列"。
+4. **FP32 对照必须是"重新以 FP32 计算 logits"**（一次**独立的 FP32 前向**），**不是**把 BF16 结果 cast 上来。只有重算才可能**改变并列结构**（FP32 下原本相等的两个值可能分开，原本不等的两个值也可能变得相等）。该对照**仅作解释证据，不作为放行条件**，用于区分"真语义并列"与"BF16 舍入造成的并列"。
 
 **T-2 serial 与 AR 在并列处 token 不同时如何分类**（逐位置独立分类，**不合并、不按位置筛样本**，与 DR3 一致）
-* **TIE-A `EXACT_TIE_BOTH_TIED`**：两侧决策行在该位置**都**并列，且两个不同 token **各自都落在对应侧的并列最大值集合内** ⇒ 差异**可归因于并列取值顺序**；
-* **TIE-B `EXACT_TIE_ONE_SIDED`**：只有一侧并列，或另一侧 token **不在**其并列集合内（或该侧不并列且 `margin > 0`）⇒ 差异**不能**归因于并列；
-* **TIE-C `EXACT_TIE_UNRESOLVED_EVIDENCE`**：缺判定行证据（无诊断行 / dtype 未记录 / `argmax` 与实际 token 不符）⇒ **无法分类**（按"证据不足"处理，不得默认成 TIE-A）。
+* **TIE-A `EXACT_TIE_BOTH_TIED`（措辞已按本轮修正）**：两侧决策行在该位置**都**并列，且两个不同 token **各自都落在对应侧的并列最大值集合内** ⇒ 该结果**只能说"与并列敏感性相容"（tie-sensitivity-compatible）**，**不能**直接归因为"并列取值顺序"。理由：并列只说明**该位置对极微小的数值差异敏感**，它**不说明**两侧数值差异的**来源与大小**；"两侧都并列"与"差异由并列造成"是两件事。**要作因果归因，需要额外证据**（例如两侧决策行的逐元素差值、以及 FP32 重算对照），在缺这些证据时只能停在"相容"这一档措辞。
+* **TIE-B `EXACT_TIE_ONE_SIDED`**：只有一侧并列，或另一侧 token **不在**其并列集合内（或该侧不并列且 `margin > 0`）⇒ **与并列敏感性不相容**（该差异**不能**用并列解释）。
+* **TIE-C `EXACT_TIE_UNRESOLVED_EVIDENCE`**：缺判定行证据（缺任一侧的决策行 / dtype 未记录 / `argmax` 与实际 token 不符）⇒ **无法分类**（按"证据不足"处理，**不得**默认成 TIE-A，**也不得**用另一侧的证据代替）。
 
-**T-3 是否阻断 Gate A —— 我的建议：阻断（不自动豁免）**
-* **默认阻断**：只要 serial 与 AR 在任一位置 token 不同，Gate A 判 `SERIAL_ORACLE_FAIL`（与 `design_freeze:96` 一致）；TIE-A/B/C 只是**附着在失败记录上的解释性分类**，**不改变判决**。
-* **明确禁止**：把 TIE-A 当作自动豁免，或据此声称 Gate A 通过。
+> ⚠️ **本轮新增的可得性限制（与 §1A-T-6 一致，必须与 T-2 一起读）**：当前工具**只能**给出 **AR 侧**的决策行重建
+> ⇒ **TIE-A/TIE-B 双侧分类在现阶段不可判**，一律记 **TIE-C（证据不足）**。详见 T-6 的字段审计与最小补证方案。
+
+**T-3 是否阻断 Gate A —— 我的建议：阻断（不自动豁免；本轮再次确认，严格门不变）**
+* **默认阻断**：只要 serial 与 AR 在任一位置 token 不同，Gate A 判 `SERIAL_ORACLE_FAIL`（与 `design_freeze:96` 一致）。**并列分类（TIE-A/B/C）不改变判决**：它只是**附着在失败记录上的解释性分类**，"与并列敏感性相容"**不等于**"token 相等"，更**不等于**门通过。
+* **明确禁止**：把 TIE-A 当作自动豁免、把"相容"读成"等价"、或据此声称 Gate A 通过。
 * **若小组希望"TIE-A 不阻断"**：那属于**放宽冻结判据**（修改 exact-token 门），必须同时满足：① 在**看到任何 Stage 2b 结果之前**定稿；② 与 **D-8** 一起走正式变更流程并留痕；③ 豁免**仅限** T-0 定义的精确定义情形（两侧都并列且两个 token 都属各自并列集合），逐位置提供 T-4 全部证据；④ **不得**引入任何 margin/ULP 阈值。**我的建议是不采用该选项**：先按严格口径跑一轮、拿到并列频率实测数据后再由小组决定是否提出变更（届时任何阈值也只能对**下一轮**预登记）。
 * 本规则同样适用于 production（`M=4`）与 AR 的比较（用于**解释**生产分歧），但生产层本就不设 exact-id 门。
 
@@ -129,6 +132,44 @@
 
 **T-5 预登记时点**
 本规则随本决策单在**任何 Stage 2b GPU 运行之前**提交（以 commit 为证）。一经批准即冻结：**不得**在看到结果后修改阈值、增删分类或改变阻断结论。
+
+**T-6 "规则所需证据 vs 当前工具实际产出"字段审计（本轮完成；结论：双侧分类暂不可判）**
+
+> **核心技术事实**：`correctness_protocol_margins` **只重建 AR 口径的决策行** —— 它按 AR 的方式走
+> （分块 prefill + 逐 token `M=1` 沿**该 run 的 token 序列**步进），在首分歧位置取 target 的最后一行 logits。
+> 它**不能**给出 **serial 运行**或 **production（`M=4`）块验证**在该位置的**实际决策行**：
+> 那两行的 cache 构造历史与 GEMM 形状都不同（本项目已记录的"形状敏感性"正是分歧机制本身）。
+> **因此：不得用 AR 单侧 logits 推断另一侧是否并列，也不得把重建行当作任一侧的实际行。**
+
+| T-4 所需证据 | 当前产出方 | 现状 |
+| --- | --- | --- |
+| 位置：输出内下标 / 绝对位置 / 轮号 / 共同前缀 `P` | AR 与 production 产物逐 token 比对 + `end_state.prompt_len` + `rounds` | ✅ **已有**（`stage2b_verdict` 的 GB6 运行侧；真实 F13：`47 / 8239 / 18 / P=47`） |
+| 两侧 token id | 同上 | ✅ **已有** |
+| **AR 侧**行摘要：`argmax` / `top1,top2` / `margin` / `tied_at_max` | `correctness_protocol_margins`（AR 口径**重建**） | ✅ **已有**（= "现有工具已能完成的 GB6 AR margin 记账"），但 `cache_len_after` 是**重建**出来的 cache 长度，**不是**该 run 的实际 cache 长度，需在记录里标注来源 |
+| **并列 token id 集合**（成员，而非仅计数） | 无 | ❌ **缺**（现只记 `tied_at_max` 计数；要判 TIE-A 必须知道成员是哪些 token） |
+| **对侧（serial / production）的实际决策行** | 无（诊断工具只有 AR 口径重建） | ❌ **缺** ⇒ **TIE-A/TIE-B 不可判** |
+| 产生该行的臂 + dtype/layout（bf16/fp32、block/single-step） | 产物的 `kv_format` / `dtypes`；诊断工具未记"该行为 AR 口径重建"的显式臂标签 | ⚠️ **部分**（需在诊断记录里加 `arm`/`dtype` 显式字段） |
+| FP32 **重算**对照行 | 无（现有 `--target-rope cpu_fp32` 是 RoPE 口径，非"该位置 logits 的 FP32 重算"） | ❌ **缺** |
+| 两次重复上"并列是否同样出现" | 只有 token 层面的两次一致性 | ❌ **缺**（需要每侧每位置的行） |
+| 两侧完整序列 / 停止原因 / work 统计 | GB6 运行侧字段 | ✅ **已有**（AR 按 decode steps / target calls 记，不填造接受率） |
+| 标签 + 判据出处（TIE-A/B/C + 依据） | 无 | ❌ **缺**（本轮**不实现**：在无对侧证据时标签只能恒为 TIE-C） |
+| 并列频率描述统计 | 需全位置的行 | ❌ **缺**（依赖下面的补证） |
+
+**最小补证方案（**待批准、本轮不实施**；任何一项都不得改动生产推理路径的数值行为）**
+* **P-1 serial 侧决策行（必需）**：在 serial oracle 运行器上加**可选、只读**的"决策行捕获"（如 `SO_CAPTURE_ROWS=1`），
+  把该 run **每一步** target 已算出的 logits 行**按原 dtype 原样**存 side-car（≤64 步 × 词表；bf16 约 20 MB/run），
+  并记录 `arm="serial"`、`dtype`、位置索引、cache 长度。**只读已算出的张量，不改变任何计算**；
+  需以"开启/关闭捕获两次跑出相同 token"来证明无副作用（CPU 侧可先用 Stage 0 类自测覆盖开关逻辑）。
+* **P-2 production 侧决策行（必需）**：在 harness 里同法捕获块验证行（每轮 `M=4` 的第 i 行，即判定 d_{i+1} 的那一行），
+  记 `arm="production"`；同样只读、同样以确定性复跑验证。
+* **P-3 诊断工具的自我标注（低成本）**：`correctness_protocol_margins` 的记录里显式写
+  `arm="ar_reconstruction"`、`dtype`、`cache_len_after_source="reconstructed"`，避免被误读成 serial/production 的行；
+  并增加 `tied_token_ids`（并列成员）。
+* **P-4 FP32 重算对照（可选）**：同一位置用 FP32 **重新前向**（不是 cast 已有 bf16 结果）产出一行，作为"真语义并列 vs BF16 舍入"的解释证据。
+* **在 P-1/P-2 落地之前**：T-2 的双侧分类**一律记 TIE-C（证据不足）**，只报告 **AR 侧** `tied_at_max` 作为**线索**；
+  **不得**据此判 TIE-A、**不得**据此豁免 Gate A。
+* **时序要求**：若小组希望 Stage 2b 的结果里带上双侧并列分类，则 **P-1/P-2 必须在跑 Stage 2b 之前**批准并实现
+  （事后无法从已落盘产物补出对侧决策行）；若不带，则本阶段并列一律记 TIE-C，Stage 2b 仍可照常按严格门判决。
 
 ## 2. 运行准入条件（**不是**协议批准，但缺一不可；需你同意执行顺序）
 
@@ -147,6 +188,8 @@
 4. **D-5 / D-6 / D-7 / D-9**：D-5 是否两条轨迹都评；D-6 是否批准"FP8 各自做 Gate A"；D-7 是否保留词条；D-9 是否同意不重复 FP32。
 5. **§1A 精确并列处置规则（可记为 D-10）**：是否批准"**默认阻断、TIE-A 不自动豁免**"？若希望"TIE-A 不阻断"，请明示这属于**放宽冻结判据**（须与 D-8 同批、且只能在看到结果前定稿）。
 6. **执行准入**：是否同意 E-1（**先做 F09 单 family 端到端诊断核验**，失败即停）+ E-2/E-3/E-4 的运行纪律？
+7. **并列双侧分类的补证（T-6 的 P-1/P-2）**：是否**在 Stage 2b 之前**批准并实现"决策行捕获"（serial 与 production 两侧）？
+   若**不**批准，本阶段的并列**一律记 TIE-C（证据不足）**，只报 AR 侧 `tied_at_max` 作为线索 —— Stage 2b 仍可按严格门照常判决。
 
 ## 4. 获批后的执行序列（**本轮全部未执行**）
 
@@ -167,17 +210,19 @@
 3. **诊断 GPU 分支未验证**（E-1）⇒ 若首个 family 核验失败，Stage 2b 的 GB6 记账无法补齐，判决将停在 `CHECK_NEEDS_REVIEW`（这是正确行为，不是放行）。
 4. **历史 F13 的两套口径并存**：16 项口径的历史 PASS 保留（旧聚合器 `--scope final` 仍复现），18 项（含 D6）新口径给出 FAIL。Stage 2b 必须**重跑** serial，不得用历史产物充当新判据证据。
 5. **单次运行的环境脆弱性**：commit 可用 20.3 GiB vs 16 GiB 安全线，margin 约 +4.3 GiB；若后台占用上升会被环境门正确拒绝（记录为"环境拒绝"，不计数值失败，但会造成必需重复缺失 ⇒ 判决 `CHECK_NEEDS_REVIEW`）。
-6. **编号覆盖已收紧，但仍依赖"产物即证据"**：`stage_check` 现在要求每个请求模式**恰好** `rep1..rep2` 各一份（两个 `rep1` / `rep1+rep3` / 同一产物计入两次 / 缺号 ⇒ 一律 STOP，不返回 OK）。这只是"记录层"的防线：**它不能证明 GPU 真的独立跑了两次**（同一 run 被复制成两个文件名，在记录层无法与"两次一致"区分）⇒ 核对仍依赖 `so_batch` 的逐 run 日志与 `run_id` 唯一性人工复核。
+6. **编号覆盖已收紧，但仍依赖"产物即证据"**：`stage_check` 现在要求每个请求模式**恰好** `rep1..rep2` 各一份（两个 `rep1` / `rep1+rep3` / 同一产物计入两次 / 缺号 / **`rep` 非法值** ⇒ 一律 STOP，不返回 OK，且**不崩溃**）。这只是"记录层"的防线：**它不能证明 GPU 真的独立跑了两次**（同一 run 被复制成两个文件名，在记录层无法与"两次一致"区分）⇒ 核对仍依赖 `so_batch` 的逐 run 日志与 `run_id` 唯一性人工复核。
+7. **并列双侧分类当前不可判**（T-6）：诊断工具只重建 **AR 口径**的决策行，缺 serial / production 的实际决策行 ⇒ TIE-A/TIE-B 记 TIE-C；若小组要双侧分类，**必须在 Stage 2b 之前**批准并实现 T-6 的 P-1/P-2（事后无法补）。
 
 ## 6. 修改文件与测试清单（本轮）
 
-**修改**：`specdec/engine/stage_check.py`（新增 `_rep_coverage()` 并把编号覆盖独立成一层；移除只看份数的 `len(mrows) < reps`）·
-`specdec/engine/stage_check_selftest_cpu.py`（**新增**，22 项）· 本文件（D-1/D-8 表述强化 + §1A 并列规则 + §0/§3/§5/§6 更新）。
+**修改**：`specdec/engine/stage_check.py`（`_rep_coverage()` 编号覆盖独立成层；`rep` 非法值走**明确 STOP** 而非崩溃）·
+`specdec/engine/stage2b_verdict.py`（新增共享的 `_as_rep()` / `_rep_sort_key()`，修掉 4 处未保护的 `int(rep)`；非法 `rep` 单列报出并阻断）·
+`specdec/engine/stage_check_selftest_cpu.py`（22 → **28** 项：新增 N8 非法 `rep`、V5 非法 `rep` 判决）· 本文件（T-1/T-2/T-3 技术表述修正 + **T-6 字段审计与最小补证方案** + §0/§3/§5/§6 更新）。
 **测试清单（本轮实跑，全部 exit 0）**：
 
 | 命令 | 结果 |
 | --- | --- |
-| `python -X utf8 -m specdec.engine.stage_check_selftest_cpu` | **22/0**（N1–N7 + V1–V4） |
+| `python -X utf8 -m specdec.engine.stage_check_selftest_cpu` | **28/0**（N1–N8 + V1–V5） |
 | `python -X utf8 -m specdec.engine.stage2b_verdict_selftest_cpu` | **92/0**（既有判决不受影响） |
 | `python -X utf8 -m specdec.engine.verify_family_independence_cpu` | **31/0** |
 | `python -X utf8 -m specdec.engine.serial_oracle_aggregate_selftest_cpu` | **21/0** |
@@ -186,7 +231,7 @@
 | `python -X utf8 -m specdec.engine.stage_check --tag div8209_p2 --family F09 …` | **PENDING(2)** |
 | `python -X utf8 -m specdec.engine.stage2b_preflight_cpu` | **exit 3**（F09/F03/F11/F04 未登记，待 D-3） |
 
-**未执行**：任何 GPU 运行、任何 family 登记、任何冻结判据修改、任何历史结论覆盖。
+**未执行**：任何 GPU 运行、任何 family 登记、任何冻结判据修改、任何历史结论覆盖、任何生产推理路径改动。
 
 ---
 

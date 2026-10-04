@@ -16,7 +16,8 @@
 | N5 | 加载器把同一份产物返回两次（模拟重复计入） | STOP(1)，含"同一产物被重复计入" |
 | N6 | 直接单测 `_rep_coverage`（含 `rep` 字段缺失/非法） | 各自报出对应问题 |
 | N7 | 某模式 0 份产物 | 仍为 **PENDING(2)**（"未跑"不等于"编号错"，语义不能被改坏） |
-| V1–V4 | 用**同一批夹具**跑 `stage2b_verdict.evaluate()` | 既有判决**不受影响**：齐全 ⇒ PASS；N2/N3/N4 三种 ⇒ `CHECK_NEEDS_REVIEW` |
+| N8 | `rep='bad'`（非法值） | **不崩溃**、判 **STOP(1)** 并点名非法 `rep`（旧实现在 `int('bad')` 处抛 `ValueError`） |
+| V1–V5 | 用**同一批夹具**跑 `stage2b_verdict.evaluate()` | 既有判决**不受影响**：齐全 ⇒ PASS；N2/N3/N4/N8 四种 ⇒ `CHECK_NEEDS_REVIEW` |
 
 夹具复用 `stage2b_verdict_selftest_cpu` 的合成产物构造器（临时目录；**绝不触碰真实产物**）。
 """
@@ -141,9 +142,31 @@ def main() -> int:
         ck("N6_rep1加rep3报缺号与越界",
            any("缺 rep2" in x for x in p_13) and any("预登记之外的编号 [3]" in x for x in p_13), p_13)
         p_bad = SC._rep_coverage([dict(rep=None, file="a.json"), dict(rep=2, file="b.json")], reps=2)
-        ck("N6_rep缺失或非法被报出", any("缺失或非法" in x for x in p_bad), p_bad)
+        ck("N6_rep缺失或非法被报出", any("非法或缺失" in x for x in p_bad), p_bad)
         p_same = SC._rep_coverage([dict(rep=1, file="a.json")] * 2, reps=2)
         ck("N6_同一文件名两次被报出", any("同一产物被重复计入" in x for x in p_same), p_same)
+
+        # ---------- N8：`rep='bad'`（非法值）⇒ 明确 STOP 原因，**不得抛 ValueError** ----------
+        # 旧实现：`_rep_coverage` 内第二次 `int(raw)` 与 `main()` 的排序键都会崩。
+        recs_bad = FIX._full_set(FIX.TAG_GOOD)
+        for r in recs_bad:
+            if (r.get("case"), r.get("mode"), int(r.get("rep") or 0)) == (FAM, "ar", 2):
+                r["rep"] = "bad"                      # 非法编号；文件名会变成 ..._repbad_...
+        d8 = tmp / "n8"; d8.mkdir()
+        FIX._write(d8, recs_bad)
+        crash8 = None
+        try:
+            rc8, out8 = _run_main(_argv(d8, modes="ar"))
+        except Exception as e:                        # noqa: BLE001
+            crash8, rc8, out8 = f"{type(e).__name__}: {e}", None, ""
+        ck("N8_非法rep不崩溃", crash8 is None, crash8)
+        ck("N8_非法rep判STOP而非OK", rc8 == 1 and "结论 = STOP" in out8, (rc8, out8[-260:]))
+        ck("N8_理由点名非法rep", "非法或缺失" in out8 and "'bad'" in out8, out8[-400:])
+        p_bad_str = SC._rep_coverage([dict(rep="bad", file="a.json")], reps=2)
+        ck("N8_单测非法rep可解析出问题（不抛异常）",
+           any("非法或缺失" in x for x in p_bad_str), p_bad_str)
+        ck("N8_单测同时报缺号",
+           any("缺 rep1" in x for x in p_bad_str) and any("缺 rep2" in x for x in p_bad_str), p_bad_str)
 
         # ---------- N7：某模式 0 份产物 ⇒ 仍是 PENDING(2) ----------
         d7 = tmp / "n7"; d7.mkdir()
@@ -167,6 +190,10 @@ def main() -> int:
         ck("V4_缺rep2仍被判缺运行",
            sV4["decision"] == "CHECK_NEEDS_REVIEW"
            and any("缺运行" in x for x in sV4["needs_review"]), sV4["needs_review"][:3])
+        sV5 = SV.evaluate(FIX.TAG_GOOD, list(FIX.NEW), list(FIX.MODES), FIX.REPS, outdir=d8)
+        ck("V5_非法rep不崩溃且判需复核",
+           sV5["decision"] == "CHECK_NEEDS_REVIEW"
+           and any("rep 字段非法" in x for x in sV5["needs_review"]), sV5["needs_review"][:3])
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
