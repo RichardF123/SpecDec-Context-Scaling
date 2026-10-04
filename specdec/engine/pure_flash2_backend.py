@@ -221,57 +221,120 @@ _ORIG_SPEC_CHECK = spec_cache.check_consistent
 def pure_flash2_context(*models, max_seqlen: int):
     """Temporarily route enabled model attention through official FA2.
 
-    The repository source is not edited.  On exit all class/module functions
-    are restored.
+    The repository source is not edited.  On exit the monkeypatches and each
+    model/layer execution configuration are restored to their exact entry
+    state, including KV format, cache backend, page size, and paged-attention
+    mode.
     """
     if max_seqlen <= 0:
         raise ValueError("max_seqlen must be positive")
 
     original_forward = model_self.SelfAttention.forward
+    original_spec_cache = (
+        spec_cache.cache_length,
+        spec_cache.cache_device,
+        spec_cache.trim_cache,
+        spec_cache.check_consistent,
+    )
 
-    # Each enabled SelfAttention keeps a private pointer to the forward that
-    # existed before this context.  This also works if Phase13 is currently
-    # installed in the repo.
-    enabled = []
-    for model in models:
-        model.set_kv_format("fp16")
-        model.set_cache_backend("contiguous")
-        try:
-            model.set_paged_attention_mode("off")
-        except Exception:
-            pass
-        for layer in model.layers:
-            a = layer.self_attn
-            a._pure_flash2_enabled = True
-            a._pure_flash2_max_seqlen = int(max_seqlen)
-            a._pure_flash2_original_forward = original_forward.__get__(
-                a, type(a))
-            enabled.append(a)
-
-    model_self.SelfAttention.forward = _flash_forward
-    spec_cache.cache_length = _flash_cache_length
-    spec_cache.cache_device = _flash_cache_device
-    spec_cache.trim_cache = _flash_trim_cache
-    spec_cache.check_consistent = _flash_check_consistent
+    # Snapshot both model-level and layer-level execution state before forcing
+    # the temporary contiguous BF16/FP16 FA2 configuration.  Layer snapshots
+    # make restoration exact even if a caller had manually customized a layer.
+    model_states = []
+    seen_models = set()
 
     try:
+        for model in models:
+            marker = id(model)
+            if marker in seen_models:
+                continue
+            seen_models.add(marker)
+
+            layer_states = []
+            for layer in model.layers:
+                a = layer.self_attn
+                runtime_attrs = {}
+                for name in (
+                    "_pure_flash2_enabled",
+                    "_pure_flash2_max_seqlen",
+                    "_pure_flash2_original_forward",
+                ):
+                    if hasattr(a, name):
+                        runtime_attrs[name] = (True, getattr(a, name))
+                    else:
+                        runtime_attrs[name] = (False, None)
+
+                layer_states.append({
+                    "attn": a,
+                    "kv_format": a.kv_format,
+                    "cache_backend": a.cache_backend,
+                    "cache_page_size": a.cache_page_size,
+                    "paged_attention_mode": a.paged_attention_mode,
+                    "runtime_attrs": runtime_attrs,
+                })
+
+            model_states.append({
+                "model": model,
+                "kv_format": model.kv_format,
+                "cache_backend": model.cache_backend,
+                "cache_page_size": model.cache_page_size,
+                "paged_attention_mode": model.paged_attention_mode,
+                "layers": layer_states,
+            })
+
+            model.set_kv_format("fp16")
+            model.set_cache_backend("contiguous")
+            model.set_paged_attention_mode("off")
+
+            for state in layer_states:
+                a = state["attn"]
+                a._pure_flash2_enabled = True
+                a._pure_flash2_max_seqlen = int(max_seqlen)
+                a._pure_flash2_original_forward = original_forward.__get__(
+                    a, type(a))
+
+        model_self.SelfAttention.forward = _flash_forward
+        spec_cache.cache_length = _flash_cache_length
+        spec_cache.cache_device = _flash_cache_device
+        spec_cache.trim_cache = _flash_trim_cache
+        spec_cache.check_consistent = _flash_check_consistent
+
         yield
     finally:
+        # Restore module/class monkeypatches to the exact functions present on
+        # entry, then restore every model and layer field changed above.
         model_self.SelfAttention.forward = original_forward
-        spec_cache.cache_length = _ORIG_SPEC_CACHE_LENGTH
-        spec_cache.cache_device = _ORIG_SPEC_CACHE_DEVICE
-        spec_cache.trim_cache = _ORIG_SPEC_TRIM
-        spec_cache.check_consistent = _ORIG_SPEC_CHECK
-        for a in enabled:
-            a._pure_flash2_enabled = False
-            for name in (
-                "_pure_flash2_max_seqlen",
-                "_pure_flash2_original_forward",
-            ):
-                try:
-                    delattr(a, name)
-                except AttributeError:
-                    pass
+        (
+            spec_cache.cache_length,
+            spec_cache.cache_device,
+            spec_cache.trim_cache,
+            spec_cache.check_consistent,
+        ) = original_spec_cache
+
+        for state in reversed(model_states):
+            model = state["model"]
+            model.kv_format = state["kv_format"]
+            model.cache_backend = state["cache_backend"]
+            model.cache_page_size = state["cache_page_size"]
+            model.paged_attention_mode = state["paged_attention_mode"]
+
+            for layer_state in state["layers"]:
+                a = layer_state["attn"]
+                a.kv_format = layer_state["kv_format"]
+                a.cache_backend = layer_state["cache_backend"]
+                a.cache_page_size = layer_state["cache_page_size"]
+                a.paged_attention_mode = layer_state["paged_attention_mode"]
+
+                for name, (existed, value) in layer_state[
+                    "runtime_attrs"
+                ].items():
+                    if existed:
+                        setattr(a, name, value)
+                    else:
+                        try:
+                            delattr(a, name)
+                        except AttributeError:
+                            pass
 
 
 def pure_flash_cache_payload_bytes(cache) -> int:
