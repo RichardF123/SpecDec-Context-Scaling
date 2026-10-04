@@ -87,6 +87,47 @@ def _gate_serial(fam: str, rows: list, *, reps: int, ar_ref=None) -> list:
     return reasons
 
 
+def _rep_coverage(mrows: list, *, reps: int) -> list:
+    """核对**重复编号的精确覆盖**：请求的每个模式必须**恰好**是 `rep1..rep{reps}`，各一份。
+
+    ⚠️ 缺陷（本轮修复）：旧实现只有一条 `len(mrows) < reps` 检查 ⇒ 下面三种都**能返回 OK**：
+      * 两个 `rep1`（份数仍 = 2，长度检查看不见）；
+      * `rep1 + rep3`（份数 = 2，且 rep3 不在预登记集合里）；
+      * 同一份产物被计入两次（文件名相同）。
+    本函数按"编号集合 + 计数 + 产物身份"三层核对，返回问题清单（空 = 通过）：
+      ① **多个同号**：某个 `rep` 有 ≥2 份不同产物；
+      ② **缺号**：某个 `rep` 一份也没有；
+      ③ **越界/非法号**：出现 `rep1..rep{reps}` 之外的编号，或 `rep` 缺失/非法；
+      ④ **产物身份重复**：同一文件名在本次核对里出现两次。
+    """
+    want = list(range(1, int(reps) + 1))
+    problems: list = []
+    seen: list = []
+    for r in mrows:
+        raw = r.get("rep")
+        try:
+            seen.append(int(raw))
+        except (TypeError, ValueError):
+            problems.append(f"rep 字段缺失或非法：{raw!r}（文件 {r.get('file')}）")
+            seen.append(0)
+    for rep in want:
+        got = [r for r in mrows if int(r.get("rep") or 0) == rep]
+        if not got:
+            problems.append(f"缺 rep{rep} ⇒ 不能判 OK（预登记要求每个模式恰有 "
+                            f"rep1..rep{int(reps)} 各一份；若确为该阶段尚未跑完，请补齐后再核对）")
+        elif len(got) > 1:
+            problems.append(f"rep{rep} 有 {len(got)} 份产物 ⇒ **重复编号**："
+                            f"{[g.get('file') for g in got]}")
+    extra = sorted({s for s in seen if s not in want})
+    if extra:
+        problems.append(f"出现预登记之外的编号 {extra}（只允许 rep1..rep{int(reps)}）")
+    files = [r.get("file") for r in mrows]
+    dup = sorted({f for f in files if files.count(f) > 1})
+    if dup:
+        problems.append(f"同一产物被重复计入：{dup}")
+    return problems
+
+
 def _show(mode: str, rows: list, *, reps: int, ar_ref, reasons: list, notices: list | None = None) -> None:
     print(f"   [{mode}] {len(rows)}/{reps} 次；硬门={'通过' if not reasons else '**失败**'}")
     for r in rows:
@@ -162,9 +203,9 @@ def main() -> int:
             reasons, notices = _gate_serial(fam, mrows, reps=a.reps, ar_ref=ar_ref), []
         else:
             reasons, notices = [f"未知模式 {mode!r}"], []
+        # ⚠️ **编号覆盖**独立成一层：份数够不代表编号对（两个 rep1 / rep1+rep3 / 同一产物计入两次）
+        reasons = reasons + _rep_coverage(mrows, reps=a.reps)
         _show(mode, mrows, reps=a.reps, ar_ref=ar_ref, reasons=reasons, notices=notices)
-        if len(mrows) < int(a.reps):
-            reasons = reasons + [f"次数不足：{len(mrows)} < {a.reps}"]
         for x in reasons:
             problems.append(f"{mode}: {x}")
 
