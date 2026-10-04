@@ -73,7 +73,8 @@ def _flash_forward(self, x, cos, sin, cache=None):
         from flash_attn import flash_attn_with_kvcache
     except Exception as exc:
         raise RuntimeError(
-            "official flash-attn is not importable; run ensure_flash_attn2.py"
+            "official flash-attn is not importable; install a compatible "
+            "optional flash-attn package for this CUDA/PyTorch environment"
         ) from exc
 
     b, s, _ = x.shape
