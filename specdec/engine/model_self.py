@@ -115,9 +115,11 @@ _PAGED_ATTENTION_STATS: dict | None = None
 def _fresh_paged_attention_stats() -> dict:
     return {
         "direct_cuda_calls": 0,
+        "flash_paged_cuda_calls": 0,
         "materialized_cuda_calls": 0,
         "fallback_materialize_calls": 0,
         "direct_by_phase": {},
+        "flash_paged_by_phase": {},
         "materialized_by_phase": {},
         "fallback_by_phase": {},
     }
@@ -144,6 +146,9 @@ def _record_paged_attention(kind: str, phase: str) -> None:
     if kind == "direct_cuda":
         st["direct_cuda_calls"] += 1
         bucket = st["direct_by_phase"]
+    elif kind == "flash_paged_cuda":
+        st["flash_paged_cuda_calls"] += 1
+        bucket = st["flash_paged_by_phase"]
     elif kind == "materialized_cuda":
         st["materialized_cuda_calls"] += 1
         bucket = st["materialized_by_phase"]
@@ -476,7 +481,8 @@ class SelfAttention(nn.Module):
             )
 
             if paged_cuda_block and self.paged_attention_mode in ("direct_cuda", "flash_paged_cuda"):
-                _record_paged_attention("direct_cuda", _ATTENTION_PHASE)
+                _record_paged_attention(
+                    self.paged_attention_mode, _ATTENTION_PHASE)
                 k_all = None
                 v_all = None
             else:
