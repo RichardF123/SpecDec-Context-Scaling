@@ -245,3 +245,137 @@ def paged_attention_block(
         )
 
     raise ValueError(f"unsupported paged cache format {layer['fmt']!r}")
+
+
+def phase12_paged_attention_h2o(q, layer, *, validate=True):
+    """Experimental direct paged attention + H2O mass capture."""
+    import torch
+    from specdec.engine import paged_cache
+    if validate:
+        paged_cache.check_consistent(layer)
+    if q.ndim != 4 or not (1 <= int(q.shape[2]) <= 4):
+        raise ValueError("q must be [B,H,S,D], 1<=S<=4")
+    if not q.is_cuda or q.dtype != torch.bfloat16:
+        raise ValueError("Phase12 H2O capture requires CUDA BF16 q")
+    length=paged_cache.logical_length(layer)
+    page=int(layer["page_size"])
+    kv=int(layer["k_pages"][0].shape[1])
+    from .build import load
+    mod=load()
+    if layer["fmt"]=="fp16":
+        kp,vp=paged_cache.cuda_pointer_tables(layer,validate=False)
+        pair=mod.phase12_paged_attention_h2o_bf16(
+            q.contiguous(),kp,vp,kv,page,length)
+    elif layer["fmt"]=="v_fp8":
+        kp,vp,sp=paged_cache.cuda_pointer_tables_vfp8(layer,validate=False)
+        groups=int(layer["v_scale_pages"][0].shape[-1])
+        pair=mod.phase12_paged_attention_h2o_vfp8(
+            q.contiguous(),kp,vp,sp,kv,page,length,groups)
+    else:
+        raise ValueError(f"unsupported fmt {layer['fmt']!r}")
+    return pair[0],pair[1]
+
+
+def phase12_paged_compact(src, dst, indices):
+    """Copy selected resident payload directly page-to-page."""
+    import torch
+    from specdec.engine import paged_cache
+    if src["fmt"] != dst["fmt"]:
+        raise ValueError("src/dst fmt mismatch")
+    if indices.ndim!=1 or indices.dtype!=torch.long or not indices.is_cuda:
+        raise ValueError("indices must be CUDA rank-1 torch.long")
+    first=src["k_pages"][0]
+    if first.dtype != torch.bfloat16:
+        raise ValueError("Phase12 compaction requires BF16 K")
+    B,KV,_,D=map(int,first.shape)
+    page=int(src["page_size"])
+    from .build import load
+    mod=load()
+    if src["fmt"]=="fp16":
+        sk,sv=paged_cache.cuda_pointer_tables(src,validate=False)
+        dk,dv=paged_cache.cuda_pointer_tables(dst,validate=False)
+        mod.phase12_paged_compact_bf16(
+            sk,sv,dk,dv,indices.contiguous(),B,KV,D,page)
+    elif src["fmt"]=="v_fp8":
+        sk,sv,ss=paged_cache.cuda_pointer_tables_vfp8(src,validate=False)
+        dk,dv,ds=paged_cache.cuda_pointer_tables_vfp8(dst,validate=False)
+        groups=int(src["v_scale_pages"][0].shape[-1])
+        mod.phase12_paged_compact_vfp8(
+            sk,sv,ss,dk,dv,ds,indices.contiguous(),
+            B,KV,D,groups,page)
+    else:
+        raise ValueError(f"unsupported fmt {src['fmt']!r}")
+    return dst
+
+
+def phase13_flash_paged_attention(q, layer, *, validate=True):
+    """Page-native GQA-aware tiled online-softmax attention, q_len=1..4.
+
+    This is an experimental Flash-style route.  It keeps K/V paged and shares
+    each K/V tile across query heads that map to the same KV head.
+    """
+    import torch
+    from specdec.engine import paged_cache
+
+    if validate:
+        paged_cache.check_consistent(layer)
+
+    if not paged_cache.is_paged_layer(layer):
+        raise TypeError("phase13 Flash-paged attention requires paged_v0")
+
+    if q.ndim != 4 or not (1 <= int(q.shape[2]) <= 4):
+        raise ValueError("q must be [B,H,S,D] with q_len 1..4")
+
+    if not q.is_cuda or q.dtype != torch.bfloat16:
+        raise ValueError("phase13 Flash-paged attention requires CUDA BF16 q")
+
+    length = paged_cache.logical_length(layer)
+    page_size = int(layer["page_size"])
+    first_k = layer["k_pages"][0]
+    kv_heads = int(first_k.shape[1])
+
+    if int(q.shape[1]) % kv_heads != 0:
+        raise ValueError("query heads must be divisible by KV heads")
+
+    from .build import load
+    mod = load()
+
+    if layer["fmt"] == "fp16":
+        if first_k.dtype != torch.bfloat16:
+            raise ValueError("BF16 Flash-paged path requires BF16 K")
+        if layer["v_pages"][0].dtype != torch.bfloat16:
+            raise ValueError("BF16 Flash-paged path requires BF16 V")
+        kp, vp = paged_cache.cuda_pointer_tables(layer, validate=False)
+        return mod.phase13_flash_paged_bf16(
+            q.contiguous(),
+            kp,
+            vp,
+            kv_heads,
+            page_size,
+            length,
+        )
+
+    if layer["fmt"] == "v_fp8":
+        if first_k.dtype != torch.bfloat16:
+            raise ValueError("V-FP8 Flash-paged path requires BF16 K")
+        if layer["v_pages"][0].dtype != torch.float8_e4m3fn:
+            raise ValueError("V-FP8 Flash-paged path requires E4M3FN V")
+        scale = layer["v_scale_pages"][0]
+        if scale.dtype != torch.float32:
+            raise ValueError("V-FP8 Flash-paged path requires FP32 scale")
+        groups = int(scale.shape[-1])
+        kp, vp, sp = paged_cache.cuda_pointer_tables_vfp8(
+            layer, validate=False)
+        return mod.phase13_flash_paged_vfp8(
+            q.contiguous(),
+            kp,
+            vp,
+            sp,
+            kv_heads,
+            page_size,
+            length,
+            groups,
+        )
+
+    raise ValueError(
+        f"unsupported paged cache format {layer['fmt']!r}")

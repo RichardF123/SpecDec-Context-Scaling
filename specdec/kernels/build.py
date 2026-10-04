@@ -42,6 +42,8 @@ def load():
             str(src / "swiglu.cu"),
             str(src / "attention.cu"),
             str(src / "paged_attention.cu"),
+            str(src / "phase12_h2o_opt.cu"),
+            str(src / "phase13_flash_paged.cu"),
         ],
         extra_include_paths=[str(src)],
         extra_cflags=["-O3"],
