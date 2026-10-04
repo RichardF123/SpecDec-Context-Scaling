@@ -117,12 +117,18 @@ def _manifest_token_sha1(family: str, *, ctx: int = 8192) -> str | None:
 def _as_rep(v):
     """把 `rep` 解析成整数；**不可解析返回 None**（绝不抛异常）。
 
-    ⚠️ 缺陷（本轮修复）：判决工具与逐阶段核对器原先都在多处 `int(r.get("rep") or 0)`；
+    ⚠️ 缺陷（前一轮修复）：判决工具与逐阶段核对器原先都在多处 `int(r.get("rep") or 0)`；
     一旦记录里 `rep` 是非法值（如字符串 `'bad'`）就直接抛 `ValueError` ⇒ **工具崩溃**，
     而不是给出明确的"编号非法 ⇒ 不得判 PASS / 判 STOP"。
-    规则（单一实现来源，`stage_check` 直接复用本函数以避免两处口径漂移）：
-    只接受 `int`（**排除 `bool`**）与纯数字字符串；`float`/`None`/其它类型一律视为不可解析
-    （`int(1.5)` 会静默截断成 1，故不接受 float）。
+    ⚠️ 缺陷（本轮修复，边界）：旧版用 `s.isdigit()` 做门，但 `isdigit()` 为真**并不保证**
+    `int()` 能解析 —— 上标/特殊数字（`'²'`、`'³'`）`isdigit()` 为真而 `int()` 抛 `ValueError`
+    ⇒ 解析器自身又变成崩溃点。同时 `'٣'`（阿拉伯-印度数字）、`'１'`（全角）会被 `isdigit()`
+    放行并被 `int()` 接受成 3 / 1 ⇒ **编号口径不唯一**（同一个"3"有多种写法）。
+    现行规则（**只接受 ASCII 数字组成的合法整数表示**）：
+      * `int` 且**排除 `bool`**；或字符串（允许首尾空白，允许前导 `-`）**全部由 ASCII 数字组成**；
+      * 其它一律 `None`：`float`（`int(1.5)` 会静默截断）、`None`、`'²'`、`'٣'`、`'１'`、`'+1'`、
+        `'1.0'`、`''`、`'一'`、`' 1 2 '` 等。
+    单一实现来源：`stage_check` 直接复用本函数，避免两处口径漂移。
     """
     if isinstance(v, bool) or v is None:
         return None
@@ -130,7 +136,9 @@ def _as_rep(v):
         return v
     if isinstance(v, str):
         s = v.strip()
-        if s.isdigit() or (s.startswith("-") and s[1:].isdigit()):
+        body = s[1:] if s.startswith("-") else s
+        # `isascii()` 必须先判：`'²'.isdigit()` 为真但 `int('²')` 抛 ValueError
+        if body and body.isascii() and body.isdigit():
             return int(s)
     return None
 

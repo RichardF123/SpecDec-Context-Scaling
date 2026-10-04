@@ -1,6 +1,7 @@
 # Stage 2b 待批准决策单（2026-10-04）
 
 > **本单是"请求批准"，不是批准结果。** 工具自测通过 = 工具证据，**不等于**协议批准。
+> **签署用的一页版**：`docs/stage2b_approval_record_2026-10-04.md`（逐项推荐 + 后果 + 谁阻断什么）。
 > 提交本单时：**未运行任何 GPU 步骤**、未改任何冻结判据、未覆盖任何历史 FAIL/CHECK/PASS。
 > 逐项推荐的完整论证见 `docs/protocol_decision_brief_2026-10-04.md`；本单只给"决策 + 影响 + 风险"。
 
@@ -11,8 +12,8 @@
 | 预检 | `python -X utf8 -m specdec.engine.stage2b_preflight_cpu` | **exit 3** → `PREFLIGHT_OK_TOOLS_BUT_FAMILIES_UNREGISTERED`；F09/F03/F11/F04 四项均 `会被判越界=True` |
 | 治理守卫 | `python -X utf8 -m specdec.engine.verify_family_independence_cpu` | **31/0**；其中两条相关检查为 `Stage 2b 工具的源码里只有'已授权 ∪ 候选'的 family 字面量`、`Stage 2b 候选 family **尚未被任何 run 消费**（D-3 批准前不得跑）` |
 | 环境门 | `python -X utf8 -m specdec.engine.serial_oracle_env_check` | **ENVIRONMENT_OK**；commit 可用 20.3 GiB ≥ 安全线 16 GiB；入口 free 20.31 GiB ≥ 18 GiB（margin +2.31） |
-| 工具自测（**仅工具证据**） | 8 个 CPU 自测 | 合计 **282/0**（verdict 92 · diag 25 · **stage_check 28** · agg 21 · guard 31 · audit 19 · env 24 · stage0 42） |
-| 编号覆盖反例（已修） | `stage_check_selftest_cpu` | 两个 `rep1` / `rep1+rep3` / 同一产物计入两次 / 缺 `rep2` / **`rep='bad'`（非法值，旧实现崩溃）** ⇒ 均**不得 OK**；同一批夹具下 `stage2b_verdict` 既有判决**不变**（V1–V5） |
+| 工具自测（**仅工具证据**） | 8 个 CPU 自测 | 合计 **289/0**（verdict 92 · diag 25 · **stage_check 35** · agg 21 · guard 31 · audit 19 · env 24 · stage0 42） |
+| 编号覆盖反例（已修） | `stage_check_selftest_cpu` | 两个 `rep1` / `rep1+rep3` / 同一产物计入两次 / 缺 `rep2` / **非法 `rep`（`'bad'`、上标 `'²'`、Unicode 数字 `'٣'`/`'１'`）** ⇒ 均**不得 OK** 且**不崩溃**；同一批夹具下 `stage2b_verdict` 既有判决**不变**（V1–V6） |
 | 历史产物只读复核 | AR vs production 首分歧 | 输出下标 **47**（旧实现误取末位 63）；运行侧 GB6 字段全齐，仍缺 5 个诊断字段 |
 
 **结论：GPU 阶段被"协议未批准"硬阻断；工具侧不再是阻断项。**
@@ -135,6 +136,12 @@
 
 **T-6 "规则所需证据 vs 当前工具实际产出"字段审计（本轮完成；结论：双侧分类暂不可判）**
 
+> **⚠️ 本轮决定记录（2026-10-04，待小组确认）：不扩展并列诊断范围。**
+> 现有 **AR 单侧重建足以完成既定的 GB6 记账**（`ar_top1`/`ar_top2`/`margin`/`tied_at_max` + `cache_len_after`），
+> 但**不足以**判 **TIE-A/TIE-B**；在 P-1/P-2 获批并实现之前，凡**需要双侧证据**的分歧**一律记 TIE-C（证据不足）**。
+> **严格 exact-id 门不变、不自动豁免**：并列分类永远不会把 `SERIAL_ORACLE_FAIL` 变成 PASS。
+> 不为此改动任何生产推理路径，也不为此改运行器/harness（P-1/P-2 仍是"待批准"的可选项）。
+
 > **核心技术事实**：`correctness_protocol_margins` **只重建 AR 口径的决策行** —— 它按 AR 的方式走
 > （分块 prefill + 逐 token `M=1` 沿**该 run 的 token 序列**步进），在首分歧位置取 target 的最后一行 logits。
 > 它**不能**给出 **serial 运行**或 **production（`M=4`）块验证**在该位置的**实际决策行**：
@@ -216,13 +223,15 @@
 ## 6. 修改文件与测试清单（本轮）
 
 **修改**：`specdec/engine/stage_check.py`（`_rep_coverage()` 编号覆盖独立成层；`rep` 非法值走**明确 STOP** 而非崩溃）·
-`specdec/engine/stage2b_verdict.py`（新增共享的 `_as_rep()` / `_rep_sort_key()`，修掉 4 处未保护的 `int(rep)`；非法 `rep` 单列报出并阻断）·
-`specdec/engine/stage_check_selftest_cpu.py`（22 → **28** 项：新增 N8 非法 `rep`、V5 非法 `rep` 判决）· 本文件（T-1/T-2/T-3 技术表述修正 + **T-6 字段审计与最小补证方案** + §0/§3/§5/§6 更新）。
+`specdec/engine/stage2b_verdict.py`（共享 `_as_rep()` / `_rep_sort_key()`；**只接受 ASCII 数字组成的整数表示**，
+`'²'`/`'٣'`/`'１'` 等一律不可解析；修掉 7 处未保护的 `int(rep)`；非法 `rep` 单列报出并阻断）·
+`specdec/engine/stage_check_selftest_cpu.py`（22 → **35** 项：N8/N10 非法与上标 `rep`、N9 解析边界、V5/V6 判决回归）·
+`docs/stage2b_approval_record_2026-10-04.md`（**新增**，一页签署版）· 本文件（T-1/T-2/T-3 表述修正 + T-6 审计与"不扩展并列诊断范围"决定 + §0/§3/§5/§6 更新）。
 **测试清单（本轮实跑，全部 exit 0）**：
 
 | 命令 | 结果 |
 | --- | --- |
-| `python -X utf8 -m specdec.engine.stage_check_selftest_cpu` | **28/0**（N1–N8 + V1–V5） |
+| `python -X utf8 -m specdec.engine.stage_check_selftest_cpu` | **35/0**（N1–N10 + V1–V6） |
 | `python -X utf8 -m specdec.engine.stage2b_verdict_selftest_cpu` | **92/0**（既有判决不受影响） |
 | `python -X utf8 -m specdec.engine.verify_family_independence_cpu` | **31/0** |
 | `python -X utf8 -m specdec.engine.serial_oracle_aggregate_selftest_cpu` | **21/0** |

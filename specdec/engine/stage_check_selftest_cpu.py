@@ -168,6 +168,45 @@ def main() -> int:
         ck("N8_单测同时报缺号",
            any("缺 rep1" in x for x in p_bad_str) and any("缺 rep2" in x for x in p_bad_str), p_bad_str)
 
+        # ---------- N9：`_as_rep` 的**边界**——只接受 ASCII 数字组成的整数表示 ----------
+        # 旧版用 `isdigit()` 当门：`'²'.isdigit()` 为真但 `int('²')` 抛 ValueError ⇒ 解析器自崩；
+        # 且 `'٣'`/`'１'` 会被放行并解析成 3/1 ⇒ 编号口径不唯一。
+        acc = {"1": 1, "-1": -1, "01": 1, " 2 ": 2, "10": 10}
+        rej = {"²": None, "³": None, "½": None, "٣": None, "１": None, "一": None,
+               "+1": None, "1.0": None, "": None, "  ": None, "1 2": None, "0x2": None}
+        bad_acc = {k: SV._as_rep(k) for k, want in acc.items() if SV._as_rep(k) != want}
+        ck("N9_ASCII数字被正确接受", not bad_acc, bad_acc)
+        raised = {}
+        for k in rej:
+            try:
+                got = SV._as_rep(k)
+            except Exception as e:                                    # noqa: BLE001
+                got = f"RAISED:{type(e).__name__}"
+            if got is not None:
+                raised[k] = got
+        ck("N9_非ASCII数字/非法串返回None且不抛异常", not raised, raised)
+        typed = {repr(v): SV._as_rep(v) for v in (None, True, False, 1.5, [], {}, 2)}
+        ck("N9_类型边界（bool/float/None/容器）",
+           typed["True"] is None and typed["False"] is None and typed["None"] is None
+           and typed["1.5"] is None and typed["[]"] is None and typed["{}"] is None
+           and typed["2"] == 2, typed)
+
+        # ---------- N10：上标数字 `rep='²'` 端到端 ⇒ STOP，且**不崩溃** ----------
+        recs_sup = FIX._full_set(FIX.TAG_GOOD)
+        for r in recs_sup:
+            if (r.get("case"), r.get("mode"), int(r.get("rep") or 0)) == (FAM, "ar", 2):
+                r["rep"] = "²"
+        d10 = tmp / "n10"; d10.mkdir()
+        FIX._write(d10, recs_sup)
+        crash10 = None
+        try:
+            rc10, out10 = _run_main(_argv(d10, modes="ar"))
+        except Exception as e:                                        # noqa: BLE001
+            crash10, rc10, out10 = f"{type(e).__name__}: {e}", None, ""
+        ck("N10_上标数字rep不崩溃", crash10 is None, crash10)
+        ck("N10_上标数字rep判STOP", rc10 == 1 and "结论 = STOP" in out10, (rc10, out10[-240:]))
+        ck("N10_理由点名该非法值", "非法或缺失" in out10 and "²" in out10, out10[-360:])
+
         # ---------- N7：某模式 0 份产物 ⇒ 仍是 PENDING(2) ----------
         d7 = tmp / "n7"; d7.mkdir()
         FIX._write(d7, [r for r in FIX._full_set(FIX.TAG_GOOD) if r.get("mode") != "serial"])
@@ -194,6 +233,10 @@ def main() -> int:
         ck("V5_非法rep不崩溃且判需复核",
            sV5["decision"] == "CHECK_NEEDS_REVIEW"
            and any("rep 字段非法" in x for x in sV5["needs_review"]), sV5["needs_review"][:3])
+        sV6 = SV.evaluate(FIX.TAG_GOOD, list(FIX.NEW), list(FIX.MODES), FIX.REPS, outdir=d10)
+        ck("V6_上标数字rep不崩溃且判需复核",
+           sV6["decision"] == "CHECK_NEEDS_REVIEW"
+           and any("rep 字段非法" in x for x in sV6["needs_review"]), sV6["needs_review"][:3])
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
