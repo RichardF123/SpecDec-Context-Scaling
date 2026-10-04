@@ -53,6 +53,27 @@ See the [authoritative final closeout](docs/kv_optimization_final_closeout_2026-
 [4K/8K PagedAttention evidence](results/paged_attention_4k8k_2026-10-04/),
 and [H2O latency evidence](results/h2o_latency_2026-10-04/).
 
+Optimization execution addendum（2026-10-04）
+After the earlier KV closeout, three additional GPU experiment stages were
+completed and archived:
+- Phase12 optimized H2O execution with page-native compaction and kernel-
+  integrated score capture. It preserves the tested reference output/state and
+  materially reduces the old H2O implementation overhead, but optimized H2O
+  remains slower than standard direct SpecDec in this harness.
+- Phase13 adds an opt-in custom flash_paged_cuda route: a page-native,
+  GQA-aware tiled online-softmax CUDA kernel for q_len 1..4, including the
+  tested asymmetric V-FP8 target path. This is Flash-style custom CUDA, not
+  the official FlashAttention package.
+- A separate official FlashAttention-2 BF16 backend was tested with
+  preallocated contiguous KV via flash_attn_with_kvcache. It is the strongest
+  BF16 latency reference in this extension, but it is intentionally not paged
+  and does not claim V-FP8/H2O support.
+See
+[`docs/optimization_execution_addendum_2026-10-04.md`](docs/optimization_execution_addendum_2026-10-04.md)
+and [`results/optimization_results_index_2026-10-04.md`](results/optimization_results_index_2026-10-04.md).
+The formal frozen 6+2 course experiment and the separate production BF16
+AR/SpecDec strict-consistency issue are unchanged.
+
 ## 历史状态快照（2026-09-27）
 
 以下保留当时记录，后续状态以上方 2026-10-02 更新为准；其中“下一步”及 12 条件范围均为历史计划。
