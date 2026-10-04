@@ -94,6 +94,12 @@ upgrade the table into a claim that every repeat is faster. The strongest
 Phase13 result is that the page-native tiled kernel materially improves the old
 direct page traversal while preserving the tested output/statistics.
 
+The archived Phase13 `route_json` used the older telemetry bucket and counted
+both `direct_cuda` and `flash_paged_cuda` calls under `direct_cuda_calls`.
+The recorded `mode` and actual dispatch path remain authoritative for those
+historical runs. The integrated source now records `flash_paged_cuda` in its
+own counter and per-phase bucket; the immutable archive is not rewritten.
+
 ## 3. Pure official FlashAttention-2
 
 This is a separate BF16 backend using the official `flash-attn` package with a
@@ -126,9 +132,12 @@ contiguous FlashAttention inference backend.
 
 ## 4. Integration decision
 
-- **Keep Phase12 H2O execution changes** as the current H2O implementation.
-  They reduce reference overhead without changing the frozen policy, but H2O
-  remains slower than standard direct SpecDec in the tested implementation.
+- **Keep the Phase12 H2O execution changes as an opt-in optimized path.**
+  The public `spec_decode_greedy_h2o` defaults remain
+  `score_capture_mode="reference"` and `compaction_mode="reference"`.
+  The optimized path reduces reference overhead without changing the frozen
+  policy, but H2O remains slower than standard direct SpecDec in the tested
+  implementation.
 - **Keep Phase13 `flash_paged_cuda` as an opt-in paged route.** It supersedes
   the older direct kernel for the tested Flash-paged experiment but is still a
   custom kernel, not official FlashAttention.
