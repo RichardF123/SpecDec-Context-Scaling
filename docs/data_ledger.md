@@ -3694,3 +3694,129 @@ mismatch 轮 `trim` 后把保留区间 `pre..pre+m-1` **逐个单步重放**（�
   工具改动默认关闭（`SMOKE_PREFILL_DIGEST`、可选 `on_prefill_post`、dispatch 按臂判定、head_dim 推断）；自测 27/0、28/0、38/0。
   **缺项**：未做 `.pt` 级逐元素比较；只覆盖 1 family/1 KV 档/64 token；V-only FP8 与 fam16 其余条件未测；
   正式门（B6 20 组合、FP32 主门）未被替代。
+
+## 2026-10-04 KV Optimization Final Validation and H2O Latency
+
+### Scope and provenance
+
+This append-only entry extends, and does not overwrite, the 2026-10-02 KV
+optimization closeout. It remains supplementary engineering evidence outside
+the frozen 6+2 course experiment. The production BF16 AR/SpecDec strict
+long-context consistency issue remains separate and unresolved.
+
+Source archives:
+
+- `SPECDEC_4K8K_VALIDATION_ARCHIVE_2026-10-04.zip`:
+  SHA256 `5b670fe267a8d1e6cddec91308684bfe7c09ce90321d18e0adab313e7f55c52b`.
+- `SPECDEC_H2O_LATENCY_FINAL_2026-10-04.zip`:
+  SHA256 `596d455490f9c48e3eff3f7d8fb795315417c2441f40d64beda31eca2120fb14`.
+
+All 40 entries listed by the 4K/8K source manifest verified. In the H2O
+archive, all 26 non-manifest payload entries verified; its manifest's
+`SHA256SUMS.txt` self-entry incorrectly contains the empty-file digest and
+cannot self-verify. The source manifest is retained verbatim, and the integrated
+directory includes a corrected manifest that intentionally excludes itself.
+
+Archive source snapshots of the finalized core files were byte-identical to the
+branch versions. No core algorithm file was replaced. Newly integrated code is
+limited to benchmark/validation harnesses and their shell runners.
+
+Recorded environment: Python 3.12.14, PyTorch 2.11.0+cu128, CUDA runtime 12.8,
+Transformers 4.57.1, NVIDIA GeForce RTX 4060, driver 595.91.07,
+`nvidia-smi` CUDA 13.2, and 8188 MiB. Full snapshots and model revisions are
+under the result directories.
+
+### Final 4K/8K PagedAttention evidence
+
+Configuration: batch 1, Qwen/Qwen2.5-1.5B-Instruct target,
+Qwen/Qwen2.5-0.5B-Instruct draft, SpecDec `k=4`, 16 generated tokens,
+page size 16, chunked prefill 512, and H2O disabled.
+
+| Context | Target KV | Direct runs | Peak allocated GiB | Materialized | Output/stats parity |
+|---:|---|---:|---:|---|---:|
+| 4096 | BF16 | 3/3 PASS | 4.411 | PASS | 1 |
+| 4096 | V-FP8 | 3/3 PASS | 4.387 | PASS | 1 |
+| 8192 | BF16 | 3/3 PASS | 4.858 | PASS | 1 |
+| 8192 | V-FP8 | 3/3 PASS | 4.811 | PASS | 1 |
+
+The final direct path is validated through 8K only for this tested
+configuration. These real dual-model runs are distinct from the operator
+microbenchmark.
+
+The canonical operator CSV defines latency ratio as
+`materialized/direct`; every reported value is below one, so direct was
+slower:
+
+| Format | Context | q_len | Materialized/direct | Temporary MiB saved |
+|---|---:|---:|---:|---:|
+| BF16 | 4096 | 1 | 0.741x | 4.000 |
+| BF16 | 4096 | 4 | 0.745x | 4.000 |
+| BF16 | 8192 | 1 | 0.802x | 8.000 |
+| BF16 | 8192 | 4 | 0.830x | 8.000 |
+| V-FP8 | 4096 | 1 | 0.404x | 13.028 |
+| V-FP8 | 4096 | 4 | 0.402x | 13.020 |
+| V-FP8 | 8192 | 1 | 0.385x | 26.060 |
+| V-FP8 | 8192 | 4 | 0.390x | 26.051 |
+
+The direct path removes full-history materialization temporary allocation, and
+the saving grows with context. It does not establish a latency speedup. Earlier
+v1d speedups remain historical evidence from a different implementation/scope
+and are superseded for the final q_len 1–4/V-FP8 performance claim.
+
+Nine of the 16 retained PagedAttention worker JSON files contain timing fields
+that differ from the canonical raw CSV; archive timestamps show those workers
+were refreshed after the CSV/report. Worker status, route, parity, statistics,
+and peak-memory evidence remain useful, but the canonical raw/summary CSV files
+are the timing source of truth.
+
+### H2O operational latency
+
+The 512/2048 regime used systems, reasoning, and code prompts with three
+repeats per prompt (nine paired comparisons per KV/context). The corrected
+4096/8192 regime used the systems prompt only, three paired repeats, and
+chunked prefill 512. The regimes are not identically sampled.
+
+| Context | Target KV | Pairs | Median H2O/standard decode | Resident/seen |
+|---:|---|---:|---:|---:|
+| 512 | BF16 | 9 | 2.316x | 0.485 |
+| 512 | V-FP8 | 9 | 2.382x | 0.485 |
+| 2048 | BF16 | 9 | 3.079x | 0.496 |
+| 2048 | V-FP8 | 9 | 3.111x | 0.496 |
+| 4096 | BF16 | 3 | 3.186x | 0.498 |
+| 4096 | V-FP8 | 3 | 3.239x | 0.498 |
+| 8192 | BF16 | 3 | 4.206x | 0.499 |
+| 8192 | V-FP8 | 3 | 3.465x | 0.499 |
+
+The individual 8K BF16 ratios were 4.015x, 6.617x, and 4.206x; the individual
+V-FP8 ratios were 3.298x, 3.718x, and 3.465x. The corrected 4K/8K cells each
+produced 3/3 valid pairs with exact paired output and equal SpecDec statistics.
+
+The first harness's 4K rows reported `NO_VALID_PAIRS` after single-shot
+prefill attempts. They diagnose an unsuitable long-context harness, not H2O
+scientific failure, OOM evidence for the corrected design, or lack of support.
+The chunked-prefill harness supplied the final 4K/8K result.
+
+The current reference H2O score-capture and materialize/gather/repack
+compaction implementation introduces substantial decode latency overhead while
+bounding resident history near half at the nominal 50% budget. This measures
+the present implementation, not an intrinsic theoretical cost of H2O.
+
+### Evidence and claim boundaries
+
+- PagedAttention evidence:
+  `results/paged_attention_4k8k_2026-10-04/`.
+- H2O latency evidence: `results/h2o_latency_2026-10-04/`.
+- Consolidated interpretation:
+  `docs/kv_optimization_final_closeout_2026-10-04.md`.
+- The accepted A–G quality/memory ablation remains unchanged.
+- Paged storage itself is not a speed claim.
+- Final direct PagedAttention is a temporary-memory optimization, not a
+  demonstrated latency optimization.
+- V-FP8 exactness and 8K stability are limited to tested configurations.
+- H2O 50% is not universally lossless; 25% remains an aggressive stress arm.
+- The policy is a global-token/GQA H2O-inspired adaptation, not an exact
+  per-head reproduction.
+- H2O score capture and compaction remain reference implementations.
+- H2O latency is current implementation overhead, not an algorithmic lower
+  bound.
+

@@ -3,3 +3,7 @@
 # trailing spaces, so suppress textual diff/whitespace normalization for them.
 results/kv_closeout_2026-10-02/*.csv -text -diff
 results/kv_closeout_2026-10-02/environment/* -text -diff
+results/paged_attention_4k8k_2026-10-04/*.csv -text -diff
+results/paged_attention_4k8k_2026-10-04/environment/* -text -diff
+results/h2o_latency_2026-10-04/**/*.csv -text -diff
+results/h2o_latency_2026-10-04/environment/* -text -diff

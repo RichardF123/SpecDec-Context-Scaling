@@ -1,5 +1,11 @@
 # KV Optimization Final GPU Closeout — 2026-10-02
 
+> **Final successor (2026-10-04).** This document remains the authoritative
+> record for the 2026-10-02 GPU closeout. The later 4K/8K validation and H2O
+> operational-latency measurements are consolidated in
+> [the 2026-10-04 final closeout](kv_optimization_final_closeout_2026-10-04.md).
+> They extend rather than replace the accepted A–G results.
+
 ## Status and scope
 
 The RTX 4060 GPU closeout for the KV optimization engineering extension is

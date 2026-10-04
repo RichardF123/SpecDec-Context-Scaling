@@ -1,5 +1,12 @@
 # H2O v2 — SpecDec committed-history integration
 
+> **Later operational measurement (2026-10-04).** The “no latency
+> improvement claimed” wording below is a historical stage boundary, not an
+> indication that latency remained unmeasured. Final operational benchmarks
+> show substantial overhead in the current reference H2O score-capture and
+> compaction implementation; see
+> [the final closeout](kv_optimization_final_closeout_2026-10-04.md).
+
 > **Historical stage record.** This file preserves the v2 gate and its
 > then-current exclusions. The final closeout also covers the V-FP8 target,
 > final quality/payload evaluation, and the paired interaction audit. H2O score

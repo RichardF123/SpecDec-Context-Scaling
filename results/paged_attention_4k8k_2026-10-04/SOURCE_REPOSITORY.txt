@@ -1,0 +1,3 @@
+git_worktree=false
+This GPU instance was reconstructed from the prior final closeout code_snapshot.
+The archive therefore stores the exact code files used by this validation.

@@ -1,5 +1,11 @@
 # Final KV Optimization Ablation
 
+> **Later latency evidence (2026-10-04).** The A–G quality/memory result below
+> is unchanged. A separate operational benchmark subsequently measured
+> substantial latency overhead in the current reference H2O score-capture and
+> compaction implementation; see
+> [the final closeout](kv_optimization_final_closeout_2026-10-04.md).
+
 > **Completed 2026-10-02.** This runbook is retained as the historical
 > standalone execution protocol. Its runner writes the unsuffixed default
 > output names listed below. The authoritative closeout copies are separate

@@ -1,0 +1,34 @@
+{
+  "context": 8192,
+  "target_kv": "v_fp8",
+  "mode": "direct_cuda",
+  "repeat": 2,
+  "status": "PASS",
+  "gpu": "NVIDIA GeForce RTX 4060",
+  "torch": "2.11.0+cu128",
+  "prefill_s": 7.103917295113206,
+  "decode_s": 3.313644537003711,
+  "total_s": 10.417564408155158,
+  "decode_tok_s": 4.828520325981508,
+  "n_gen": 16,
+  "gen_sha256": "7c998d6d23d6428f62172874d0614e996fb8500fa7074211d3f5d96adffc8bd6",
+  "stats": {
+    "rounds": 4,
+    "proposed": 16,
+    "accepted": 16,
+    "target_block_calls": 4,
+    "draft_calls": 16,
+    "mismatch_rounds": 0,
+    "all_accept_rounds": 4,
+    "rollbacks": 0
+  },
+  "peak_alloc_gib": 4.810551643371582,
+  "peak_reserved_gib": 7.494140625,
+  "direct_by_phase": {
+    "propose": 384,
+    "verify": 112
+  },
+  "fallback_by_phase": {
+    "prefill": 832
+  }
+}

@@ -1,5 +1,13 @@
 # PagedAttention v1d — pointer-table reuse + repeated benchmark
 
+> **Superseded performance interpretation (2026-10-04).** Earlier v1d
+> measurements used a different implementation and scope. They remain
+> historical engineering evidence, but the final `q_len=1..4` plus V-FP8
+> benchmark on RTX 4060 supersedes them for current performance claims: direct
+> access saves materialization temporary memory and did not provide a latency
+> speedup. See
+> [the final closeout](kv_optimization_final_closeout_2026-10-04.md).
+
 > **Historical stage record.** The scope below is the v1d boundary, not the
 > current implementation boundary. The 2026-10-02 final closeout subsequently
 > added BF16 `q_len=1..4` verification and asymmetric V-FP8 direct paged CUDA.

@@ -1,5 +1,12 @@
 # H2O v3 — canonical V-FP8 target combination
 
+> **Later operational measurement (2026-10-04).** The “no latency
+> improvement claimed” wording below is a historical stage boundary, not an
+> indication that latency remained unmeasured. Final operational benchmarks
+> show substantial overhead in the current reference H2O score-capture and
+> compaction implementation; see
+> [the final closeout](kv_optimization_final_closeout_2026-10-04.md).
+
 > **Final-status note (2026-10-02).** This runbook records the v3 execution
 > stage. Canonical `_final` results are archived under
 > [`results/kv_closeout_2026-10-02/`](../results/kv_closeout_2026-10-02/).

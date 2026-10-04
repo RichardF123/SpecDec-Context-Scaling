@@ -1,5 +1,12 @@
 # Final 4060 Closeout Run — historical execution runbook
 
+> **Later validation (2026-10-04).** This historical procedure remains
+> completed. Formal 4K/8K PagedAttention validation and operational H2O latency
+> measurements were added later; see
+> [the final closeout](kv_optimization_final_closeout_2026-10-04.md). The
+> current reference H2O path shows substantial overhead, not a latency
+> improvement.
+
 > **Completed historical procedure.** This runbook came from the verified
 > `SPECDEC_FINAL_GPU_CLOSEOUT_2026-10-02.zip`. It documents how the already
 > completed closeout was executed; it is not a request to rerun GPU work. The

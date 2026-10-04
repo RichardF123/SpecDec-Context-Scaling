@@ -26,6 +26,33 @@
 
 详见：[本次状态与结论边界](docs/status_update_2026-10-02.md)、[RoPE 对齐](docs/c1_rope_source_alignment_2026-10-01.md)、[真实生成对照](docs/ar_spec_aligned_rope_2026-10-01.md)、[第 47 位四格定位](docs/divasc_index47_localization_2026-10-01.md)。定位报告的原下一步建议需按本次状态说明修正，尚未据此执行新实验。
 
+
+## KV optimization engineering closeout（2026-10-04）
+
+This supplementary engineering track is closed and does **not** redefine the
+formal 6+2 course experiment. The separate production BF16 AR/SpecDec
+long-context strict-consistency issue remains unresolved.
+
+- Paged KV storage and the final direct PagedAttention path for
+  `q_len=1..4` are implemented and semantically validated in the tested
+  configurations.
+- The direct route covers the asymmetric V-FP8 target and SpecDec
+  propose/verify/repair. Real target+draft validation completed through 8K
+  context on the recorded RTX 4060 8GB setup for batch 1, `k=4`, and 16
+  generated tokens.
+- Direct page-aware access removes full-history materialization temporary
+  allocation, with savings increasing at 4K/8K; the current custom kernel was
+  slower than the materialized CUDA reference in the final RTX 4060
+  microbenchmark.
+- H2O-inspired committed-history retention is integrated. At the nominal 50%
+  budget, resident/seen approaches 0.5, but the current reference
+  score-capture and compaction implementation adds substantial decode
+  overhead. This is not a speed claim or an intrinsic lower bound for H2O.
+
+See the [authoritative final closeout](docs/kv_optimization_final_closeout_2026-10-04.md),
+[4K/8K PagedAttention evidence](results/paged_attention_4k8k_2026-10-04/),
+and [H2O latency evidence](results/h2o_latency_2026-10-04/).
+
 ## 历史状态快照（2026-09-27）
 
 以下保留当时记录，后续状态以上方 2026-10-02 更新为准；其中“下一步”及 12 条件范围均为历史计划。
