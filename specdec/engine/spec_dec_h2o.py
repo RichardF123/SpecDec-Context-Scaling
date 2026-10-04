@@ -322,6 +322,7 @@ def _prune_model(
     seen_after: int,
     generated_after: int,
     trace_prune=None,
+    compaction_mode: str = "reference",
 ) -> tuple[list[dict], list[LayerH2OState], int, bool]:
     """Prune one model at a committed round boundary.
 
@@ -375,6 +376,7 @@ def _prune_model(
             layer,
             state,
             config,
+            compaction_mode=compaction_mode,
         )
         states[index] = state
         new_cache.append(updated)
@@ -432,6 +434,8 @@ def spec_decode_greedy_h2o(
     log=None,
     trace_prune=None,
     return_caches: bool = True,
+    score_capture_mode: str = "reference",
+    compaction_mode: str = "reference",
 ) -> dict:
     """Greedy SpecDec with H2O pruning only at committed round boundaries.
 
@@ -473,6 +477,11 @@ def spec_decode_greedy_h2o(
         attention_mode=attention_mode,
         allow_v_fp8=False,
     )
+
+    target.set_h2o_score_capture_mode(score_capture_mode)
+    draft.set_h2o_score_capture_mode(score_capture_mode)
+    if compaction_mode not in ("reference", "page_native"):
+        raise ValueError("invalid compaction_mode")
 
     target_logits, target_cache = _prefill(
         target, prompt_ids)
@@ -688,6 +697,7 @@ def spec_decode_greedy_h2o(
                     seen_after=trace_seen_after,
                     generated_after=trace_generated_after,
                     trace_prune=trace_prune,
+                    compaction_mode=compaction_mode,
                 )
             )
             draft_cache, draft_states, draft_evicted, draft_pruned = (
@@ -700,6 +710,7 @@ def spec_decode_greedy_h2o(
                     seen_after=trace_seen_after,
                     generated_after=trace_generated_after,
                     trace_prune=trace_prune,
+                    compaction_mode=compaction_mode,
                 )
             )
 
@@ -819,6 +830,8 @@ def spec_decode_greedy_h2o(
         "target_kv": target_kv,
         "draft_kv": draft_kv,
         "seen_tokens": seen,
+        "score_capture_mode": score_capture_mode,
+        "compaction_mode": compaction_mode,
         "target_states": target_states,
         "draft_states": draft_states,
     }

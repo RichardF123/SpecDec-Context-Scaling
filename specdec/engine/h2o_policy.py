@@ -216,6 +216,8 @@ def prune_committed(
     layer: dict,
     state: LayerH2OState,
     config: H2OConfig,
+    *,
+    compaction_mode: str = "reference",
 ) -> tuple[dict, LayerH2OState, torch.Tensor | None]:
     """Prune an already-committed layer/state pair at a safe boundary.
 
@@ -241,7 +243,12 @@ def prune_committed(
     if int(keep.numel()) == resident:
         return layer, state, None
 
-    out = paged_cache.select_indices(layer, keep)
+    if compaction_mode == "reference":
+        out = paged_cache.select_indices(layer, keep)
+    elif compaction_mode == "page_native":
+        out = paged_cache.select_indices_page_native(layer, keep)
+    else:
+        raise ValueError("compaction_mode must be reference or page_native")
     evicted = resident - int(keep.numel())
 
     state.scores = state.scores.index_select(0, keep)

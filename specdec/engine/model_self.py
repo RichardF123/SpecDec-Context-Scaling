@@ -107,7 +107,7 @@ _MAX_FALLBACK_LOGGED = 32
 #
 # Prefill stays on the existing materialized/fused path.  Attention math and
 # backend policy outside the eligible direct paged calls are unchanged.
-PAGED_ATTENTION_MODES = ("off", "materialized_cuda", "direct_cuda")
+PAGED_ATTENTION_MODES = ("off", "materialized_cuda", "direct_cuda", "materialized_triton", "flash_paged_cuda")
 PAGED_DIRECT_PHASES = ("decode", "propose", "verify", "repair", "other")
 _PAGED_ATTENTION_STATS: dict | None = None
 
@@ -337,6 +337,7 @@ class SelfAttention(nn.Module):
         self.paged_attention_mode = "off"
         # H2O v0 reference-score capture. Disabled by default.
         self.h2o_capture_scores = False
+        self.h2o_capture_mode = "reference"  # PHASE12_H2O_OPT
         self.h2o_last_score = None
         self.fp8_g_k = GROUP_SIZE
         self.fp8_g_v = GROUP_SIZE
@@ -378,6 +379,7 @@ class SelfAttention(nn.Module):
         else:
             v_cur16 = v
         paged_cuda_block = False
+        h2o_cuda_capture = False
         if paged_mode:
             if cache_was_none:
                 cache = paged_cache.create_layer_cache(fmt, self.cache_page_size)
@@ -385,6 +387,17 @@ class SelfAttention(nn.Module):
                 paged_cache.append_current(cache, k, v)
             else:
                 paged_cache.append_current(cache, k_cur16, qv_cur, vs_cur)
+
+            h2o_cuda_capture = (
+                self.h2o_capture_scores
+                and self.h2o_capture_mode == "paged_cuda"
+                and not cache_was_none
+                and fmt in ("fp16", "v_fp8")
+                and 1 <= s <= 4
+                and q.is_cuda
+                and _ATTENTION_PHASE in PAGED_DIRECT_PHASES
+                and self.paged_attention_mode == "direct_cuda"
+            )
 
             # H2O reference scorer.
             #
@@ -400,7 +413,7 @@ class SelfAttention(nn.Module):
             # This scorer is deliberately outside the page-aware CUDA kernel.
             # Correctness/state isolation is validated before score collection
             # is fused into CUDA.
-            if self.h2o_capture_scores:
+            if self.h2o_capture_scores and not h2o_cuda_capture:
                 if fmt not in ("fp16", "v_fp8"):
                     raise ValueError(
                         "H2O score capture supports fp16/base or v_fp8 paged cache only")
@@ -450,6 +463,7 @@ class SelfAttention(nn.Module):
                     )
 
             # FINAL_PAGED_V2_Q1_Q4_VFP8
+            # PHASE13_FLASH_PAGED: page-native tiled online-softmax route.
             # q_len 1..4 direct page-aware attention for BF16/base and V-FP8.
             # Prefill remains on the established materialized/fused path.
             paged_cuda_block = (
@@ -458,15 +472,15 @@ class SelfAttention(nn.Module):
                 and 1 <= s <= 4
                 and q.is_cuda
                 and _ATTENTION_PHASE in PAGED_DIRECT_PHASES
-                and self.paged_attention_mode in ("materialized_cuda", "direct_cuda")
+                and self.paged_attention_mode in ("materialized_cuda", "direct_cuda", "materialized_triton", "flash_paged_cuda")
             )
 
-            if paged_cuda_block and self.paged_attention_mode == "direct_cuda":
+            if paged_cuda_block and self.paged_attention_mode in ("direct_cuda", "flash_paged_cuda"):
                 _record_paged_attention("direct_cuda", _ATTENTION_PHASE)
                 k_all = None
                 v_all = None
             else:
-                if paged_cuda_block and self.paged_attention_mode == "materialized_cuda":
+                if paged_cuda_block and self.paged_attention_mode in ("materialized_cuda", "materialized_triton"):
                     _record_paged_attention("materialized_cuda", _ATTENTION_PHASE)
                 else:
                     _record_paged_attention("fallback_materialize", _ATTENTION_PHASE)
@@ -508,10 +522,23 @@ class SelfAttention(nn.Module):
         elif paged_cuda_block:
             from specdec.kernels import ops as kernel_ops
             if self.paged_attention_mode == "direct_cuda":
-                out = kernel_ops.paged_attention_block(
-                    q, cache, backend="cuda", validate=False)
+                if h2o_cuda_capture:
+                    out, mass = kernel_ops.phase12_paged_attention_h2o(
+                        q, cache, validate=False)
+                    self.h2o_last_score = (
+                        mass[0].detach().contiguous()
+                        if s == 1 else mass.detach().contiguous()
+                    )
+                else:
+                    out = kernel_ops.paged_attention_block(
+                        q, cache, backend="cuda", validate=False)
+            elif self.paged_attention_mode == "flash_paged_cuda":
+                out = kernel_ops.phase13_flash_paged_attention(
+                    q, cache, validate=False)
             elif self.paged_attention_mode == "materialized_cuda":
                 out = kernel_ops.attention(q, k_all, v_all, backend="cuda")
+            elif self.paged_attention_mode == "materialized_triton":
+                out = kernel_ops.attention(q, k_all, v_all, backend="triton")
             else:
                 raise RuntimeError(
                     f"unexpected paged attention mode {self.paged_attention_mode!r}")
@@ -683,8 +710,12 @@ class QwenLM(nn.Module):
             existing contiguous CUDA online-softmax attention.
 
         direct_cuda:
-            For the same calls, read paged K/V directly with the page-aware
-            CUDA kernel and do not materialize full-history K/V.
+            For the same calls, read paged K/V directly with the original
+            page-aware CUDA kernel and do not materialize full-history K/V.
+
+        flash_paged_cuda:
+            Phase13 experimental page-native GQA-aware tiled online-softmax
+            path. K/V remain paged; no full-history materialization.
 
         Direct/materialized CUDA comparison paths cover q_len=1..4 BF16 and
         asymmetric V-FP8 paged calls in decode/propose/verify/repair/other
@@ -700,12 +731,18 @@ class QwenLM(nn.Module):
             layer.self_attn.paged_attention_mode = mode
 
     def set_h2o_score_capture(self, enabled: bool) -> None:
-        """Enable/disable H2O reference attention-mass capture."""
+        """Enable/disable H2O attention-mass capture."""
         flag = bool(enabled)
         for layer in self.layers:
             layer.self_attn.h2o_capture_scores = flag
             if not flag:
                 layer.self_attn.h2o_last_score = None
+
+    def set_h2o_score_capture_mode(self, mode: str) -> None:
+        if mode not in ("reference", "paged_cuda"):
+            raise ValueError("mode must be reference or paged_cuda")
+        for layer in self.layers:
+            layer.self_attn.h2o_capture_mode = mode
 
     def pop_h2o_scores(self) -> list[torch.Tensor]:
         """Return captured global token-mass tensor(s) per decoder layer."""

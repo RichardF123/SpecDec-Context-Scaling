@@ -246,6 +246,45 @@ def select_indices(layer: dict, indices: torch.Tensor) -> dict:
     return out
 
 
+
+def _allocate_selected_pages(layer: dict, n: int) -> dict:
+    check_consistent(layer)
+    out=create_layer_cache(layer["fmt"],layer["page_size"])
+    count=math.ceil(n/layer["page_size"])
+    for _ in range(count):
+        out["k_pages"].append(torch.empty_like(layer["k_pages"][0]))
+        out["v_pages"].append(torch.empty_like(layer["v_pages"][0]))
+        if layer["fmt"]=="v_fp8":
+            out["v_scale_pages"].append(
+                torch.empty_like(layer["v_scale_pages"][0]))
+    out["length"]=n
+    check_consistent(out)
+    return out
+
+
+def select_indices_page_native(layer: dict, indices: torch.Tensor) -> dict:
+    """Phase12 page-native H2O compaction; policy/order unchanged."""
+    check_consistent(layer)
+    if not isinstance(indices,torch.Tensor) or indices.ndim!=1 or indices.dtype!=torch.long:
+        raise ValueError("indices must be rank-1 torch.long")
+    n=int(indices.numel())
+    if n<=0: raise ValueError("must retain at least one token")
+    idx=indices.to(device=layer["k_pages"][0].device).contiguous()
+    cur=logical_length(layer)
+    if int(idx.min())<0 or int(idx.max())>=cur:
+        raise ValueError("index out of range")
+    if n>1 and not bool(torch.all(idx[1:]>idx[:-1]).item()):
+        raise ValueError("indices must be strictly increasing")
+    if layer["k_pages"][0].device.type!="cuda" or layer["k_pages"][0].dtype!=torch.bfloat16:
+        return select_indices(layer,idx)
+    if layer["fmt"]=="fp16" and layer["v_pages"][0].dtype!=torch.bfloat16:
+        return select_indices(layer,idx)
+    out=_allocate_selected_pages(layer,n)
+    from specdec.kernels import ops as kernel_ops
+    kernel_ops.phase12_paged_compact(layer,out,idx)
+    check_consistent(out)
+    return out
+
 def payload_bytes(layer: dict) -> int:
     """Allocated bytes for paged K/V payload tensors, excluding metadata."""
     check_consistent(layer)
@@ -509,5 +548,5 @@ __all__ = [
     "cuda_pointer_tables_vfp8",
     "is_paged_layer", "layer_device", "logical_length", "materialize_k",
     "materialize_layer", "payload_bytes", "pointer_table_stats",
-    "reset_pointer_table_stats", "select_indices", "trim_layer", "truncate_layer",
+    "reset_pointer_table_stats", "select_indices", "select_indices_page_native", "trim_layer", "truncate_layer",
 ]
