@@ -197,11 +197,12 @@ def main() -> int:
             f"flash={r['flash_paged_ms']:.4f} ms "
             f"speedup={r['flash_speedup_vs_direct_x']:.3f}x"
         )
+    gate_status = "PASS" if decision["microbench_win"] else "FAIL"
     print(
-        "\nPHASE13_FLASH_MICROBENCH: PASS",
+        f"\nPHASE13_FLASH_MICROBENCH: {gate_status}",
         f"(wins={decision['wins']}/3)"
     )
-    return 0
+    return 0 if decision["microbench_win"] else 2
 
 
 if __name__ == "__main__":
