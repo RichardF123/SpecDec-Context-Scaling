@@ -1,202 +1,195 @@
-# Stage 2b 运行手册（2026-10-04，工具加固轮修订）
+# Stage 2b 运行手册（2026-10-04，**GB6 记账轮**修订）
 
-> **本轮判决（一句话，两条问题分别回答）**
+> **本轮结论（两问两答，先给答案再给依据）**
 >
-> 1. **工具能否放行 Stage 2b？—— 不能。** 两个独立原因：
->    * **治理（阻断）**：`D-1`（exact-id 门重新分层）与 `D-3`（登记 `F09/F03/F11/F04`）**仍未批准**；
->      preflight 因此返回 `3`，任何 run 现在开跑都会被守卫正确判越界。
->    * **可执行性（阻断，本轮新发现 E-1）**：唯一能产出 GB6 诊断字段的生产者
->      `specdec/engine/correctness_protocol_margins.py` 仍按**旧模式名** `aligned`/`spec` 取产物
->      （`:136`），而 Stage 2b 的模式名是 `prod`/`serial` ⇒ 取不到 divergent 侧产物时
->      `position` 会**静默退化**为"最后一个 token"（`:142`）。本轮的 GB6 位置交叉核对会把这种
->      记录**判为不一致并拒绝**（安全侧），但在 E-1 修好之前，一旦某 family 出现分歧，
->      判决只能停在 `CHECK_NEEDS_REVIEW`——**这是正确行为，不是放行**。
-> 2. **协议是否仍阻断 GPU 运行？—— 是。** `D-1/D-3/D-4/D-5/D-6` 均待批准；
->    **本轮未运行任何 GPU 任务**，未批准协议，未启动 pilot/正式实验，未外推 FP8 结论。
+> **1. 工具是否已能正确判决 Stage 2b？—— 本轮的三个判决漏洞已修好并**在真实产物上复现验证**；
+> 但"能正确判决"目前只覆盖**产物侧**（读记录、配对、分类、拒绝）。真正的 GPU 阶段仍不能开跑**
+> （见第 2 条）。本轮**没有**任何 GPU 运行，因此诊断工具的 GPU 分支属**已实现未验证**。
 >
-> 本轮做了两件事：**(a) 修掉判决工具的 5 处虚假 PASS / 阶段放行漏洞并各自留下回归自测；
-> (b) 修掉自查中又发现的 3 处同类漏洞。** 上一版本手册顶部那句"工具已具备可执行性"
-> 是**未经验证的结论，已删除**（当时 `stage2b_verdict` 的 GB6 记账分支因"读到空 gen"而**恒不触发**，
-> 见 §0 的 C-1）。
+> **2. 即使工具就绪，哪些协议批准仍阻止 GPU 阶段？** —— `D-1`（exact-id 门重新分层到 serial oracle）、
+> `D-3`（登记 `F09/F03/F11/F04` 进 run 级授权）、`D-4`（采用 DR1–DR4）、`D-5`、`D-6`（FP8 Gate A）
+> 均**待批准**；preflight 因 D-3 仍返回 `3`。**工具就绪 ≠ 获准开跑。**
 >
-> 复现证据（全部纯 CPU、只读产物）：`stage2b_verdict_selftest_cpu` **64/0** ·
-> `serial_oracle_aggregate_selftest_cpu` **21/0** · `verify_family_independence_cpu` **31/0** ·
-> `serial_oracle_audit_selftest_cpu` **19/0** · `serial_oracle_env_check_selftest_cpu` **24/0** ·
-> `serial_oracle_stage0` **42/0**（合计 **201 项，0 失败**）·
-> `stage2b_preflight_cpu` → `PREFLIGHT_OK_TOOLS_BUT_FAMILIES_UNREGISTERED (exit 3)`。
+> 判定依据（本轮实测，逐条可复现）：见 §0 与 §6 —— **三个反例的修复前/修复后实际输出**，
+> 而不是"自测总数 PASS"。
 
 ---
 
-## 0. 本轮修掉的漏洞（每一项：反例 → 根因 → 修复位置 → 复现与修复后结果）
+## 0. 本轮修的三个漏洞（修复前实测输出 → 根因 → 修复 → 修复后实测输出）
 
-| # | 反例 / 症状 | 根因 | 修复位置 | 修复后复现结果 |
-| --- | --- | --- | --- | --- |
-| **CE1** | `--tag definitely_missing_stage2b_tag --families , …` 曾返回 **exit 0 + `SERIAL_ORACLE_PASS`** | family 集合为空 ⇒ `期望三元组 = 0` ⇒ "覆盖性检查"空转 ⇒ 无任何 needs_review ⇒ 直落 PASS 分支 | `stage2b_verdict.validate_arguments()`（tag 非空、family 非空/无重复/形如 `F\d{2}`、模式**精确**等于 `ar,prod,serial`、reps==预登记值 2）；`_cli()` 在**评估之前**校验并以 **exit 2** 返回、**不写任何产物**；`evaluate()` 内部**再校验一次**（双保险，防绕过 CLI） | exit **2**，打印 `[非法] family 集合为空（不允许：会导致『期望三元组=0 ⇒ 空泛 PASS』）`；落盘目录文件数 **0**（实测临时目录为空） |
-| **CE2** | 只有 `F13 AR×2` + `--modes ar` 曾判 PASS（prod/serial 各 0 次） | 期望三元组只按传入的模式集合展开 ⇒ "没跑的模式"从不进入核对 | 同 `validate_arguments()`（模式必须精确三元素）+ `evaluate()` 中**独立于三元组的逐模式存在性检查** | `--modes ar` ⇒ exit **2**「模式必须精确包含 `['ar','prod','serial']`」；`--modes ar,prod,serial` 但目录内只有 AR ⇒ `CHECK_NEEDS_REVIEW`「prod/serial 模式没有任何可用产物 ⇒ 该阶段未执行」 |
-| **CE3** | `stage_check --tag div8209_so --family F13 …` 曾返回 **OK(exit 0)**，而该 F13 的 serial 产物是 `complete_with_selfcheck_failures` 且缺 D6 清理后读数 | 首版核对器对 serial 只做了"存在性 + token 等价"，**没有真正跑它所声称的 18 项硬检查**（`require_d6=True` 从未生效） | `stage_check._gate_serial()`（18 项硬检查 + `_rounds` 完整性 + trace 一致性 + `stage=="complete"` + `self_checks_all_ok` + 与同 family AR 的**逐 token 相等** + 两次重复一致） | exit **1 / STOP（7 项失败/缺字段）**，含 `18_d6_mode_restored_after_cleanup`（清理后实测 `serial`、运行结束时 `None`）、`stage=complete_with_selfcheck_failures`、`self_checks_all_ok != True`。**历史 F13 的聚合 JSON 未被改写**（§2 末尾说明） |
-| **CE4** | production 与 AR 分歧时，生产分歧记录**缺 v2 GB6 必需字段**却仍可 PASS | 分歧只写"首分歧下标"，未区分"产物可直接取得"与"需独立诊断 pass"的字段；也没有"缺字段 ⇒ 不得 PASS"的通道 | `stage2b_verdict.GB6_FROM_RUNS` / `GB6_FROM_DIAGNOSTIC` 两分；`_gb6_record()`；`evaluate()` 的 `gb6_needs_review` 通道 + `--gb6` 链接 | 无诊断 ⇒ `CHECK_NEEDS_REVIEW`「GB6 必需字段未齐全（需独立诊断 pass）：`['ar_top1','ar_top2','cache_len_after','margin','tied_at_max']` ⇒ 不得判 PASS」。真实 F13 的分歧现在**如实**记录为 `first_divergence_index=47`、`ar_token=6702`、`prod_token=6652`、`absolute_position=8239`、`round_index=18`（取自 prod 侧） |
-| **CE5** | 每条"环境拒绝"产物都被塞进 `needs_review`，即使有效重复齐全 | 环境拒绝与"证据缺失"混为一类 | `evaluate()` 把环境拒绝单列为 `env_blocked_records` / `n_env_blocked`（`env_blocked_policy` 字段写明规则）；仅当其**造成必需重复缺失**时由覆盖性检查阻断 | 实测：tag 内 3 条 F13 AR 环境拒绝 ⇒ 单独列出、`needs_review` 中**没有**环境噪声；有效重复齐全时不影响判决；造成缺重复时仍 `CHECK_NEEDS_REVIEW`（用例 K） |
-| **C-1** | （自查发现）**GB6 记账分支恒不触发** —— 我加的 CE4 回归第一次跑就抓到 | `_gb6_record` 直接读 runner 顶层 `rec["gen"]`，而真实产物**没有顶层 `gen`**（`_row` 从 `smoke.gen` 取）⇒ `gen=None` ⇒ 判不出分歧 ⇒ `divergent=False` ⇒ 分歧从不记账却走 PASS 路径 | 新增 `_gb6_run_view()`：`gen`/`rounds`/`specdec_stats` 一律走与聚合器唯一访问器 `_row` **同一路径**（`smoke.*`）；`prompt_len` 取 `smoke.end_state.prompt_len` | 分歧被真正识别；CE4/CE4a–CE4l 全部通过 |
-| **C-2** | （自查发现）**诊断记录的 tag 核对形同虚设** | 真实诊断产物（`div8209_proto_margins_*.json`）把 `runs_tag` 放在**文件顶层**，family 条目里没有 ⇒ 首版把 `diag_tag=None` 当成"无需核对"而放行 ⇒ 旧配置 margin 可被静默采用 | `load_gb6_diagnostics()` 把顶层 tag **下推**到每条 family 记录；`_gb6_record()` 改为**没有可核对 tag 即拒绝**（不容忍"默认同配置"） | CE4h（无 tag ⇒ 拒绝 + 理由"没有可核对的 tag"）、CE4i（文件式顶层 tag ⇒ 下推后 PASS）、CE4j（`runs_tag=div8209_proto` ⇒ 拒绝且理由含"禁止跨配置迁移"）全部通过 |
-| **C-3** | （自查发现）**位置交叉核对坐标系自相矛盾** | 生产者 `correctness_protocol_margins.py:142` 记的 `position` 是**输出序列内下标**（`pos=cp`；历史 F01: `position=14, prompt_len=8192`），首版却拿它与 `prompt_len + d`（绝对位置）比较 ⇒ 既可能假拒绝、又给了"绝对位置"一个没有生产者支撑的口径 | `_gb6_record()` 统一按**输出下标**与 `common_prefix_len` 比较（`position_frame="output_index"`）；另加 `prompt_len` 一致性核对（不同输入配置 ⇒ 拒绝） | CE4d/CE4g（位置不符 ⇒ 不 PASS）、CE4f（无 `prompt_len` 变体仍 PASS）、CE4k（`prompt_len` 不符 ⇒ 不 PASS）全部通过 |
-| **C-4** | （自查发现）**决策轮号恒缺**：真实 F13 上 `round_index = null` | AR 模式产物**没有** `smoke.rounds`（AR 无投机轮），而首版只从 AR 侧推导 ⇒ GB6 必需字段"决策轮号"永远缺失 | `_gb6_record()` 改以 **divergent（production）侧的 rounds** 推出决策轮号，并同时留下 `round_index_prod` / `round_index_ar` / `round_index_source` | 真实 F13：`round_index=18`（`source=prod`，`round_index_ar=None`）；CE4l（人为删掉 AR 的 `rounds`）通过 |
-| **C-5** | （自查发现）`--outdir` 对**落盘位置**无效 | `_cli()` 写产物时写死 `OUTDIR`，读却用 `--outdir` ⇒ "读 A 目录、写到默认目录" | `_cli()` 改为写 `Path(a.outdir)` | 与 `evaluate(outdir=...)` 读取口径一致 |
+### CF1：算出了 `gb6["missing"]` 却从不据此阻断
 
-**判决优先级（本轮明确，任何一条都不会放行 PASS）**：
-① 参数非法 / 覆盖性不全 / AR 基线无法评估（缺字段）⇒ `CHECK_NEEDS_REVIEW`；
-② AR 基线**可评估且不成立** ⇒ `BASELINE_REGRESSION`；③ serial 硬检查 / token 等价 / production 结构失败 ⇒ `SERIAL_ORACLE_FAIL`；
-④ **GB6 分歧记账不全** ⇒ `CHECK_NEEDS_REVIEW`；⑤ 全通过 ⇒ `SERIAL_ORACLE_PASS`。
-> ④ 故意排在 ②③ 之后：不得因"记账没做"把**真实的基线回归 / serial 失败**降级为"证据不足"（自测 F 抓到过这种降级）。
+| | |
+| --- | --- |
+| **修复前实测**（合成一套齐全产物，只抹掉 `end_state.prompt_len`） | `gb6.missing = ['absolute_position']`、`gb6.divergent = True`，判决 = **`SERIAL_ORACLE_PASS`** |
+| **根因** | `evaluate()` 只检查了**诊断侧**缺失（`from_diagnostic_missing`），**运行侧**的 `gb6["missing"]` 算出来后被丢弃；另外 `v in (None, {})` 这种判法把"字典存在但关键值全为 `None`"当成字段齐全 |
+| **修复位置** | `stage2b_verdict.py`：① `_gb6_present()`（None/空串/空容器/**全 None 的字典或序列**都算缺失，而 `0`/`False` 算存在）；② `GB6_WORK_REQUIRED`（`ar_work` 必须有 `decode_steps`/`target_gen_calls`；`prod_work` 必须有 `rounds`/`proposed`/`accepted`，**逐子字段**点名）；③ `evaluate()` 中 `if gb6["missing"]:` ⇒ `CHECK_NEEDS_REVIEW` |
+| **修复后实测** | 判决 = **`CHECK_NEEDS_REVIEW`**，理由 `F09: GB6 必需字段**实际为空** ['absolute_position']（运行侧缺 ['absolute_position']；诊断侧缺 []）⇒ 不得判 PASS`；真实 F13 的运行侧现在**全齐**（`from_runs_missing=[]`） |
+| **顺带修正的语义** | AR 的工作量**不再塞进"接受率"模板**：`ar_work = {decode_steps: 63, target_gen_calls: 63, actual_len: 64, stop_reason: 'max_new_reached', acceptance: 'not_applicable（AR 无投机 ⇒ 无 proposed/accepted，不填造接受率）'}`（真实 F13 实测） |
+| **无分歧时不误伤** | 旧规则若直接改会在"token 相等"时把全部字段判缺；现在 `divergent=False ⇒ missing=[]` 且写 `not_applicable`（用例 CF1d：无分歧 ⇒ 无需诊断即可 PASS） |
+
+### CF2：AR 的两处自报状态从不互相核对
+
+| | |
+| --- | --- |
+| **修复前实测**（新 family AR：`smoke.stop_reason=max_new_reached`，`end_state.stop_reason=eos`） | `ar_checks.stop_legal_and_consistent = true`、`ar_baseline_ok = True`，判决 = **`SERIAL_ORACLE_PASS`** |
+| **根因** | `_ar_baseline_new` 只对 `smoke.stop_reason` 判"合法且两次一致"，**从不与 `end_state.stop_reason` 对照**；`end_state.gen_len/gen_hash` 与独立计算值的缺失也只会变成 `None != hash` 式硬失败，**分不出"缺字段"还是"相互矛盾"** |
+| **修复位置** | `_ar_baseline_new` 重写为**逐条**核对：生成 IDs **独立算出的** `gen_hash`、`end_state.gen_hash`、实际长度、`end_state.gen_len`、`smoke.stop_reason`、`end_state.stop_reason`（每 rep 一份 `per_row` 明细），并把问题**分类**：<br>· `missing_fields`（缺字段）⇒ `CHECK_NEEDS_REVIEW`<br>· `self_contradiction`（字段都在但矛盾，含预登记长度不符/停止非法）⇒ `CHECK_NEEDS_REVIEW`（**不**声称基线回归：矛盾说明记录坏了）<br>· `between_reps`（两次重复之间不一致）⇒ `BASELINE_REGRESSION`（确定性失败）<br>旧 family（F13/F01/F02/F08/F10）**保留原判据不变**，只是把分类显式化 |
+| **修复后实测** | 矛盾 ⇒ **`CHECK_NEEDS_REVIEW`**，理由 `AR 产物**自报状态相互矛盾** {'rep1': {'stop_smoke_vs_end_state': {'smoke': 'max_new_reached', 'end_state': 'eos'}}, …}`；缺 `end_state.stop_reason` ⇒ 归为 `AR 基线**证据缺失**`；两次不一致 ⇒ 仍 `BASELINE_REGRESSION`（CF2d）；两者同时出现 ⇒ 矛盾优先（CF2e） |
+| **真实数据现状（诚实说明）** | div8209_so/F13 的 6 份有效产物 `smoke.stop_reason` 与 `end_state.stop_reason` **全部一致** ⇒ CF2 是**潜在**漏洞（只在记录被写坏/工具写入口径不一致时才暴露），本轮靠合成用例覆盖 |
+
+### CF3：诊断工具按旧模式名取产物，找不到 divergent 侧就退化为末 token
+
+| | |
+| --- | --- |
+| **修复前实测**（真实 `div8209_so` / F13，照抄旧选择逻辑） | `{'ar_len': 64, 'aligned_len': 0, 'spec_len': 0, 'cp': 64, 'pos': 63}` ⇒ 位置 = **末 token 63**，而真实首分歧 = **47** |
+| **根因** | `correctness_protocol_margins.py` 用 `_gen("ar") / _gen("aligned") / _gen("spec")`；Stage 2b 的模式名是 `ar/prod/serial` ⇒ `diag_gen` 为空 ⇒ `pos = max(0, len(ar_gen)-1)` |
+| **修复位置** | ① **新增纯 CPU 模块** `gb6_diag_select.py`：`select_divergent_pair()` 负责配对 + 来源/配置核对 + 首分歧计算，**缺 divergent 侧即抛 `MISSING_ARTIFACT`**，绝不退化；② `correctness_protocol_margins.py`：模式名参数化（`--ar-mode/--div-mode/--stage2b`）、改用被选中的**那两份文件**、载入输入长度与产物 `prompt_len` 交叉核对、`position_origin` 自证来源、退出码 **4** = 有 family 配对被拒；③ 消费端 `stage2b_verdict`：诊断必须带 `GB6_DIAG_PROVENANCE`（`family`/`runs_tag`/`position_origin`/`position`/`prompt_len`）且 `position_origin` 必须含 `first_divergence`，否则**拒绝** |
+| **修复后实测（有 prod）** | `status=DIVERGENT 首分歧=47 position=47 round_index=18 prompt_len=8192 ar_token=6702 prod_token=6652`，来源串写明用的是**哪两份文件**；配置核对 10 项全 `true` |
+| **修复后实测（无 prod）** | 真实 `div8209_so`+`F01`（只有 AR/serial）⇒ `MISSING_ARTIFACT`：`tag='div8209_so' family='F01' mode='prod' 在 attn 下没有任何产物（**不允许**用其它模式/其它 tag/family 代跑，也不允许退化为末 token）` |
+| **修复后实测（消费端）** | `position_origin='legacy_last_index（…非首分歧）'` 的记录 ⇒ 判决 `CHECK_NEEDS_REVIEW`，理由点名 `position_origin … first_divergence`；缺 `position_origin` 的**旧 margins 产物**同理被拒（CF3/CF3b） |
+| **顺带修掉的一个**过度严格**（真实数据抓到） | 首版把 `kv_format` **整体**比对 ⇒ 真实配对被误拒：AR `{'target':'fp16','draft':'not_loaded'}` vs prod `{'target':'fp16','draft':'fp16'}` —— **AR 本来就不加载 draft**。现只比对 **target 侧**（`kv_format.target`、`dtypes.model`、`dtypes.target_kv_payload`），并把这条豁免写进记录的 `config_notes` |
+| **观察（不在本轮改动范围）** | 真实产物里 target KV 标签写作 `"fp16"`，而 `dtypes.target_kv_payload` 是 `base_bf16`。这是既有标注惯例，**本轮只做"两侧相等"核对，不改任何数值路径**；如需澄清属另一轮事项 |
+
+> **本轮另外发现并顺手修的**：`end_state.n_decode_steps` 未在 `SV._row` 暴露（AR 工作量要按它记录）
+> ⇒ 已按产物真实字段名暴露；聚合器字段名契约自测（s12）因此回到 **21/0**。
+> 过程说明：我一度用 PowerShell `Set-Content` 回写过一个 UTF-8 源文件（历史上曾因此产生 mojibake），
+> 随即做了字节级校验（合法 UTF-8、替换字符 0、`py_compile` 通过）并**剥掉多余 BOM**；
+> 之后所有源码改动一律走编辑工具。
 
 ## 1. 工具清单（全部受版本控制）
 
 | 工具 | 用途 | 退出码 |
 | --- | --- | --- |
-| `python -X utf8 -m specdec.engine.stage2b_preflight_cpu` | 开跑前只读预检：family 来源/hash/独立性/守卫登记/工具就绪 | `0` 可跑 · `3` 工具就绪但 family **未登记** · `1` 硬问题 |
-| `python -X utf8 -m specdec.engine.stage_check --tag … --family … --modes … --reps …` | **逐阶段硬门核对**（AR → production → serial；真的跑 18 项 serial 硬检查） | `0` 通过 · `1` STOP（失败/缺字段）· `2` 尚有阶段未跑（PENDING）· **`3` 参数非法** |
-| `python -X utf8 -m specdec.engine.stage2b_verdict --tag … --families … --modes … --reps … [--gb6 …]` | **Stage 2b 判决**（参数/覆盖/基线/分歧记账四道门） | `0` PASS · `1` 其它判决 · **`2` 参数非法（不落盘）** |
-| `python -X utf8 -m specdec.engine.stage2b_verdict_selftest_cpu` | 判决工具自测（合成产物在临时目录） | `0` PASS（64 项） |
-| `python -X utf8 -m specdec.engine.serial_oracle_aggregate_selftest_cpu` | 聚合器字段名契约自测（含新工具） | `0` PASS（21 项） |
-| `python -X utf8 -m specdec.engine.verify_family_independence_cpu` | 治理守卫（family 授权范围 + 工具源级扫描） | `0` PASS（31 项） |
-| `python -X utf8 -m specdec.engine.serial_oracle_env_check` | 环境门（16 GiB 线 + 18 GiB 入口门槛） | `0` ENVIRONMENT_OK |
-| `.\scripts\so_batch.ps1 -Tag … -Cases … -Modes … -Reps …` | 顺序批量运行（**GPU**；一个进程 = 一个三元组） | 逐 run 的 rc 记入日志 |
+| `python -X utf8 -m specdec.engine.stage2b_preflight_cpu` | 开跑前只读预检 | `0` 可跑 · `3` 工具就绪但 family **未登记** · `1` 硬问题 |
+| `python -X utf8 -m specdec.engine.stage_check --tag … --family …` | 逐阶段硬门（AR/production/serial） | `0` 通过 · `1` STOP · `2` PENDING · `3` 参数非法 |
+| `python -X utf8 -m specdec.engine.stage2b_verdict --tag … --families … [--gb6 …]` | Stage 2b 判决 | `0` PASS · `1` 其它判决 · `2` 参数非法（不落盘） |
+| `python -X utf8 -m specdec.engine.correctness_protocol_margins --stage2b …` | **GB6 诊断 pass**（位置 + top-1/top-2/margin/tie/cache） | `0` 完成 · **`4` 有 family 配对被拒** · `5` 检查失败 · `2` 崩溃 |
+| `python -X utf8 -m specdec.engine.gb6_diag_select_selftest_cpu` | 诊断**配对/来源核对**自测（纯 CPU） | `0` PASS（25 项） |
+| `python -X utf8 -m specdec.engine.stage2b_verdict_selftest_cpu` | 判决工具自测（合成产物） | `0` PASS（92 项） |
+| `python -X utf8 -m specdec.engine.serial_oracle_aggregate_selftest_cpu` | 字段名契约自测 | `0` PASS（21 项） |
+| `python -X utf8 -m specdec.engine.verify_family_independence_cpu` | 治理守卫 | `0` PASS（31 项） |
 
-**已删除的本机临时脚本**：`output/g5/attn/_so_stage_check.py`（由受版本控制的 `specdec/engine/stage_check.py` 取代）。
+## 2. 各阶段硬门（`stage_check` 的真实口径）
 
-## 2. 各阶段实际执行的硬门（`stage_check` 的真实口径，不是声称）
+* **AR**：两次在场且逐 token 一致 · 自报 hash/长度/停止自洽 · 停止合法。
+  **新 family 另有逐条核对**（见 CF2 表）：独立 hash / `end_state.gen_hash` / 实际长度 /
+  `end_state.gen_len` / `smoke.stop_reason` / `end_state.stop_reason`，**缺字段与相互矛盾分类阻断**。
+  **旧 family**（F13/F01/F02/F08/F10）仍用**登记输出锚点 + 上一轮产物**的原判据。
+* **production**：两次一致 · `checks_passed` · cache 结构 · 逐轮不变量 · 有限性 · token 在词表 ·
+  停止合法 · `s>1` batched 几何 · 非 OOM。**与 AR 的分歧只作 `[待办·不阻断]`**（不判失败、不阻断 serial）。
+* **serial**：18 项硬检查（含 D6）· 逐轮字段 · trace 一致 · `stage=="complete"` · `self_checks_all_ok` ·
+  与同 family AR **逐 token 相等** · 两次一致。
 
-* **AR 阶段**：两次重复在场 · 两次逐 token 一致 · 自报 hash/长度与 `end_state` 一致 · 停止原因合法且一致 · 新 family
-  必须另有 manifest 输入 `token_sha1` 与实际输入一致（**不得**套用旧 family 的登记输出锚点）。
-* **production 阶段**：两次在场且逐 token 一致 · `checks_passed` · cache 结构 ok 且检查数 > 0 · 逐轮不变量 ok ·
-  有限性 · token 在词表内 · 停止合法 · **存在 `s>1` 的 batched 几何** · 非 OOM ·
-  **与 AR 的分歧只作"待办提示"（`[待办·不阻断]`），既不判失败也不阻断 serial 阶段** ——
-  历史五个 family 的 production 都与 AR 分歧，那是被记录的现象；serial 的逐 token 等价才是核心证据，
-  不能因为分歧就不跑 serial。分歧的**记账**要求由最终判决工具执行（缺 GB6 诊断 ⇒ 不放行）。
-* **serial 阶段**：**18 项**硬检查（`_serial_hard_checks2(require_d6=True)`，含 D6"清理后模式已复位"）·
-  `_rounds` 字段完整 · trace 与轮记录一致 · `stage == "complete"` · `self_checks_all_ok == True` ·
-  与**同 family 的 AR** 逐 token 完全相等 · 两次 serial 一致。
+## 3. GB6 记账：字段来源（谁提供、怎么核）
 
-> **历史记录与"更严门"的关系（必须说清，且不得改写历史）**：
-> `div8209_so` 的 F13 在**当时 16 项**硬检查口径下的 Stage-2 `SERIAL_ORACLE_PASS` **仍然是历史事实**，
-> 本轮**没有**改写它（`output/g5/attn/div8209_so_stage2_aggregate_20261003T170149Z.json` 保持原样；
-> 旧的 16 项口径自测 `--scope final` 现在仍复现 `SERIAL_ORACLE_PASS`，见该工具新时间戳产物）。
-> 但新增的第 18 项（D6）在 F13 上**不成立** ⇒ 新工具对同一批产物给出 `SERIAL_ORACLE_FAIL`。
-> 两者**不是矛盾**：前者是"当时判据下的历史结论"，后者是"更严判据下的当前结论"；
-> 正因如此，Stage 2b 的 serial 必须**重新跑**（历史产物不能充当新判据的证据）。
+| 字段 | 来源 | 备注 |
+| --- | --- | --- |
+| `first_divergence_index` / `common_prefix_len` | **运行侧**（AR vs prod 产物逐 token 比） | 输出序列内下标 |
+| `ar_token` / `prod_token` | 运行侧；诊断侧若也记则**必须一致**（不一致 ⇒ 拒） | CF3c |
+| `ar_len` / `prod_len` | 运行侧 | |
+| `absolute_position` | 运行侧 = `end_state.prompt_len + 下标` | 缺 `prompt_len` ⇒ 该字段判缺 ⇒ 阻断（CF1） |
+| `round_index` | 运行侧：**divergent（production）侧**的 `smoke.rounds` 推出 | AR 产物没有 `rounds`（真实实测） |
+| `ar_work` | 运行侧：`decode_steps`（`end_state.n_decode_steps`）+ `target_gen_calls`；`acceptance=not_applicable` | **不填造 AR 接受率** |
+| `prod_work` | 运行侧：`specdec_stats` 的 `rounds/proposed/accepted/…` | 真实 F13：`25/97/46`，rollbacks 18 |
+| `ar_top1` / `ar_top2` / `margin` / `tied_at_max` / `cache_len_after` | **独立诊断 pass**（GPU，AR 口径重建决策行） | 现有产物**推不出**；缺 ⇒ 不 PASS |
+| `position_origin` / `position` / `prompt_len` / `family` / `runs_tag` | 诊断**来源/配置**字段 | 必须自证"同 tag、同 family 的 AR vs production 首分歧" |
 
-## 3. 复制即用命令（按顺序；每条都标注前置 / 预期产物 / 停止条件）
+**核对规则（缺一即 `CHECK_NEEDS_REVIEW`）**：family 一致 · tag 一致（**禁止**跨 tag 迁移旧 margin）·
+来源字段齐全 · `position_origin` 含 `first_divergence` · `position` 与产物推出的首分歧下标一致 ·
+`prompt_len` 与产物一致 · 两侧 `token` 一致。**诊断与正式计时分离**：诊断产物不进入任何性能结论。
 
-### 3.0 预检（只读；**现在就应执行**）
+## 4. 复制即用命令
+
+### 4.0 预检（只读；现在就可执行）
 ```powershell
-python -X utf8 -m specdec.engine.stage2b_preflight_cpu
-python -X utf8 -m specdec.engine.verify_family_independence_cpu
-python -X utf8 -m specdec.engine.serial_oracle_env_check
+python -X utf8 -m specdec.engine.stage2b_preflight_cpu                     # 期望：exit 3（待 D-3）
+python -X utf8 -m specdec.engine.verify_family_independence_cpu            # 期望：31/0
+python -X utf8 -m specdec.engine.serial_oracle_env_check                   # 期望：ENVIRONMENT_OK
 ```
-* **前置**：工作树 clean。
-* **预期产物**：仅 stdout（不落盘）。
-* **停止条件**：preflight 返回 `1` 或 `3`；守卫 `FAIL`；环境非 `ENVIRONMENT_OK`。
-  当前：preflight = `3`（**待 D-3**）、守卫 = **31/0**、环境门最近一次 `ENVIRONMENT_OK`。
 
-### 3.1 每个 family 的"AR×2 → production×2 → serial×2"（**GPU 阶段；本轮未执行**）
+### 4.1 逐 family：AR×2 → production×2 → serial×2（**GPU；需 D-1/D-3**）
 ```powershell
-$tag = 'div8209_p2'; $reps = 2; $py = '.\.venv\Scripts\python.exe'
+$tag='div8209_p2'; $reps=2; $py='.\.venv\Scripts\python.exe'
 foreach ($f in 'F09','F03','F11','F04') {
   & .\scripts\so_batch.ps1 -Tag $tag -Cases $f -Modes ar -Reps 1,2
   & $py -X utf8 -m specdec.engine.stage_check --tag $tag --family $f --modes ar --reps $reps
-  if ($LASTEXITCODE -ne 0) { throw "$f AR 阶段未通过（rc=$LASTEXITCODE），停止" }
-
+  if ($LASTEXITCODE -ne 0) { throw "$f AR 未通过（rc=$LASTEXITCODE）" }
   & .\scripts\so_batch.ps1 -Tag $tag -Cases $f -Modes prod -Reps 1,2
   & $py -X utf8 -m specdec.engine.stage_check --tag $tag --family $f --modes ar,prod --reps $reps
-  if ($LASTEXITCODE -ne 0) { throw "$f production 阶段未通过（rc=$LASTEXITCODE），停止" }
-
+  if ($LASTEXITCODE -ne 0) { throw "$f production 未通过（rc=$LASTEXITCODE）" }
   & .\scripts\so_batch.ps1 -Tag $tag -Cases $f -Modes serial -Reps 1,2
   & $py -X utf8 -m specdec.engine.stage_check --tag $tag --family $f --modes ar,prod,serial --reps $reps
-  if ($LASTEXITCODE -ne 0) { throw "$f serial 阶段未通过（rc=$LASTEXITCODE），停止" }
+  if ($LASTEXITCODE -ne 0) { throw "$f serial 未通过（rc=$LASTEXITCODE）" }
 }
 ```
-* **前置**：3.0 全部通过（**尤其 D-3 已批准 ⇒ preflight 返回 0**）。
-* **预期产物**：每三元组 `{tag}_{family}_{mode}_rep{rep}_{runid}.json` + `.pt`；
-  每次 `so_batch` 一份 `{tag}_{family}_{mode}_rep{rep}.log` 与一份 `{tag}_batch_*.log`；
-  共 **4 family × 3 mode × 2 rep = 24 个 JSON**（+24 个 `.pt`）。
-* **停止条件**：`stage_check` 任一阶段 rc ≠ 0（**逐阶段硬停**，不得"先跑完再一起看"）。
+**停止条件**：任一阶段 rc ≠ 0 立即停（`stage_check` 会点名是哪一项硬门/哪个字段）。
+production 与 AR 的分歧只打印 `[待办·不阻断]`，**不**阻断 serial。
 
-### 3.2 GB6 独立诊断 pass（**仅当某 family 的 production 与 AR 分歧时需要**）
+### 4.2 GB6 诊断 pass（**仅当某 family 的 production 与 AR 分歧**；GPU）
 ```powershell
-# ⚠️ 前置：E-1 必须先修（见文首）—— 现在这个工具按旧模式名 aligned/spec 取产物，
-#    对 Stage 2b 的 prod/serial 取不到 divergent 侧序列 ⇒ position 会静默退化成最后一个 token。
-$env:PM_FAMILIES = 'F09,F03,F11,F04'      # 支持 env 参数化（默认 F01,F02,F08,F10）
-$env:PM_RUNS_TAG = 'div8209_p2'            # ★ 必须等于 Stage 2b 的 tag，否则判决工具会拒收
-python -X utf8 -m specdec.engine.correctness_protocol_margins
+$env:PM_FAMILIES='F09,F03,F11,F04'      # 支持 env 参数化
+$env:PM_RUNS_TAG='div8209_p2'           # ★ 必须等于 Stage 2b 的 tag（否则判决工具拒收）
+python -X utf8 -m specdec.engine.correctness_protocol_margins --stage2b --runs-tag div8209_p2 --tag div8209_p2 --families F09,F03,F11,F04
 ```
-* **预期产物**：`output/g5/attn/div8209_p2_margins_<utc>.json`（顶层含 `runs_tag`，`families` 下每 family 一条）。
-* **该产物必须提供的 GB6 诊断字段**：`ar_top1` · `ar_top2` · `margin` · `tied_at_max` · `cache_len_after`
-  **外加**坐标核对用的 `position`（**输出序列内下标**口径）与 `prompt_len`。
-* **链接方式**（判决时显式给出，工具不会自动找）：
-  ```powershell
-  python -X utf8 -m specdec.engine.stage2b_verdict --tag div8209_p2 `
-    --families F09,F03,F11,F04 --modes ar,prod,serial --reps 2 `
-    --gb6 output/g5/attn/div8209_p2_margins_<utc>.json
-  ```
-* **判决工具的核对规则（缺一即 `CHECK_NEEDS_REVIEW`）**：family 必须一致 · tag 必须一致（**禁止**用
-  `div8209_proto` 等旧配置的 margin 迁移）· `position` 必须与产物推出的首分歧下标一致 ·
-  `prompt_len` 必须与产物一致。
-* **停止条件**：任一必需诊断字段缺失 / family 或 tag 不符 / 位置或 `prompt_len` 不符 ⇒ **停在
-  `CHECK_NEEDS_REVIEW`**，不得手填、不得估算、不得从上一轮产物迁移 margin。
+* **预期产物**：`output/g5/attn/div8209_p2_margins_<utc>.json`（顶层 `runs_tag`，`families` 下每 family 一条，
+  含 `position_origin`/`position`/`prompt_len`/`pair`/`config_checks`）。
+* **停止条件**：
+  * 退出码 **4**（有 family 配对被拒，如缺 `prod` 产物 / tag 不符 / 配置不符）⇒ **停下核对**，
+    不得手工填数、不得从旧 tag 迁移 margin；
+  * 某 family 状态为 `TOKEN_EQUAL` ⇒ 该 family **不需要**诊断（无分歧），如实记录即可；
+  * 退出码 5 ⇒ 检查失败（载入输入长度与 `prompt_len` 不符等），同样停。
 
-### 3.3 最终判决（只读；24 次跑完 + 需要的诊断 pass 之后）
+### 4.3 最终判决（只读）
 ```powershell
-python -X utf8 -m specdec.engine.stage2b_verdict `
-  --tag div8209_p2 --families F09,F03,F11,F04 --modes ar,prod,serial --reps 2 `
+python -X utf8 -m specdec.engine.stage2b_verdict --tag div8209_p2 `
+  --families F09,F03,F11,F04 --modes ar,prod,serial --reps 2 `
   --gb6 output/g5/attn/div8209_p2_margins_<utc>.json
 ```
-* **前置**：3.1 四个 family 三阶段全过；（若分歧）3.2 的诊断产物齐全。
-* **预期产物**：`output/g5/attn/div8209_p2_stage2b_verdict_<utc>.json` + `.jsonl`（新时间戳，不覆盖历史；
-  落盘位置跟随 `--outdir`）。
-* **停止条件**：判决 ≠ `SERIAL_ORACLE_PASS`；或 CLI 以 **exit 2** 返回（参数非法，此时**不会有**产物）。
+**停止条件**：判决 ≠ `SERIAL_ORACLE_PASS`；或 exit 2（参数非法，此时不会写任何产物）。
+`SERIAL_ORACLE_FAIL` = 真实硬门失败；`BASELINE_REGRESSION` = AR 基线可评估且不成立；
+`CHECK_NEEDS_REVIEW` = 证据不足/记录矛盾/记账不全（含本文 §0 的三个漏洞）。
 
-### 3.4 FP8 档（**待 D-6；另起 tag，且先做 1 次结构 smoke**）
+### 4.4 FP8 档（**待 D-6**）
 ```powershell
-$env:SO_KV = 'v_fp8'
-& .\scripts\so_batch.ps1 -Tag div8209_p2fp8 -Cases F13 -Modes ar -Reps 1     # smoke：确认布局/结构字段可记录
-# 若 smoke 通过且 D-6 批准：F13 × {ar,prod,serial} × 2 = 6 次
+$env:SO_KV='v_fp8'
+& .\scripts\so_batch.ps1 -Tag div8209_p2fp8 -Cases F13 -Modes ar -Reps 1     # 结构 smoke
 ```
-* **前置**：D-6 批准 + `v_fp8` 结构 smoke 通过（需新增 S2/S3/S4 结构检查，见审计 §4.2）。
-* **禁止**：把 BF16 五-family 的 serial PASS 外推为 FP8 PASS。
+**禁止**把 BF16 五-family 的 serial PASS 外推为 FP8 PASS。
 
-## 4. 仍待批准 / 待运行 / 阻断
+## 5. 仍待批准 / 阻断（工具就绪 ≠ 获准开跑）
 
 | # | 事项 | 状态 |
 | --- | --- | --- |
-| **E-1** | `correctness_protocol_margins.py` 的模式名仍为 `aligned`/`spec`（`:136`），Stage 2b 为 `prod`/`serial` ⇒ 分歧位置静默退化（`:142`）；需参数化 divergent 模式名并加一条 CPU 可测的取产物自测 | **本轮新发现，未修**（属 GPU 侧工具的语义改动，需与 3.2 同轮做并验证）；**阻断 GB6 记账** |
-| D-1 | exact-id 门**重新分层**到 serial oracle（执行路径的实质调整） | **待批准**（阻断全部后续） |
-| D-3 | 登记 `F09/F03/F11/F04` 进守卫授权范围 | **待批准**（阻断 Stage 2b；preflight 现返回 `3`） |
-| D-4 | 采用 DR1–DR4（**删除** `index==0` 自动阈值；全量记录 + 分层解释，不按分歧位置筛样本） | **待批准**（已写入 v2 §5.2 与 brief §4，标注"待批准"） |
+| **D-1** | exact-id 门**重新分层**到 serial oracle | **待批准**（阻断全部后续） |
+| **D-3** | 登记 `F09/F03/F11/F04` 进**run 级**授权 | **待批准**（preflight 返回 3） |
+| **D-4** | 采用 DR1–DR4（删除 `index==0` 自动阈值；全量记录、分层解释） | **待批准** |
 | D-2 / D-5 / D-6 / D-7 / D-8 / D-9 | 见 brief §3 | **待批准** |
-| — | Stage 2b 的 24 次运行（+ 可能的诊断 pass） | **待运行**（依赖 D-1/D-3 与 E-1） |
-| — | FP8-0 / FP8-A（7–13 次） | **待运行**（依赖 D-6） |
-| — | pilot / 正式矩阵（C1–C6、A1–A2） | **阻断** |
-| — | 守卫的**源级扫描**扩到新工具 | **已完成**：`stage2b_verdict.py` / `stage2b_preflight_cpu.py` / `stage2b_verdict_selftest_cpu.py` 已登记为 opt-in 消费方；新增 `STAGE2B_CANDIDATE_FAMILIES`（候选集合，显式注明"**不构成 run 级授权**"）与两条新检查 ⇒ 守卫 **31/0**。`stage_check.py` **故意不登记**（检测器扫不到它，而"消费方集合 == OPT_IN_CONSUMERS"是等式检查）。**run 级授权未放宽**：新检查要求"候选 family 尚未被任何 run 消费" |
+| E-1（上轮发现） | 诊断工具模式名不匹配 ⇒ 已**参数化 + 拒绝式退化**；但 GPU 分支**未验证**（无 GPU 运行） | **代码已改，待 GPU 轮验证** |
+| — | Stage 2b 24 次运行（+ 可能的诊断 pass） | **待运行**（依赖 D-1/D-3） |
+| — | FP8-0 / FP8-A | **待运行**（依赖 D-6） |
+| — | pilot / 正式矩阵 | **阻断** |
 
-## 5. 本轮修改文件清单与自测汇总
+## 6. 自测与真实数据证据（本轮实测，全部 exit 0）
 
-**本轮改动（全部为工具/文档/CPU 自测；未触碰数值路径）**：
-`specdec/engine/stage2b_verdict.py`（§0 的 CE1/CE2/CE4/CE5 与 C-1…C-5 修复）·
-`specdec/engine/stage2b_verdict_selftest_cpu.py`（27 → **64** 项：新增 CE1、CE2/CE2b、CE3、CE4a–CE4l、CE5）·
-`specdec/engine/stage_check.py`（真实执行各阶段硬门；serial 走 18 项含 D6；STOP/PENDING/OK 三态）·
-`docs/stage2b_runbook_2026-10-04.md`（本文件：删除未经验证的"可执行性"结论，补 GB6 诊断 pass 的运行/链接/停止条件）。
+| 自测 | 结果 |
+| --- | --- |
+| `stage2b_verdict_selftest_cpu` | **92/0**（上一轮 64 → 本轮 +28：CF1/CF1b–d/CF2/CF2b–e/CF3/CF3b–d，CE4f 改为"缺 prompt_len ⇒ 拒"两条） |
+| `gb6_diag_select_selftest_cpu`（新） | **25/0**（T1 正常配对、T2 **缺 prod 拒绝**、T3–T5 来源、T6–T12 配置、T13 无分歧不记位置、T14 legacy 标注） |
+| `serial_oracle_aggregate_selftest_cpu` | **21/0** |
+| `verify_family_independence_cpu` | **31/0**（新登记 `gb6_diag_select.py` + 其自测；run 级授权**未**放宽） |
+| `serial_oracle_audit_selftest_cpu` / `env_check` / `stage0` | **19/0** · **24/0** · **42/0** |
+| 真实数据复核（只读） | 新配对逻辑在 `div8209_so`/F13 上给出**首分歧 47**（旧逻辑 63）；缺 prod 时 `MISSING_ARTIFACT`；真实 F13 运行侧 GB6 字段**全齐**，仅缺 5 个诊断字段 |
 
-**上一轮已新增（本次沿用）**：`stage2b_preflight_cpu.py` ·
-`specdec/engine/verify_family_independence_cpu.py`（守卫登记与候选集合）·
-`specdec/engine/serial_oracle_aggregate.py`（legacy 反静默：越界 family ⇒ NEEDS_REVIEW）·
-`serial_oracle_aggregate_selftest_cpu.py`（字段名契约扫描扩到新工具 ⇒ 21/0）·
-`docs/specdec_correctness_protocol_v2_2026-10-04.md`（DR1–DR4）·
-`docs/protocol_decision_brief_2026-10-04.md`（删 R3）·
-`docs/stage2b_executability_audit_2026-10-04.md`（§3 追加修复说明）。
+## 7. 本轮修改文件
 
-**自测汇总（本轮实测，全部 exit 0）**：
-`stage2b_verdict_selftest_cpu` **64/0** · `serial_oracle_aggregate_selftest_cpu` **21/0** ·
-`verify_family_independence_cpu` **31/0** · `serial_oracle_audit_selftest_cpu` **19/0** ·
-`serial_oracle_env_check_selftest_cpu` **24/0** · `serial_oracle_stage0` **42/0** ⇒ 合计 **201/0**。
+**新增**：`specdec/engine/gb6_diag_select.py`（纯 CPU 配对/来源核对）·
+`specdec/engine/gb6_diag_select_selftest_cpu.py`（25 项自测）。
+**修改**：`specdec/engine/stage2b_verdict.py`（CF1/CF2/CF3 消费端修复 + `_ar_work` + `_gb6_present`
++ 诊断来源/一致性核对 + `end_state_n_decode_steps` 暴露）·
+`specdec/engine/correctness_protocol_margins.py`（模式名参数化 / `--stage2b` / 拒绝式退化 / 退出码 4）·
+`specdec/engine/stage2b_verdict_selftest_cpu.py`（+31 项）·
+`specdec/engine/verify_family_independence_cpu.py`（登记新消费方）· 本文件。
 
-**未修改**（按边界要求）：`model_self.py` / `spec_dec.py` 的任何数值路径 · proposal（`output/pdf/*.tex`）·
-历史 FAIL/CHECK/PASS 结论与既有原始产物 · 冻结判据文件（`design_freeze_g4_specdec.md`、`g5_measurement_protocol.md`）。
+**未修改（按边界要求）**：`model_self.py` / `spec_dec.py` 的任何数值路径 · proposal ·
+历史 FAIL/CHECK/PASS 结论与既有原始产物 · 冻结判据文件。**未运行 GPU，未批准协议，未外推 FP8。**

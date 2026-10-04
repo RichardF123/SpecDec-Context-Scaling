@@ -40,6 +40,26 @@ RUNID = "20261004T000000Z"
 # 合成产物的 prompt 长度：真实产物 `smoke.end_state.prompt_len` 存在（如 F13 prod = 8192）。
 # 合成里统一取 8192，使"绝对位置 = prompt_len + 输出内下标"可被**精确断言**。
 PROMPT_LEN = 8192
+# 诊断记录里"位置来源"的合法标注（新工具 `gb6_diag_select` 写的就是这一口径）。
+# ⚠️ 消费端要求它**含 `first_divergence`**：这正是为了拒绝"找不到 prod 就退回末 token"的记录。
+ORIGIN_OK = "first_divergence(ar_vs_prod)"
+
+
+def _diag(tag: str, families=(None,), **over) -> dict:
+    """合成一份**形状与真实生产者一致**的 GB6 诊断记录（按 family 索引）。
+
+    生产者 = `correctness_protocol_margins.py` + `gb6_diag_select.py`，其必需字段见
+    `SV.GB6_FROM_DIAGNOSTIC`（数值）与 `SV.GB6_DIAG_PROVENANCE`（来源/配置）。
+    """
+    fams = list(NEW) if families == (None,) else list(families)
+    out = {}
+    for f in fams:
+        d = dict(family=f, runs_tag=tag, ar_top1=1, ar_top2=2, margin=0.5, tied_at_max=1,
+                 cache_len_after=8255, position=7, prompt_len=PROMPT_LEN,
+                 position_origin=ORIGIN_OK)
+        d.update(over)
+        out[f] = d
+    return out
 
 
 def _gen_for(family: str, mode: str, rep: int, *, variant: int = 0) -> list:
@@ -129,11 +149,15 @@ def _mk(tag: str, family: str, mode: str, rep: int, *, gen: list | None = None,
                    end_state=dict(gen_hash=(self_hash or SV.AGG._gen_hash(gen)), gen_len=len(gen),
                                   stop_reason=stop, eos_seen=False,
                                   # ⚠️ 忠实于真实产物：`end_state.prompt_len` / `max_new` /
-                                  #    `target_cache_len` / `draft_cache_len` / `n_rounds` 都存在
-                                  #    （见 output/g5/attn/div8209_so_F13_prod_rep1_*.json）。
-                                  #    首版合成缺这些字段 ⇒ GB6 的 `absolute_position` 永远推导不出，
-                                  #    属**测试夹具不忠实**（自测 CE4b 抓到）。
+                                  #    `target_cache_len` / `draft_cache_len` / `n_rounds` /
+                                  #    `n_decode_steps` 都存在
+                                  #    （见 output/g5/attn/div8209_so_F13_ar_rep2_*.json：
+                                  #     AR 的 n_decode_steps=63 = 64 token - 首 token；
+                                  #     production 的 n_decode_steps=0）。
+                                  #    首版合成缺这些字段 ⇒ GB6 的 `absolute_position` 与
+                                  #    `ar_work.decode_steps` 永远推导不出（**夹具不忠实**，自测抓到）。
                                   max_new=len(gen), prompt_len=PROMPT_LEN,
+                                  n_decode_steps=(0 if mode != "ar" else max(0, len(gen) - 1)),
                                   target_cache_len=PROMPT_LEN + len(gen),
                                   draft_cache_len=PROMPT_LEN + len(gen), n_rounds=len(rounds))))
     return rec
@@ -244,10 +268,7 @@ def main() -> int:
         ck("G_缺GB6记账时不放行", sG["decision"] == "CHECK_NEEDS_REVIEW"
            and not sG["serial_failures"] and not sG["baseline_failures"], sG["decision"])
         sG2 = SV.evaluate(TAG_GOOD, list(NEW), list(MODES), REPS, outdir=tmpG,
-                          gb6_diagnostics={f: dict(family=f, ar_top1=1, ar_top2=2, margin=0.5,
-                                                   tied_at_max=1, cache_len_after=8255,
-                                                   position=7, prompt_len=PROMPT_LEN, runs_tag=TAG_GOOD)
-                                           for f in NEW})
+                          gb6_diagnostics=_diag(TAG_GOOD))
         ck("G_记账齐全后分歧只记录_判决PASS", sG2["decision"] == "SERIAL_ORACLE_PASS", sG2["decision"])
         sG = sG2
         ck("G_分歧分类为NUMERICAL_DIVERGENCE_RECORDED",
@@ -334,11 +355,8 @@ def main() -> int:
         sCE4a = SV.evaluate(TAG_GOOD, list(NEW), list(MODES), REPS, outdir=tmpCE4)   # 无诊断
         ck("CE4_分歧但无GB6诊断_不PASS", sCE4a["decision"] == "CHECK_NEEDS_REVIEW", sCE4a["decision"])
         ck("CE4_报缺诊断字段",
-           any("GB6 必需字段未齐全" in x for x in sCE4a["needs_review"]), sCE4a["needs_review"][:3])
-        gb6_full = {f: dict(family=f, ar_top1=1, ar_top2=2, margin=0.5, tied_at_max=1,
-                            cache_len_after=8255, position=7, prompt_len=PROMPT_LEN,
-                            runs_tag=TAG_GOOD)
-                    for f in NEW}
+           any("GB6 必需字段**实际为空**" in x for x in sCE4a["needs_review"]), sCE4a["needs_review"][:3])
+        gb6_full = _diag(TAG_GOOD)
         sCE4b = SV.evaluate(TAG_GOOD, list(NEW), list(MODES), REPS, outdir=tmpCE4,
                             gb6_diagnostics=gb6_full)
         ck("CE4b_诊断齐全_可PASS", sCE4b["decision"] == "SERIAL_ORACLE_PASS", sCE4b["decision"])
@@ -378,18 +396,24 @@ def main() -> int:
         sCE4e = SV.evaluate(TAG_GOOD, list(NEW), list(MODES), REPS, outdir=tmpCE4,
                             gb6_diagnostics=gb6_wrongtag)
         ck("CE4e_跨tag诊断被拒_不PASS", sCE4e["decision"] == "CHECK_NEEDS_REVIEW", sCE4e["decision"])
-        # ---- CE4f/4g：`position` 的**坐标系**口径（生产者记的是输出序列内下标）----
-        gb6_idx = {f: {k: v for k, v in gb6_full[f].items() if k != "prompt_len"} for f in NEW}
+        # ---- CE4f：诊断缺 `prompt_len`（**来源/配置**字段不全）⇒ 拒绝（本轮收紧：坐标口径
+        #      的对照必须建立在"两侧同一 prompt_len"之上，缺了就不能采用）----
+        gb6_nopl = {f: {k: v for k, v in gb6_full[f].items() if k != "prompt_len"} for f in NEW}
         sCE4f = SV.evaluate(TAG_GOOD, list(NEW), list(MODES), REPS, outdir=tmpCE4,
-                            gb6_diagnostics=gb6_idx)
-        ck("CE4f_下标坐标系一致_可PASS", sCE4f["decision"] == "SERIAL_ORACLE_PASS", sCE4f["decision"])
-        ck("CE4f_标注下标坐标系",
-           all(sCE4f["per_family"][f]["gb6"].get("position_frame") == "output_index" for f in NEW),
-           {f: sCE4f["per_family"][f]["gb6"].get("position_frame") for f in NEW})
-        gb6_idx_bad = {f: dict(gb6_idx[f], position=9) for f in NEW}
+                            gb6_diagnostics=gb6_nopl)
+        ck("CE4f_缺prompt_len诊断被拒_不PASS", sCE4f["decision"] == "CHECK_NEEDS_REVIEW",
+           sCE4f["decision"])
+        ck("CE4f_理由为来源配置字段不全",
+           any("来源/配置" in x and "prompt_len" in x for x in sCE4f["needs_review"]),
+           sCE4f["needs_review"][:2])
+        # ---- CE4g：位置不符（同坐标系：诊断 position 是输出序列内下标）⇒ 不 PASS ----
+        gb6_idx_bad = {f: dict(gb6_full[f], position=9) for f in NEW}
         sCE4g = SV.evaluate(TAG_GOOD, list(NEW), list(MODES), REPS, outdir=tmpCE4,
                             gb6_diagnostics=gb6_idx_bad)
-        ck("CE4g_下标坐标系不符_不PASS", sCE4g["decision"] == "CHECK_NEEDS_REVIEW", sCE4g["decision"])
+        ck("CE4g_位置与产物不符_不PASS", sCE4g["decision"] == "CHECK_NEEDS_REVIEW", sCE4g["decision"])
+        ck("CE4g_标注为输出下标坐标系",
+           all(sCE4g["per_family"][x]["gb6"].get("position_frame") == "output_index" for x in NEW),
+           {x: sCE4g["per_family"][x]["gb6"].get("position_frame") for x in NEW})
         # ---- CE4h：诊断**没有任何 tag** ⇒ 拒绝（不得默认"同配置"）----
         gb6_notag = {f: {k: v for k, v in gb6_full[f].items() if k != "runs_tag"} for f in NEW}
         sCE4h = SV.evaluate(TAG_GOOD, list(NEW), list(MODES), REPS, outdir=tmpCE4,
@@ -455,6 +479,168 @@ def main() -> int:
            (sCE5["n_env_blocked"], sCE5["env_blocked_records"]))
         ck("CE5_不再是needs_review噪声",
            not any("环境拒绝" in x for x in sCE5["needs_review"]), sCE5["needs_review"][:3])
+
+        # ================= 本轮（CF 系列）：三个**已复现**判决漏洞的回归 =================
+        # ---- CF1：运行侧 GB6 字段缺失（`missing=['absolute_position']`）必须阻断 ----
+        #      旧实现算出了 `missing` 却**从不使用**它 ⇒ 记录不完整仍然 PASS。
+        tmpCF1 = tmp / "cf1"; tmpCF1.mkdir()
+        recs_cf1 = _full_set(TAG_GOOD, prod_variant=1)
+        for r in recs_cf1:
+            r["smoke"]["end_state"].pop("prompt_len", None)   # ⇒ absolute_position 推导不出
+        _write(tmpCF1, recs_cf1)
+        sCF1 = SV.evaluate(TAG_GOOD, list(NEW), list(MODES), REPS, outdir=tmpCF1,
+                           gb6_diagnostics=gb6_full)
+        g1 = sCF1["per_family"]["F09"]["gb6"]
+        ck("CF1_旧实现会PASS的情形现在不PASS", sCF1["decision"] == "CHECK_NEEDS_REVIEW",
+           sCF1["decision"])
+        ck("CF1_missing确含absolute_position", "absolute_position" in (g1.get("missing") or []),
+           g1.get("missing"))
+        ck("CF1_阻断理由点名运行侧缺字段",
+           any("GB6 必需字段**实际为空**" in x and "absolute_position" in x
+               for x in sCF1["needs_review"]), sCF1["needs_review"][:3])
+        ck("CF1_运行侧缺失被单列", "absolute_position" in (g1.get("from_runs_missing") or []),
+           g1.get("from_runs_missing"))
+        # ---- CF1b：字典存在但**关键值全为 None** 不算字段齐全（AR 工作量） ----
+        tmpCF1b = tmp / "cf1b"; tmpCF1b.mkdir()
+        recs_cf1b = _full_set(TAG_GOOD, prod_variant=1)
+        for r in recs_cf1b:
+            if r.get("mode") == "ar":
+                r["smoke"]["end_state"].pop("n_decode_steps", None)     # 无 decode steps
+                r["smoke"]["specdec_stats"].pop("decode_steps", None)
+                r["audit"]["target"].pop("n_generation_calls", None)    # 无 target calls
+        _write(tmpCF1b, recs_cf1b)
+        sCF1b = SV.evaluate(TAG_GOOD, list(NEW), list(MODES), REPS, outdir=tmpCF1b,
+                            gb6_diagnostics=gb6_full)
+        g1b = sCF1b["per_family"]["F09"]["gb6"]
+        ck("CF1b_AR工作量关键值全None不算齐全",
+           {"ar_work.decode_steps", "ar_work.target_gen_calls"} <= set(g1b.get("missing") or []),
+           g1b.get("missing"))
+        ck("CF1b_该情形不PASS", sCF1b["decision"] == "CHECK_NEEDS_REVIEW", sCF1b["decision"])
+        # ---- CF1c：AR 工作量必须按 decode steps/target calls 记录，且**不填造接受率** ----
+        sCF1c = SV.evaluate(TAG_GOOD, list(NEW), list(MODES), REPS, outdir=tmpCE4,
+                            gb6_diagnostics=gb6_full)
+        aw = sCF1c["per_family"]["F09"]["gb6"]["runs_derived"].get("ar_work") or {}
+        ck("CF1c_AR工作量记decode_steps与target_calls",
+           aw.get("decode_steps") is not None and aw.get("target_gen_calls") is not None, aw)
+        ck("CF1c_AR不填造接受率",
+           aw.get("proposed") is None and aw.get("accepted") is None
+           and "not_applicable" in str(aw.get("acceptance")), aw)
+        # ---- CF1d：无分歧时**无需** GB6 诊断（`missing` 必须为空、不得阻断）----
+        tmpCF1d = tmp / "cf1d"; tmpCF1d.mkdir()
+        _write(tmpCF1d, _full_set(TAG_GOOD))              # prod 与 AR 逐 token 相同
+        sCF1d = SV.evaluate(TAG_GOOD, list(NEW), list(MODES), REPS, outdir=tmpCF1d)
+        g1d = sCF1d["per_family"]["F09"]["gb6"]
+        ck("CF1d_无分歧时missing为空", not g1d.get("missing"), g1d.get("missing"))
+        ck("CF1d_无分歧时无需诊断即可PASS", sCF1d["decision"] == "SERIAL_ORACLE_PASS",
+           sCF1d["decision"])
+        # ---- CF2：新 family AR 的 `smoke.stop_reason` 与 `end_state.stop_reason` 矛盾必须阻断 ----
+        tmpCF2 = tmp / "cf2"; tmpCF2.mkdir()
+        recs_cf2 = _full_set(TAG_GOOD)
+        for r in recs_cf2:
+            if r.get("mode") == "ar":
+                r["smoke"]["end_state"]["stop_reason"] = "eos"     # smoke 说 max_new_reached
+        _write(tmpCF2, recs_cf2)
+        sCF2 = SV.evaluate(TAG_GOOD, list(NEW), list(MODES), REPS, outdir=tmpCF2)
+        pf2 = sCF2["per_family"]["F03"]
+        ck("CF2_旧实现会PASS的情形现在不PASS", sCF2["decision"] == "CHECK_NEEDS_REVIEW",
+           sCF2["decision"])
+        ck("CF2_矛盾被列为自报状态矛盾",
+           bool(pf2["ar_checks"].get("per_row")) and
+           all(rr["contradictions"].get("stop_smoke_vs_end_state")
+               for rr in pf2["ar_checks"]["per_row"]), pf2["ar_checks"].get("per_row"))
+        ck("CF2_stop_matches_end_state检查为False",
+           pf2["ar_checks"].get("stop_matches_end_state") is False,
+           pf2["ar_checks"].get("stop_matches_end_state"))
+        ck("CF2_理由为自报状态相互矛盾",
+           any("自报状态相互矛盾" in x for x in sCF2["needs_review"]), sCF2["needs_review"][:3])
+        ck("CF2_不误判为基线回归", not sCF2["baseline_failures"], sCF2["baseline_failures"][:2])
+        # ---- CF2b：新 family AR **缺** `end_state.stop_reason` ⇒ 归为"证据缺失" ----
+        tmpCF2b = tmp / "cf2b"; tmpCF2b.mkdir()
+        recs_cf2b = _full_set(TAG_GOOD)
+        for r in recs_cf2b:
+            if r.get("mode") == "ar":
+                r["smoke"]["end_state"].pop("stop_reason", None)
+        _write(tmpCF2b, recs_cf2b)
+        sCF2b = SV.evaluate(TAG_GOOD, list(NEW), list(MODES), REPS, outdir=tmpCF2b)
+        ck("CF2b_缺stop_reason归为证据缺失_不PASS",
+           sCF2b["decision"] == "CHECK_NEEDS_REVIEW"
+           and any("证据缺失" in x and "end_state.stop_reason" in x
+                   for x in sCF2b["needs_review"]), sCF2b["needs_review"][:3])
+        # ---- CF2c：新 family AR 的独立 hash 与 end_state hash 矛盾 ⇒ 阻断 ----
+        tmpCF2c = tmp / "cf2c"; tmpCF2c.mkdir()
+        recs_cf2c = _full_set(TAG_GOOD)
+        for r in recs_cf2c:
+            if r.get("mode") == "ar":
+                r["smoke"]["end_state"]["gen_hash"] = "deadbeefdeadbeef"
+        _write(tmpCF2c, recs_cf2c)
+        sCF2c = SV.evaluate(TAG_GOOD, list(NEW), list(MODES), REPS, outdir=tmpCF2c)
+        ck("CF2c_hash矛盾被列为矛盾并阻断",
+           sCF2c["decision"] == "CHECK_NEEDS_REVIEW"
+           and any("自报状态相互矛盾" in x for x in sCF2c["needs_review"]),
+           sCF2c["needs_review"][:2])
+        # ---- CF2d：两次重复之间不一致仍按"基线回归"（确定性失败，分类不能被改坏）----
+        #      注意：必须把该 rep 的**自报字段一起改**，否则同时制造出"自报矛盾"，
+        #      测的就不是"两次之间不一致"这一类了（下面的 CF2e 专门测两者的优先级）。
+        tmpCF2d = tmp / "cf2d"; tmpCF2d.mkdir()
+        recs_cf2d = _full_set(TAG_GOOD)
+        for r in recs_cf2d:
+            if r.get("mode") == "ar" and int(r.get("rep") or 0) == 2:
+                g2 = [x + 1 for x in r["smoke"]["gen"]]
+                r["smoke"]["gen"] = g2
+                r["smoke"]["end_state"]["gen_hash"] = SV.AGG._gen_hash(g2)
+        _write(tmpCF2d, recs_cf2d)
+        sCF2d = SV.evaluate(TAG_GOOD, list(NEW), list(MODES), REPS, outdir=tmpCF2d)
+        ck("CF2d_两次重复不一致=BASELINE_REGRESSION",
+           sCF2d["decision"] == "BASELINE_REGRESSION", sCF2d["decision"])
+        ck("CF2d_分类为两次之间不一致",
+           any("两次" in x for x in sCF2d["baseline_failures"]), sCF2d["baseline_failures"][:2])
+        # ---- CF2e：既"两次不一致"又"自报矛盾"时，`CHECK_NEEDS_REVIEW`（证据不可信）优先于
+        #      `BASELINE_REGRESSION`：**不得**在记录本身矛盾时声称"基线回归" ----
+        tmpCF2e = tmp / "cf2e"; tmpCF2e.mkdir()
+        recs_cf2e = _full_set(TAG_GOOD)
+        for r in recs_cf2e:
+            if r.get("mode") == "ar" and int(r.get("rep") or 0) == 2:
+                r["smoke"]["gen"] = [x + 1 for x in r["smoke"]["gen"]]   # 自报字段**不**跟着改
+        _write(tmpCF2e, recs_cf2e)
+        sCF2e = SV.evaluate(TAG_GOOD, list(NEW), list(MODES), REPS, outdir=tmpCF2e)
+        ck("CF2e_自报矛盾优先于基线回归",
+           sCF2e["decision"] == "CHECK_NEEDS_REVIEW"
+           and any("自报状态相互矛盾" in x for x in sCF2e["needs_review"]), sCF2e["decision"])
+        # ---- CF3：诊断**位置来源**必须自证为首分歧；"末 token"口径的记录必须被拒 ----
+        gb6_legacy = _diag(TAG_GOOD, position_origin="legacy_last_index（无分歧 ⇒ 末位；非首分歧）")
+        sCF3 = SV.evaluate(TAG_GOOD, list(NEW), list(MODES), REPS, outdir=tmpCE4,
+                           gb6_diagnostics=gb6_legacy)
+        ck("CF3_末token口径诊断被拒_不PASS", sCF3["decision"] == "CHECK_NEEDS_REVIEW",
+           sCF3["decision"])
+        ck("CF3_拒绝理由点名position_origin",
+           any("position_origin" in x and "first_divergence" in x for x in sCF3["needs_review"]),
+           sCF3["needs_review"][:2])
+        # CF3b：诊断缺 position_origin（旧 margins 产物就是这种形态）⇒ 拒绝
+        gb6_noorigin = {f: {k: v for k, v in gb6_full[f].items() if k != "position_origin"}
+                        for f in NEW}
+        sCF3b = SV.evaluate(TAG_GOOD, list(NEW), list(MODES), REPS, outdir=tmpCE4,
+                            gb6_diagnostics=gb6_noorigin)
+        ck("CF3b_缺position_origin被拒_不PASS", sCF3b["decision"] == "CHECK_NEEDS_REVIEW",
+           sCF3b["decision"])
+        # CF3c：两侧 token 不一致 ⇒ 拒绝（运行侧与诊断侧必须相互一致）
+        gb6_badtok = {f: dict(gb6_full[f], ar_token=999999) for f in NEW}
+        sCF3c = SV.evaluate(TAG_GOOD, list(NEW), list(MODES), REPS, outdir=tmpCE4,
+                            gb6_diagnostics=gb6_badtok)
+        ck("CF3c_两侧token不一致被拒_不PASS", sCF3c["decision"] == "CHECK_NEEDS_REVIEW",
+           sCF3c["decision"])
+        ck("CF3c_理由点名token不一致",
+           any("token 与运行侧产物不一致" in x for x in sCF3c["needs_review"]),
+           sCF3c["needs_review"][:2])
+        # CF3d：位置正确 + 两侧字段齐全 ⇒ **完整记账**并放行（正向用例）----
+        rd_ok = sCE4b["per_family"]["F09"]["gb6"]
+        ck("CF3d_正向：两侧字段齐全且无残留缺失",
+           (not rd_ok.get("missing")) and (not rd_ok.get("from_runs_missing"))
+           and rd_ok.get("from_diagnostic_available") == sorted(SV.GB6_FROM_DIAGNOSTIC),
+           (rd_ok.get("missing"), rd_ok.get("from_runs_missing"),
+            rd_ok.get("from_diagnostic_available")))
+        ck("CF3d_正向：位置与两侧token全部对得上",
+           rd_ok["runs_derived"]["first_divergence_index"] == rd_ok["diagnostic_provenance"]["position"]
+           and rd_ok["runs_derived"]["round_index"] is not None, rd_ok.get("runs_derived"))
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

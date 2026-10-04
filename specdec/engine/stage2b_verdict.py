@@ -46,10 +46,20 @@ LEGAL_STOPS = ("max_new_reached", "eos")
 REQUIRED_MODES = ("ar", "prod", "serial")
 PREREGISTERED_REPS = 2
 # GB6 记账字段的两类来源（**不得**编造，也**不得**从别的 family/旧配置迁移）
+# 运行侧：`ar_work`/`prod_work` 是**按模式如实记录的工作量**（AR 记 decode steps / target calls，
+# **不填造接受率**；production 记 rounds/proposed/accepted/rollbacks/block calls）。
 GB6_FROM_RUNS = ("first_divergence_index", "common_prefix_len", "ar_token", "prod_token",
                  "ar_len", "prod_len", "absolute_position", "round_index",
-                 "ar_acceptance_work", "prod_acceptance_work")
+                 "ar_work", "prod_work")
 GB6_FROM_DIAGNOSTIC = ("ar_top1", "ar_top2", "margin", "tied_at_max", "cache_len_after")
+# 工作量字段的**逐字段**必需项：字典存在但关键值全为 None **不算**字段齐全（本轮反例之一）。
+GB6_WORK_REQUIRED = {"ar_work": ("decode_steps", "target_gen_calls"),
+                     "prod_work": ("rounds", "proposed", "accepted")}
+# 诊断记录的**来源/配置**字段：缺任何一个都说明这份记录"来历不明"⇒ 不得采用。
+# `position_origin` 必须自证"位置来自同 tag/同 family 的 AR vs production 首分歧"，
+# 从而在**消费端**堵住"找不到 prod 就退回末 token"的旧行为。
+GB6_DIAG_PROVENANCE = ("family", "runs_tag", "position_origin", "position", "prompt_len")
+GB6_POSITION_ORIGIN_REQUIRED = "first_divergence"
 # 有**历史登记输出锚点**的 family（沿用既有判据，不改写）；其余视为"新 family（无旧 AR 锚点）"
 KNOWN_ANCHOR_FAMILIES = tuple(AGG.STAGE2_FAMILIES)
 
@@ -66,7 +76,11 @@ def _extra_fields(rec: dict) -> dict:
                 input_source_kind=inp.get("source_kind"),
                 provenance_hash_verified=(prov.get("hash_verified") if isinstance(prov, dict) else None),
                 env_qualified=rec.get("env_qualified"),
-                model_run_happened=rec.get("model_run_happened"))
+                model_run_happened=rec.get("model_run_happened"),
+                # GB6 的 AR 工作量要按 **decode steps** 记录 ⇒ 这里如实暴露产物里的该字段
+                # （真实 AR 产物 = 63；production = 0）。字段名契约自测 s12 要求"凡是被
+                # stage2b 工具 `.get(...)` 引用的行字段，都必须真的存在于 `SV._row` 输出里"。
+                end_state_n_decode_steps=((sm.get("end_state") or {}).get("n_decode_steps")))
 
 
 def _row(rec: dict) -> dict:
@@ -133,11 +147,53 @@ def validate_arguments(tag: str, families: list, modes: list, reps) -> list:
 
 
 def _acceptance_work(r: dict) -> dict:
+    """**production（投机）侧**的工作量：如实取自 `specdec_stats`。"""
     st = r.get("specdec_stats") or {}
-    return dict(rounds=st.get("rounds"), proposed=st.get("proposed"), accepted=st.get("accepted"),
+    return dict(mode="prod", rounds=st.get("rounds"), proposed=st.get("proposed"),
+                accepted=st.get("accepted"),
                 target_block_calls=st.get("target_block_calls"), draft_calls=st.get("draft_calls"),
                 rollbacks=st.get("rollbacks"), actual_len=r.get("gen_len"),
                 stop_reason=r.get("stop_reason"))
+
+
+def _ar_work(r: dict) -> dict:
+    """**AR 侧**的工作量：按 **decode steps / target generation calls** 记录。
+
+    ⚠️ 反例（本轮修复）：旧实现把 AR 也塞进 `_acceptance_work`，于是 `proposed`/`accepted` 恒为
+    `None` —— 既不是"AR 的接受率"（AR 没有投机，接受率**不适用**），也不是可用工作量。
+    这里改为：`decode_steps`（取 `end_state.n_decode_steps`，真实 AR 产物 = 63）·
+    `target_gen_calls`（审计计数）· `actual_len` · `stop_reason`，并**显式写出**
+    `acceptance="not_applicable（AR 无投机）"`，避免读者把它当作"接受率缺失"。
+    这两个关键字段**逐字段**参与完整性核对（见 `GB6_WORK_REQUIRED`）。
+    """
+    steps = r.get("end_state_n_decode_steps")
+    if steps is None:
+        steps = (r.get("specdec_stats") or {}).get("decode_steps")
+    n = r.get("gen_len")
+    return dict(mode="ar", decode_steps=steps, target_gen_calls=r.get("target_gen_calls"),
+                actual_len=n, stop_reason=r.get("stop_reason"),
+                acceptance="not_applicable（AR 无投机 ⇒ 无 proposed/accepted，不填造接受率）",
+                decode_steps_derivation=("end_state.n_decode_steps（真实 AR：64 token = 首 token + 63 步 decode）"
+                                         if steps is not None else "缺 n_decode_steps/decode_steps"))
+
+
+def _gb6_present(v) -> bool:
+    """字段是否**实际非空**。
+
+    ⚠️ 反例（本轮修复）：旧实现只判 `v in (None, {})` ⇒ "字典存在但关键值全为 None"
+    （例如 AR 工作量字典的每个值都是 None）会被算作**字段齐全** ⇒ 缺口被静默放过。
+    规则：None / 空字典 / 全 None 的字典 / 全 None 的序列 / 空串 ⇒ **缺失**；
+    `0`、`False`、非空串 ⇒ **存在**（`tied_at_max=0`、`first_divergence_index=0` 都是合法值）。
+    """
+    if v is None:
+        return False
+    if isinstance(v, dict):
+        return any(_gb6_present(x) for x in v.values())
+    if isinstance(v, (list, tuple, set)):
+        return any(_gb6_present(x) for x in v)
+    if isinstance(v, str):
+        return bool(v.strip())
+    return True
 
 
 def _gb6_run_view(row: dict, raw: dict | None) -> dict:
@@ -157,8 +213,10 @@ def _gb6_run_view(row: dict, raw: dict | None) -> dict:
         file=row.get("file"), rep=row.get("rep"), gen=gen, gen_len=len(gen),
         gen_hash=row.get("gen_hash"), rounds=sm.get("rounds") or [],
         specdec_stats=sm.get("specdec_stats") or {}, stop_reason=row.get("stop_reason"),
+        target_gen_calls=row.get("target_gen_calls"),
         prompt_len=(None if es.get("prompt_len") is None else int(es["prompt_len"])),
         end_state_gen_hash=es.get("gen_hash"), end_state_gen_len=es.get("gen_len"),
+        end_state_n_decode_steps=es.get("n_decode_steps"),
         end_state_n_rounds=es.get("n_rounds"), end_state_target_cache_len=es.get("target_cache_len"),
         end_state_draft_cache_len=es.get("draft_cache_len"))
 
@@ -197,7 +255,12 @@ def _gb6_record(fam: str, ar_views: list, pr_views: list, diag: dict | None) -> 
         out["artifact_inconsistency"]["gen_hash_vs_end_state"] = bad_hash
     d = AGG._first_div(pg, ag)
     if d is None:
+        # 无分歧 ⇒ **无需** GB6 记账：`missing` 必须是空的，否则每个"token 相等"的 family 都会被
+        # 误判为"缺字段"（本轮把 `missing` 提升为阻断判据后，这个区分是必需的）。
         out["divergent"] = False
+        out["missing"] = []
+        out["not_applicable"] = ("AR 与 production 逐 token 相同 ⇒ 无分歧可记账；"
+                                 "诊断字段（top-1/top-2/margin/tie/cache）在此**非必需**")
         return out
     out["divergent"] = True
     prompt_len = ar.get("prompt_len")
@@ -219,8 +282,8 @@ def _gb6_record(fam: str, ar_views: list, pr_views: list, diag: dict | None) -> 
         round_index_source=("prod" if pr_ridx is not None else ("ar" if ar_ridx is not None else None)),
         round_index_prod=pr_ridx, round_index_ar=ar_ridx,
         round_start_offset=(pr_cum if pr_ridx is not None else ar_cum),
-        ar_acceptance_work=_acceptance_work(ar),
-        prod_acceptance_work=_acceptance_work(pr),
+        ar_work=_ar_work(ar),
+        prod_work=_acceptance_work(pr),
         prod_hashes=[v.get("gen_hash") for v in pr_views],
         # 产物里可直接取得的 cache 长度（**补充证据**，不替代诊断 pass 的 `cache_len_after`）；
         # 真实产物 `end_state` 中存在；缺失则如实为 None，不推导、不迁移。
@@ -240,6 +303,12 @@ def _gb6_record(fam: str, ar_views: list, pr_views: list, diag: dict | None) -> 
         same_family = (diag.get("family") == fam) or (diag.get("family_id") == fam)
         diag_tag = diag.get("runs_tag") or diag.get("tag")
         same_tag = (diag_tag is not None) and (diag_tag == _GB6_CTX.get("tag"))
+        # (c) 本轮新增：诊断必须**自证来源** —— `position_origin` 须表明位置取自
+        #     "同 tag、同 family 的 AR 与 production 首分歧"。旧工具在找不到 `prod` 时
+        #     会把位置退化成**末 token**（真实 F13 实测：pos=63 而真值 47）；这类记录在
+        #     消费端必须被拒，而不是被当作首分歧用。
+        prov_missing = [k for k in GB6_DIAG_PROVENANCE if not _gb6_present(diag.get(k))]
+        origin = str(diag.get("position_origin") or "")
         if not same_family:
             out["rejected_reason"] = (f"诊断记录的 family={diag.get('family') or diag.get('family_id')!r}"
                                       f" 与本 family 不符")
@@ -247,12 +316,19 @@ def _gb6_record(fam: str, ar_views: list, pr_views: list, diag: dict | None) -> 
             out["rejected_reason"] = "诊断记录没有可核对的 tag（禁止默认『同配置』⇒ 不采用）"
         elif not same_tag:
             out["rejected_reason"] = f"诊断记录的 tag={diag_tag!r} 与本轮 tag 不符（禁止跨配置迁移）"
+        elif prov_missing:
+            out["rejected_reason"] = (f"诊断记录缺**来源/配置**字段 {prov_missing} ⇒ 来历不明，不得采用")
+        elif GB6_POSITION_ORIGIN_REQUIRED not in origin:
+            out["rejected_reason"] = (f"诊断记录的 position_origin={origin!r} 未表明位置来自"
+                                      f"『同 tag/同 family 的 AR vs production 首分歧』"
+                                      f"（要求含 {GB6_POSITION_ORIGIN_REQUIRED!r}）⇒ 不得采用")
         else:
             out["source"] = diag.get("_source")
             out["diagnostic"] = {k: diag.get(k) for k in GB6_FROM_DIAGNOSTIC}
+            out["diagnostic_provenance"] = {k: diag.get(k) for k in GB6_DIAG_PROVENANCE}
             # 位置交叉核对（同一坐标系）：生产者的口径是 **输出序列内下标** ——
-            # `correctness_protocol_margins.py:142` 记的是 `pos = cp`（首分歧下标），
-            # 历史产物亦如此（F01: position=14, prompt_len=8192）。故比较对象是 `common_prefix_len`；
+            # 新工具的 `position` 就是 AR vs production 的首分歧下标；历史产物亦是下标
+            # （F01: position=14, prompt_len=8192）。故比较对象是 `common_prefix_len`；
             # 不把 `position` 当绝对位置（首版那样做会自相矛盾：同一个数两边都不对）。
             dpos = diag.get("position")
             d_common = out["runs_derived"].get("common_prefix_len")
@@ -263,9 +339,29 @@ def _gb6_record(fam: str, ar_views: list, pr_views: list, diag: dict | None) -> 
             dpl = diag.get("prompt_len")
             if dpl is not None and prompt_len is not None and int(dpl) != int(prompt_len):
                 out["prompt_len_mismatch"] = dict(diagnostic=int(dpl), derived=int(prompt_len))
-    out["missing"] = ([k for k in GB6_FROM_RUNS if out["runs_derived"].get(k) in (None, {})]
-                      + [k for k in GB6_FROM_DIAGNOSTIC if not out["diagnostic"].get(k, None) is not None
-                         and out["diagnostic"].get(k) is None])
+            # **两侧 token 相互一致**：诊断若也记了 `ar_token`/`prod_token`，必须与运行侧推出的一致。
+            tok_mm = {}
+            for side, key in (("ar", "ar_token"), ("prod", "prod_token")):
+                dv, rv = diag.get(key), out["runs_derived"].get(key)
+                if _gb6_present(dv) and _gb6_present(rv) and int(dv) != int(rv):
+                    tok_mm[key] = dict(diagnostic=int(dv), derived=int(rv))
+            if tok_mm:
+                out["token_mismatch"] = tok_mm
+    # `missing` 一律用 `_gb6_present`（"存在但值全为 None"**不算**字段齐全）。
+    # 工作量字段再**逐子字段**核对：`ar_work` 必须有 decode_steps/target_gen_calls，
+    # `prod_work` 必须有 rounds/proposed/accepted；缺哪个就点哪个名字。
+    out["missing"] = [k for k in GB6_FROM_RUNS if not _gb6_present(out["runs_derived"].get(k))]
+    for key, sub in GB6_WORK_REQUIRED.items():
+        w = out["runs_derived"].get(key) or {}
+        miss = [f"{key}.{s}" for s in sub if not _gb6_present(w.get(s))]
+        if miss:
+            out["missing"] = [m for m in out["missing"] if m != key] + miss
+    # 诊断记录被**拒绝**时，其字段不计入"缺失"（那是另一类失败，已由 `rejected_reason` 单独报出）。
+    if out.get("rejected_reason"):
+        out["missing_diagnostic_note"] = "诊断记录被拒绝 ⇒ 其字段不作『缺失』计（另有拒绝理由）"
+    else:
+        out["missing"] += [k for k in GB6_FROM_DIAGNOSTIC
+                           if not _gb6_present(out["diagnostic"].get(k))]
     return out
 
 
@@ -362,37 +458,103 @@ def _ar_baseline_known(fam: str, ar: list) -> dict:
     missing_field: list = []
     ok = bool(checks["reps_identical"] and checks["equals_registered_anchor"]
               and checks["self_reported_hash_agrees"])
-    return dict(checks=checks, ok=ok, missing_fields=missing_field)
+    # 与 `_ar_baseline_new` 统一 schema：`inconsistency` = "可评估且不成立" ⇒ BASELINE_REGRESSION。
+    # 旧 family 的判据**不变**（仍是这三项），只是换成显式分类后由 `evaluate` 分开报。
+    inconsistency = [k for k in ("reps_identical", "equals_registered_anchor",
+                                 "self_reported_hash_agrees") if checks[k] is not True]
+    return dict(checks=checks, ok=ok, missing_fields=missing_field,
+                self_contradiction={}, inconsistency=inconsistency)
 
 
 def _ar_baseline_new(fam: str, ar: list, *, reps: int, ctx: int) -> dict:
-    """**新 family（无旧 AR 锚点）**：只校验自一致 + 自报一致 + manifest 输入 hash。"""
+    """**新 family（无旧 AR 锚点）**：逐条核对自报字段 + 自一致 + manifest 输入 hash。
+
+    ⚠️ 反例（本轮修复 CF2）：旧实现只把 `smoke.stop_reason` 单独判"合法且两次一致"，
+    **从不与 `end_state.stop_reason` 对照** ⇒ 一条 `smoke.stop_reason=max_new_reached` 而
+    `end_state.stop_reason=eos` 的产物照样 PASS。现在逐条核对两处自报状态：
+    生成 IDs **独立算出的** hash（`gen_hash`）· `end_state.gen_hash` · 实际长度 ·
+    `end_state.gen_len` · `smoke.stop_reason` · `end_state.stop_reason`。
+
+    分类（两者都阻断，但性质不同，必须分开报）：
+      * `missing_fields`  —— 上述任一字段**缺失** ⇒ 证据不足 ⇒ `CHECK_NEEDS_REVIEW`；
+      * `self_contradiction` —— 字段都在但**相互矛盾**（含预登记长度不符、停止原因非法）
+        ⇒ 该产物**不可信** ⇒ `CHECK_NEEDS_REVIEW`（不判成"基线回归"：矛盾说明记录坏了，
+        不能据此声称模型输出变了）；
+      * `inconsistency` —— **两次重复之间**不一致（token/hash/长度/停止）⇒ 确定性失败
+        ⇒ `BASELINE_REGRESSION`。
+    """
     exp_sha = _manifest_token_sha1(fam, ctx=ctx)
     hashes = [r["gen_hash"] for r in ar]
     stops = [r["stop_reason"] for r in ar]
     input_shas = [r.get("input_family_token_sha1") for r in ar]
+    per_row: list = []
+    missing_fields: list = []
+    contradiction: dict = {}
+    for r in ar:
+        rep = r.get("rep")
+        indep_hash, es_hash = r.get("gen_hash"), r.get("end_state_gen_hash")
+        L, eL = r.get("gen_len"), r.get("end_state_len")
+        s_smoke, s_end = r.get("stop_reason"), r.get("end_state_stop")
+        row_missing = [k for k, v in (("gen_hash（独立计算）", indep_hash),
+                                      ("end_state.gen_hash", es_hash), ("gen_len", L),
+                                      ("end_state.gen_len", eL), ("smoke.stop_reason", s_smoke),
+                                      ("end_state.stop_reason", s_end)) if not _gb6_present(v)]
+        if row_missing:
+            missing_fields.append(f"rep{rep}: {'/'.join(row_missing)}")
+        row_bad: dict = {}
+        if _gb6_present(indep_hash) and _gb6_present(es_hash) and indep_hash != es_hash:
+            row_bad["hash"] = dict(independent=indep_hash, end_state=es_hash)
+        if L is not None and eL is not None and L != eL:
+            row_bad["len"] = dict(actual=L, end_state=int(eL))
+        if L is not None and L != EXPECTED_LEN:
+            row_bad["len_vs_preregistered"] = dict(actual=L, expected=EXPECTED_LEN)
+        if _gb6_present(s_smoke) and _gb6_present(s_end) and s_smoke != s_end:
+            row_bad["stop_smoke_vs_end_state"] = dict(smoke=s_smoke, end_state=s_end)
+        if _gb6_present(s_smoke) and s_smoke not in LEGAL_STOPS:
+            row_bad["stop_not_legal"] = s_smoke
+        if row_bad:
+            contradiction[f"rep{rep}"] = row_bad
+        per_row.append(dict(rep=rep, hash_independent=indep_hash, hash_end_state=es_hash,
+                            len_actual=L, len_end_state=eL, stop_smoke=s_smoke, stop_end=s_end,
+                            missing=row_missing, contradictions=row_bad))
+    # 两次重复之间的一致性（属于"确定性失败"，不是"记录矛盾"）
+    between: list = []
+    if len(ar) >= 2:
+        if len({tuple(r["gen"]) for r in ar}) != 1:
+            between.append("两次生成的 token IDs 不同")
+        if len({r.get("gen_hash") for r in ar}) != 1:
+            between.append(f"两次自报 hash 不同 {hashes}")
+        if len({r.get("gen_len") for r in ar}) != 1:
+            between.append(f"两次实际长度不同 {[r.get('gen_len') for r in ar]}")
+        if len({r.get("stop_reason") for r in ar}) != 1:
+            between.append(f"两次 stop_reason 不同 {stops}")
     checks = dict(anchor_class="no_output_anchor（新 family：不得套用旧 family 的登记 hash）",
                   reps_present=bool(len(ar) == reps),
                   reps_identical=bool(len(ar) >= 2 and len({tuple(r["gen"]) for r in ar}) == 1),
-                  self_reported_hash_agrees=bool(ar and all(r["gen_hash"] == r.get("end_state_gen_hash")
-                                                            for r in ar)),
-                  self_reported_len_agrees=bool(ar and all(
-                      r["gen_len"] == r.get("end_state_len") == EXPECTED_LEN for r in ar)),
-                  stop_legal_and_consistent=bool(stops and len(set(stops)) == 1
-                                                 and stops[0] in LEGAL_STOPS),
+                  per_row=per_row,
+                  self_reported_hash_agrees=not any("hash" in b for b in contradiction.values()),
+                  self_reported_len_agrees=not any(("len" in b or "len_vs_preregistered" in b)
+                                                   for b in contradiction.values()),
+                  stop_legal=all(_gb6_present(s) and s in LEGAL_STOPS for s in stops),
+                  stop_matches_end_state=not any("stop_smoke_vs_end_state" in b
+                                                 for b in contradiction.values()),
+                  between_reps_consistent=not between,
                   manifest_input_hash_available=bool(exp_sha),
                   manifest_input_hash_matches=bool(exp_sha and input_shas
                                                    and all(s == exp_sha for s in input_shas)),
                   manifest_expected_token_sha1=exp_sha,
                   observed_input_token_sha1=input_shas,
-                  observed_hashes=hashes)
-    missing = [k for k in ("manifest_input_hash_available", "manifest_input_hash_matches")
-               if checks[k] is not True]
-    hard_fail = [k for k in ("reps_identical", "self_reported_hash_agrees",
-                             "self_reported_len_agrees", "stop_legal_and_consistent")
-                 if checks[k] is not True]
-    return dict(checks=checks, ok=bool(not hard_fail and not missing),
-                inconsistency=hard_fail, missing_fields=missing)
+                  observed_hashes=hashes,
+                  observed_stops_smoke=stops,
+                  observed_stops_end_state=[r.get("end_state_stop") for r in ar])
+    missing = ([k for k in ("manifest_input_hash_available", "manifest_input_hash_matches")
+                if checks[k] is not True])
+    return dict(checks=checks, ok=bool(not missing and not missing_fields and not contradiction
+                                       and not between),
+                missing_fields=missing + missing_fields,
+                self_contradiction=contradiction,
+                between_reps=between,
+                inconsistency=between)
 
 
 def _production_checks(fam: str, pr: list, *, reps: int, ar_ref: list | None) -> dict:
@@ -529,17 +691,16 @@ def evaluate(tag: str, families: list, modes: list, reps: int, *, outdir: Path =
             gb6_needs_review.append(f"{fam}: GB6 产物自洽性异常（不因分歧与否而豁免）"
                                     f"{gb6['artifact_inconsistency']}")
         if gb6.get("divergent"):
-            gb6["from_runs_available"] = sorted(GB6_FROM_RUNS)
+            gb6["from_runs_available"] = sorted(k for k in GB6_FROM_RUNS
+                                                if _gb6_present(gb6["runs_derived"].get(k)))
+            gb6["from_runs_missing"] = sorted(k for k in GB6_FROM_RUNS
+                                              if not _gb6_present(gb6["runs_derived"].get(k)))
             gb6["from_diagnostic_available"] = sorted(k for k in GB6_FROM_DIAGNOSTIC
-                                                      if gb6["diagnostic"].get(k) is not None)
+                                                      if _gb6_present(gb6["diagnostic"].get(k)))
             gb6["from_diagnostic_missing"] = sorted(k for k in GB6_FROM_DIAGNOSTIC
-                                                    if gb6["diagnostic"].get(k) is None)
+                                                    if not _gb6_present(gb6["diagnostic"].get(k)))
             if gb6.get("rejected_reason"):
                 gb6_needs_review.append(f"{fam}: GB6 诊断记录被拒绝 —— {gb6['rejected_reason']}")
-            elif gb6["from_diagnostic_missing"]:
-                gb6_needs_review.append(
-                    f"{fam}: production 与 AR 分歧，但 GB6 必需字段未齐全（需**独立诊断 pass**）："
-                    f"{gb6['from_diagnostic_missing']} ⇒ 不得判 PASS")
             if gb6.get("position_mismatch"):
                 gb6_needs_review.append(
                     f"{fam}: GB6 诊断位置与产物推导不一致 {gb6['position_mismatch']}")
@@ -547,6 +708,20 @@ def evaluate(tag: str, families: list, modes: list, reps: int, *, outdir: Path =
                 gb6_needs_review.append(
                     f"{fam}: GB6 诊断的 prompt_len 与产物不一致 {gb6['prompt_len_mismatch']}"
                     f"（疑似不同输入配置 ⇒ 不得采用）")
+            if gb6.get("token_mismatch"):
+                gb6_needs_review.append(
+                    f"{fam}: GB6 诊断的 token 与运行侧产物不一致 {gb6['token_mismatch']}"
+                    f"（两侧必须相互一致）")
+        # ⚠️ **本轮核心修复（反例 CF1）**：`gb6["missing"]` 必须进入阻断判据。
+        #    旧实现只检查了**诊断侧**缺失，于是"运行侧字段缺失（如 `absolute_position`）"
+        #    被算出却**从未被使用** ⇒ 记录不完整仍然 PASS。现在两侧一视同仁：
+        #    `missing` 非空 ⇒ CHECK_NEEDS_REVIEW，且逐项点名缺的是哪一侧的哪个字段。
+        if gb6.get("missing"):
+            gb6_needs_review.append(
+                f"{fam}: GB6 必需字段**实际为空** {gb6['missing']}"
+                f"（运行侧缺 {gb6.get('from_runs_missing', [k for k in GB6_FROM_RUNS if k in gb6['missing']])}；"
+                f"诊断侧缺 {gb6.get('from_diagnostic_missing', [k for k in GB6_FROM_DIAGNOSTIC if k in gb6['missing']])}）"
+                f" ⇒ 不得判 PASS")
         per_family[fam] = dict(
             family=fam, anchor_class=base["checks"].get("anchor_class"),
             n_reps=dict(ar=len(ar), prod=len(pr), serial=len(se)),
@@ -559,11 +734,20 @@ def evaluate(tag: str, families: list, modes: list, reps: int, *, outdir: Path =
             first_divergence_vs_ar=[r["_first_div_vs_ar"] for r in se],
             serial_hashes=[r["gen_hash"] for r in se], ar_hashes=[r["gen_hash"] for r in ar],
             hard_checks=hard, independent_round_checks=rounds, independent_trace_checks=traces)
-        if not base["ok"]:
-            if base.get("missing_fields"):
-                needs_review.append(f"{fam}: AR 基线**无法评估**（缺字段 {base['missing_fields']}）")
-            else:
-                baseline_fail.append(f"{fam}: AR 基线不成立（{base['checks']}）")
+        # AR 基线：三类问题**分开报**（缺字段 / 自报矛盾 / 可评估但不成立），全部阻断：
+        #   * 缺字段 ⇒ CHECK_NEEDS_REVIEW（证据不足）；
+        #   * 自报状态矛盾（如 smoke.stop_reason ≠ end_state.stop_reason）⇒ CHECK_NEEDS_REVIEW
+        #     （产物不可信；**不**声称"基线回归"，因为矛盾恰恰说明记录坏了）；
+        #   * 可评估且不成立（锚点不符 / 两次重复不一致）⇒ BASELINE_REGRESSION。
+        if base.get("missing_fields"):
+            needs_review.append(f"{fam}: AR 基线**证据缺失**（{base['missing_fields']}）⇒ 不得判 PASS")
+        if base.get("self_contradiction"):
+            needs_review.append(f"{fam}: AR 产物**自报状态相互矛盾** {base['self_contradiction']}"
+                                f"（生成 IDs 独立 hash / end_state hash / 长度 / 两处 stop_reason）"
+                                f" ⇒ 产物不可信，不得判 PASS")
+        if base.get("inconsistency"):
+            baseline_fail.append(f"{fam}: AR 基线不成立（{base['inconsistency']}；"
+                                 f"checks={ {k: v for k, v in base['checks'].items() if v is not True} }）")
         for key, dd in hard.items():
             for name, v in dd.items():
                 if v["ok"] is False:

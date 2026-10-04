@@ -112,7 +112,12 @@ OPT_IN_CONSUMERS = {"g5_8k_smoke_cudnn.py",      # fam16 授权轮（SMOKE_FAMIL
                     # 的口径属于消费方，必须显式登记（登记 + 下方 scoped 检查；**不放宽**任何既有检查）。
                     # 它们**不产生任何 run**，因此**不**影响 run 级授权检查。
                     "stage2b_verdict.py", "stage2b_preflight_cpu.py",
-                    "stage2b_verdict_selftest_cpu.py"}
+                    "stage2b_verdict_selftest_cpu.py",
+                    # 2026-10-04（GB6 诊断轮）登记：GB6 诊断的**产物配对/来源核对**（纯 CPU、只读）。
+                    # 它按 `_manifest_consumers()` 的字面量口径确实读取记录里的 manifest 字段
+                    # （`smoke.input.family.family_id` / `token_sha1` / `hash_verified`），
+                    # 因此必须显式登记；**它不产生任何 run**，不影响 run 级授权。
+                    "gb6_diag_select.py", "gb6_diag_select_selftest_cpu.py"}
                     # 注：`stage_check.py` **不**登记 —— 它不引用 manifest 字段（`_manifest_consumers()`
                     # 的检测器扫不到它），而"消费方集合 == OPT_IN_CONSUMERS"是**等式**检查，
                     # 多登记一个检测不到的文件会直接判失败（首版即如此）。
