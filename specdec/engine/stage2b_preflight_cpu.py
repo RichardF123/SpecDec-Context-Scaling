@@ -104,12 +104,21 @@ def main() -> int:
         hard.append(f"新 family 已被消费：{consumed[:3]}")
 
     print("-- 3) 守卫登记（D-3）")
-    reg = {f: dict(diag=(f in ("F06", "F13")), proto=(f in G.PROTOCOL_ROUND_FAMILIES),
-                   round=(f in G.SERIAL_ORACLE_ROUND["families"])) for f in new}
+    # ⚠️ 单一授权来源：全部取自守卫模块的常量（`REGISTERED_DIAG_FAMILIES` /
+    # `PROTOCOL_ROUND_FAMILIES` / `SERIAL_ORACLE_ROUND` / `STAGE2B_ROUND`），
+    # **不再硬编码** family 列表，避免预检与守卫的口径漂移。
+    reg = {f: dict(diag=(f in G.REGISTERED_DIAG_FAMILIES),
+                   proto=(f in G.PROTOCOL_ROUND_FAMILIES),
+                   round=(f in G.SERIAL_ORACLE_ROUND["families"]),
+                   stage2b=(f in G.STAGE2B_ROUND["families"])) for f in new}
     for fam, v in reg.items():
-        print(f"   {fam}: 定点诊断={v['diag']} 协议轮={v['proto']} Stage2b 授权={v['round']} "
-              f"⇒ 会被判越界={not (v['diag'] or v['proto'])}")
-    unregistered = [f for f, v in reg.items() if not v["round"]]
+        print(f"   {fam}: 定点诊断={v['diag']} 协议轮={v['proto']} 串行oracle轮={v['round']} "
+              f"Stage2b授权={v['stage2b']} "
+              f"⇒ 会被判越界={not (v['diag'] or v['proto'] or v['round'] or v['stage2b'])}")
+    unregistered = [f for f, v in reg.items()
+                    if not (v["diag"] or v["proto"] or v["round"] or v["stage2b"])]
+    print(f"   授权范围（批 1 批准，2026-10-04）：tag={G.STAGE2B_ROUND['tag']} · "
+          f"tool={G.STAGE2B_ROUND['tool']} · families={list(G.STAGE2B_ROUND['families'])}")
 
     print("-- 4) 工具就绪（tag/family/reps 必填）")
     src = (ROOT / "specdec" / "engine" / "stage2b_verdict.py").read_text(encoding="utf-8")

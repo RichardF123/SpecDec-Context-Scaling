@@ -136,6 +136,10 @@ STAGE2B_CANDIDATE_FAMILIES = ("F09", "F03", "F11", "F04")
 # 因此必须**显式登记**（登记 + scoped 检查；**不放宽**任何既有检查）。
 PROTOCOL_ROUND_FAMILIES = ("F01", "F02", "F08", "F10")
 
+# 已登记的**定点诊断** family（原为 `main()` 内的局部常量，2026-10-04 提到模块级：
+# 使 `stage2b_preflight_cpu` 能引用**同一来源**，避免预检与守卫的口径漂移）。
+REGISTERED_DIAG_FAMILIES = ("F06", "F13")
+
 # 2026-10-03（**串行 target verification oracle 轮**）：授权来源 = 本轮任务书明确指定
 #   Stage 1 = F13；Stage 2 = 协议预登记的 F01/F02/F08/F10（**不重跑** production/row-aligned）。
 #   ⇒ 授权集合 = {"F13"} ∪ PROTOCOL_ROUND_FAMILIES。
@@ -151,6 +155,15 @@ PROTOCOL_ROUND_FAMILIES = ("F01", "F02", "F08", "F10")
 #     因此**另加**下方专项 scoped 检查（**只增检查、不改既有**）。
 SERIAL_ORACLE_ROUND = dict(tag="div8209_so", tool="serial_oracle_gpu",
                            families=("F13",) + PROTOCOL_ROUND_FAMILIES)
+
+# 2026-10-04（**批 1 已获明确批准**）：Stage 2b 限定范围运行的 **run 级授权**。
+# 授权来源 = 用户对"批 1：限定范围 Stage 2b"的明确批准
+# （见 `docs/stage2b_approval_record_2026-10-04.md` §C 批 1；D-2 范围 + D-3 登记）。
+# **授权范围只限于**：该 tag + 该 tool + `STAGE2B_CANDIDATE_FAMILIES`（4 个 family）。
+# 其它 tag / 其它 tool 使用这四个 family（或该 tag/tool 使用别的 family）一律仍判**越界**
+# —— 由下方"Stage 2b 运行记录只出现在授权范围"与"运行器在该 tag 内只消费授权 family"两条 scoped 检查保证。
+STAGE2B_ROUND = dict(tag="div8209_p2", tool="serial_oracle_gpu",
+                     families=STAGE2B_CANDIDATE_FAMILIES)
 
 
 def _manifest_consumers() -> list:
@@ -346,7 +359,7 @@ def main() -> int:
     # 2026-10-01 的 F13 eager 扩展验证）也消费 manifest；按用户授权，
     # **只允许 F06 与 F13**（两者都是已参与调试的定点诊断 family），
     # 其它 family 一律仍算「授权范围之外」；**不**扩大到任何别的 family。
-    REGISTERED_DIAG_FAMILIES = ("F06", "F13")
+    # （`REGISTERED_DIAG_FAMILIES` 现为模块级常量，供预检引用同一来源。）
     fam16_files = {f"smoke8k_cudnn_prefill_{r}.json" for r in fam16_ids}
     smoke_f06 = [u for u in used
                  if (u.get("tool") or "").startswith("g5_8k_smoke_cudnn")
@@ -428,8 +441,43 @@ def main() -> int:
           not _s2b_bad, dict(found=_s2b_ids, allowed=sorted(_s2b_allowed), out_of_scope=_s2b_bad))
     _cand_used = [u["file"] for u in used
                   if (u.get("family") or {}).get("family_id") in STAGE2B_CANDIDATE_FAMILIES]
-    check("★ Stage 2b 候选 family **尚未被任何 run 消费**（D-3 批准前不得跑；run 级授权未放宽）",
+    check("★ Stage 2b 的四个 family 未被**其它工具**的运行记录消费（run 级授权仅限 "
+          "tag=div8209_p2 + tool=serial_oracle_gpu）",
           not _cand_used, dict(n_bad=len(_cand_used), bad=_cand_used[:4]))
+    # 2026-10-04（D-3 生效后）：**scoped run 级检查**——四个 family 的运行记录只能出现在授权 tag+tool 里。
+    # 记录级、按**产物内容**判定（`smoke.input.family.family_id`），不依赖名字约定；
+    # 非运行产物（`model_run_happened` 非真，例如 GB6 诊断/汇总）不构成"run"，允许引用 family。
+    _o_dir = ROOT / "output" / "g5" / "attn"
+    _n_cand_recs, _bad_cand_scope, _bad_s2b_fam = 0, [], []
+    for _f in sorted(_o_dir.glob("*.json")):
+        if not any(f"_{c}_" in _f.name for c in STAGE2B_CANDIDATE_FAMILIES):
+            continue
+        try:
+            _d = json.loads(_f.read_text(encoding="utf-8-sig"))
+        except Exception:                                        # noqa: BLE001
+            continue
+        if not isinstance(_d, dict):
+            continue
+        _sm_in = (_d.get("smoke") or {}).get("input") or {}
+        _fam = (_sm_in.get("family") or {}).get("family_id") or _d.get("case")
+        if _fam not in STAGE2B_CANDIDATE_FAMILIES:
+            continue
+        _n_cand_recs += 1
+        _tool, _tag = _d.get("tool"), _d.get("tag")
+        if _tool == STAGE2B_ROUND["tool"]:
+            # 运行器记录：必须在授权 tag 内，且 family 必须在授权集合内
+            if _tag != STAGE2B_ROUND["tag"]:
+                _bad_cand_scope.append(_f.name)
+            elif _fam not in STAGE2B_ROUND["families"]:
+                _bad_s2b_fam.append(_f.name)
+        elif _d.get("model_run_happened"):
+            _bad_cand_scope.append(f"{_f.name}（tool={_tool} 产生了 run）")
+    check("★ Stage 2b 四个 family 的**运行记录**只出现在授权范围（tag=div8209_p2 + tool=serial_oracle_gpu）",
+          not _bad_cand_scope,
+          dict(n_records=_n_cand_recs, bad=_bad_cand_scope[:4],
+               note="非运行产物（诊断/汇总）不构成 run，允许引用 family"))
+    check("★ Stage 2b 运行器在该 tag 内只消费授权的 4 个 family",
+          not _bad_s2b_fam, dict(n_records=_n_cand_recs, bad=_bad_s2b_fam[:4]))
     scoped = [u for u in used if (u.get("tool") or "").startswith("prefill_sb_replay_f06")]
     bad_family = [u["file"] for u in scoped
                   if (u.get("family") or {}).get("family_id") != "F06"]
