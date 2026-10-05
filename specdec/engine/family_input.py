@@ -52,9 +52,29 @@ def _h(ids) -> str:
 
 
 def resolve_input_plan() -> dict:
-    """按环境变量决定输入来源。**未设 `SMOKE_FAMILY` ⇒ legacy（默认路径）**。"""
+    """按环境变量决定输入来源。**默认路径不变**；三模式互斥，歧义即显式报错。
+
+    | 模式 | 触发条件 | 用途 |
+    | --- | --- | --- |
+    | `legacy` | 都没设 | 既有的写死 `test.raw` 前缀（历史默认行为，**逐位不变**） |
+    | `manifest` | 只设 `SMOKE_FAMILY` | 8K manifest 窗口（Stage 1/2 轮） |
+    | **`literal_prompt`**（2026-10-05 新增） | 只设 `SMOKE_PROMPT` | **固定字面用例**（B6 类型覆盖：自然语言/数学/代码/短/长/EOS/长度裁剪） |
+
+    ⚠️ `SMOKE_PROMPT` 与 `SMOKE_FAMILY` **同时设置 ⇒ 抛 `FamilyInputError`**（不静默择一）。
+    新增模式**只在显式设置 `SMOKE_PROMPT` 时生效** ⇒ 未指定参数时既有行为不变。
+    """
+    prompt = os.environ.get("SMOKE_PROMPT") or ""
     fam = (os.environ.get("SMOKE_FAMILY") or "").strip()
     man = os.environ.get("SMOKE_MANIFEST") or str(MANIFEST)
+    if prompt and fam:
+        raise FamilyInputError(
+            "SMOKE_PROMPT 与 SMOKE_FAMILY **同时设置** ⇒ 输入来源歧义；显式拒绝（不静默择一）")
+    if prompt:
+        pid = (os.environ.get("SMOKE_PROMPT_ID") or "").strip() or None
+        return dict(mode="literal_prompt", family_id=None, manifest=man, prompt=prompt,
+                    prompt_id=pid,
+                    prompt_sha1=hashlib.sha1(prompt.encode("utf-8")).hexdigest()[:16],
+                    reason="SMOKE_PROMPT 已设置 ⇒ 使用**固定字面 prompt**（专项用例/类型覆盖）")
     if not fam:
         return dict(mode="legacy", family_id=None, manifest=man,
                     reason="SMOKE_FAMILY 未设置 ⇒ 使用既有的写死 test.raw 前缀（默认行为不变）")

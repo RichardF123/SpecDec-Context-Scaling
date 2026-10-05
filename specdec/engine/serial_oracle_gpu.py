@@ -50,18 +50,31 @@ K = int(os.environ.get("SO_K", "4"))
 KV = os.environ.get("SO_KV", "base_bf16")
 ARM = os.environ.get("SO_ARM", "eager")
 TARGET_ROPE = os.environ.get("SO_TARGET_ROPE", "cpu_fp32")
+# 2026-10-05（C-1）：**固定字面 prompt** 专项用例（B6 类型覆盖）。未设 ⇒ 走原有 manifest 路径。
+PROMPT = os.environ.get("SO_PROMPT") or ""
+PROMPT_ID = (os.environ.get("SO_PROMPT_ID") or "").strip()
 MODES = ("ar", "prod", "serial")
 EXPECTED_INSTANCES = dict(ar=1, prod=2, serial=2)
 
 
 def _smoke_env() -> dict:
-    """由 `SO_*` 推导 `SMOKE_*`（**必须在 import harness 之前**生效）。"""
-    return dict(
+    """由 `SO_*` 推导 `SMOKE_*`（**必须在 import harness 之前**生效）。
+
+    ⚠️ 字面 prompt 模式**不设** `SMOKE_FAMILY`（两者同时设 ⇒ `family_input` 显式报错，不静默择一）。
+    """
+    env = dict(
         SMOKE_MODE=("ar" if MODE == "ar" else "spec"),
-        SMOKE_ARM=ARM, SMOKE_FAMILY=CASE, SMOKE_CTX=str(CTX), SMOKE_CHUNK=str(CHUNK),
+        SMOKE_ARM=ARM, SMOKE_CTX=str(CTX), SMOKE_CHUNK=str(CHUNK),
         SMOKE_K=str(K), SMOKE_MAXNEW=str(MAXNEW), SMOKE_KV=KV,
         SMOKE_TARGET_ROPE=TARGET_ROPE, SMOKE_BF16_RED_REDUCTION="1", SMOKE_STRUCT_CHECK="1",
         SMOKE_PREFILL_DIGEST="1")
+    if PROMPT:
+        env["SMOKE_PROMPT"] = PROMPT
+        if PROMPT_ID:
+            env["SMOKE_PROMPT_ID"] = PROMPT_ID
+    else:
+        env["SMOKE_FAMILY"] = CASE
+    return env
 
 
 def _accounting(mode: str, stats: dict, end_state: dict, trun: dict) -> dict:
@@ -101,8 +114,10 @@ def run_one() -> int:
         smoke_env=env, stage="start",
         timestamp_utc=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         git=S.git_meta(ROOT),
-        rules=("冻结配置：ctx=8192/chunk=2048/k=4/max_new=64/base_bf16/eager/target_rope=cpu_fp32/"
-               "bf16_red_red=1/struct_check=1；接受公式与停止条件未改；draft 未改；cache 不共享；不自动重试"),
+        rules=(f"冻结配置（**本次实参**）：ctx={CTX}/chunk={CHUNK}/k={K}/max_new={MAXNEW}/kv={KV}/"
+               f"arm={ARM}/target_rope={TARGET_ROPE}/bf16_red_red=1/struct_check=1；"
+               f"接受公式与停止条件未改；draft 未改；cache 不共享；不自动重试；"
+               f"输入来源={'literal_prompt（固定用例）' if PROMPT else 'manifest family'}"),
         design_doc="docs/serial_target_oracle_design_2026-10-03.md",
         accounting_identity=("ar: target_calls==decode_steps；serial: target_calls==proposed+rollbacks；"
                              "prod: target_calls==target_block_calls+rollbacks"))
@@ -125,6 +140,15 @@ def run_one() -> int:
     rec["verify_mode_before_run"] = spec_dec.target_verify_mode()
     rec["verify_wrap_before_run"] = spec_dec.verify_wrap_state()
     rec["row_aligned_wrap_active"] = bool(rec["verify_wrap_before_run"].get("active"))
+    # 2026-10-05（C-2）：把**诊断精度开关**与**后端请求**落盘（运行前 + 运行后各记一次）。
+    # 为什么：冻结候选配置含 "diag preset=eager、qk_fp32=False、prob_fp32=False"，
+    #         此前产物**未记录**这两项 ⇒ 无法取证；现在如实记录，且记录"运行后未变"。
+    rec["diag_precision_before_run"] = M.diag_precision()
+    rec["backend_request"] = dict(arm=ARM,
+                                  note="实际生效的后端/融合阶段由产物 `smoke.attention_stats` 如实记录")
+    rec["input_plan"] = dict(source=("literal_prompt" if PROMPT else "manifest family"),
+                             case=CASE, prompt_id=(PROMPT_ID or None),
+                             prompt_len_chars=(len(PROMPT) if PROMPT else None))
 
     spec_dec.clear_serial_trace()
     fallback_pt = OUTDIR / f"{TAG}_{CASE}_{MODE}_rep{REP}_{run_id}.pt"
@@ -186,6 +210,9 @@ def run_one() -> int:
         rec["verify_mode_at_run_end"] = spec_dec.target_verify_mode()
         rec["verify_wrap_after_run"] = spec_dec.verify_wrap_state()
         rec["serial_verify_dispatched"] = bool(rec["verify_mode_at_run_end"] == "serial")
+        # C-2：运行后复查诊断精度开关（应与运行前一致；不一致即为配置漂移，记录在案）
+        rec["diag_precision_after_run"] = M.diag_precision()
+        rec["diag_precision_stable"] = bool(rec["diag_precision_after_run"] == rec["diag_precision_before_run"])
         tr_ = spec_dec.serial_trace()
         rec["serial_trace"] = tr_
         rec["serial_trace_summary"] = dict(

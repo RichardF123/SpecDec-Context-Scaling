@@ -382,6 +382,15 @@ def main() -> int:
             ids_list, fam_meta = FI.load_family_ids(tok, plan["family_id"], ctx=CTX)
             ids = torch.tensor([ids_list], device="cuda")
             input_source = "manifest family（显式 SMOKE_FAMILY）"
+        elif plan["mode"] == "literal_prompt":
+            # 2026-10-05 新增：**固定字面用例**（B6 类型覆盖：数学/代码/短/长/EOS/长度裁剪）。
+            # 只在显式设置 `SMOKE_PROMPT` 时生效 ⇒ 未设置时本分支不会被走到，既有行为不变。
+            # `add_special_tokens` 沿用 manifest 路径的**显式**取值（不依赖库默认）。
+            enc = tok(plan["prompt"], return_tensors="pt",
+                      add_special_tokens=FI.TOKENIZER_ADD_SPECIAL_TOKENS).input_ids
+            ids = enc.to("cuda")
+            input_source = (f"字面 prompt（显式 SMOKE_PROMPT；固定用例 "
+                            f"{plan.get('prompt_id') or '未命名'}）")
         else:
             full = P5V.load_ids(tok)
             ids = full[:, :CTX].contiguous()
@@ -391,6 +400,10 @@ def main() -> int:
             [int(x) for x in ids[0].tolist()]),
             source=input_source,
             source_kind=plan["mode"], family=fam_meta,
+            # 2026-10-05：字面用例的可复现标识（短 prompt 的**实际**输入长度由 `ctx` 如实记录，
+            # **不**写成 8192）。
+            prompt_id=plan.get("prompt_id"), prompt_sha1=plan.get("prompt_sha1"),
+            input_tokens=int(ids.shape[1]),
             eos_config=FI.eos_config(tok),
             vocab_size=int(tgt.embed_tokens.weight.shape[0]),
             dtypes=dict(model=str(next(tgt.parameters()).dtype),
