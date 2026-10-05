@@ -127,7 +127,38 @@ B6 证据（§5 五项）与 `FULL_B6_PASS`（还需 `B6_VFP8_PASS`，下一阶�
 测量前置（speedup 声明资格 10 条、measured reps 完整、无 OOM/NaN/ENV_INVALID，诊断计时不入 speedup）；
 工程（入口内存余量薄、`cuda_free≈0`）；未决解释规则（并列双侧分类 P-1/P-2 未实施）。
 
-## 7. 本轮**未执行**的部分（明确列出）
+## 8. rev.3（2026-10-05）：验收器四漏洞修复 + 对计划的影响
+
+**性质**：四个漏洞**全部在验收工具里**（判据/检查逻辑），**不涉及**生产 SpecDec 算法、数值路径或历史结果；
+不得据此宣称算法错误。
+
+| # | 漏洞（rev.2 检查器） | 最小复现（旧规则） | 修复 | 复现结果（新规则） |
+| --- | --- | --- | --- | --- |
+| 1 | **完整序列一致性**：只看重叠区间 `first_divergence` ⇒ `AR=[1,2,3,4]`、`serial=[1,2]` 判"无分歧" | `OLD_PASS` | 严格门改为**完整 token 列表相等**（长度不同也算不一致），报告共同前缀 / 两侧长度 / 长度差异位置 | **`CASE_FAIL`** |
+| 2 | **硬检查只判存在**：`self_checks_all_ok`、`cache_structure_ok`、`prefill_logits_finite`、`round_invariants.all_ok` 全 False 仍 PASS | `OLD_PASS` | **逐项验值**（调用计数恒等式 / 有限性 / cache 结构 / 控制不变量 / 运行完成 / 杀开关复位 / 停止合法性）+ `gen_len`↔长度↔`max_new`↔`stop_reason`↔EOS 自洽性；缺失⇒`INCOMPLETE`、显式失败⇒`FAIL`、类型非法⇒非 PASS | **`CASE_FAIL`** |
+| 3 | **AR 融合被误拒**：旧版对 AR 强制 `expect_prefill_fused=False` | `OLD_FAIL`（误拒） | AR 与 Spec 走**同一 target prefill 策略**；按分派证据（`strategy`/`requested_backend`/`fused_by_phase`/`s_max_by_phase`/`fallbacks`/`eager_reason_kinds`）判定；**禁止**非 prefill 融合；`expect=None` **≠** 不检查（须"真融合"或"有记录的回退理由"，否则证据不足）；声明应融合却跑 `arm=eager` ⇒ **未被检验**（`INCOMPLETE`）；`target/draft` 调用不可分 ⇒ **显式证据边界** | **`CASE_PASS`** |
+| 4 | **跨模式/跨 rep 不匹配**：无输入与配置核对 | `OLD_PASS` | 同 (case,rep) 的 AR/prod/serial 必须同 input hash、同实际长度、同 target dtype/KV、同 backend 与 prefill 策略、同 `chunk`/`k`/`max_new`/EOS/冻结数值配置；同模式跨 rep 亦然；**AR 未加载 draft 属预期差异**；**AR 误加载 draft ⇒ 基线不纯 ⇒ FAIL** | **`CASE_FAIL`** |
+
+**顺带修复（产物选择）**：`find_runs()` 不再静默择一 —— 同一 `(mode,rep)` 重复产物、非法 `rep`、
+身份字段（tag/case/mode）与请求不一致，**全部显式报告并判非 PASS**。
+
+**CPU 回归**：`b6_branch_coverage_selftest_cpu` **83/0**（保留原 33 项断言，新增 G12–G20：
+严格前缀/同长度差异、9 类硬检查 × {非法取值/缺失/类型非法}、自洽性四项、AR 融合不误拒、
+`expect=None` 两种情形、跨模式/跨 rep/AR-draft 六项、产物选择三项、完整夹具 PASS、production 只记录）。
+全量套件 **374/0**；既有 9 套自测数值未变。
+
+**对历史 Stage 2b 产物的只读核验（不改历史判决）**：四 family 全部 **`CASE_INCOMPLETE`**，
+理由是**缺 `diag_precision_before_run/after_run/stable` 这一新增必需字段**（C-2 之前的产物本就没有）；
+同时 `硬检查 0/84 非 ok`、`serial vs AR` 全部 `EQUAL`、production 为 F09/F04 `EQUAL`、F03/F11 `TOKEN_DIFF`。
+⇒ 这是**证据不足**（旧产物缺字段），**不是**算法/数值问题；历史判决与产物一律未改。
+
+**对 GPU 计划的影响**：**计划仍可执行** —— 检查器 CLI 未变，§4 的行 A/B 命令无需改动；
+且新运行由 rev.2 运行器记录 `diag_precision_*`、`input_tokens`、`attention_stats`（含分派证据），
+足以满足新的必需字段与匹配要求。**剩余阻塞项不变**：**P-A**（60 runs 新 tag 授权）、
+**P-B**（6 runs 8K 融合复核：`F09`+候选臂，需扩展 run 级授权）、**P-C/P-D**（GB6 记账与 eager 对照是否要做）。
+**本轮未运行任何 GPU 任务**，`div8209_b6` 产物数 = 0。
+
+## 9. 本轮**未执行**的部分（明确列出）
 
 * **未运行任何 GPU 任务**（无非授权 GPU 使用；`div8209_b6` 尚无产物）；
 * **未实现**：8K 融合复核的运行入口以外的任何新能力；`stage2b_verdict` 对字面用例的支持；并列双侧捕获 P-1/P-2；B6 覆盖轮之外的任何测试矩阵扩展；
