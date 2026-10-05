@@ -241,6 +241,36 @@ def _serial_oracle_run_records(tag: str, tool: str) -> list:
     return out
 
 
+def _stage2b_authorized_smoke_files() -> set:
+    """**被 Stage 2b 授权 run 记录经 `smoke_artifact` 明确链接**的 harness smoke 文件名集合。
+
+    背景（2026-10-04，批 1 批准后实测发现）：Stage 2b 的每次 run 会**驱动同一个 harness**
+    （`g5_8k_smoke_cudnn`）⇒ 除运行器自己的记录外，还会写一份 `smoke8k_eager_<runid>.json`
+    （family 在**顶层** `input` 里，因此主检测器能看到它，并按"smoke 工具消费了未授权 family"报越界）。
+
+    授权口径（**必须逐份、不可泛指**）：
+      * 只认"**授权 tag + 授权 tool**"的运行记录里 `smoke_artifact` 字段**显式指向**的那一份；
+      * **不**把四个 family 泛指授权给 smoke 工具 —— 那会允许任意 tag 下用 F09 跑 smoke；
+      * 未被授权 run 链接的 smoke 产物**仍然判越界**（下方 `outside` / `smoke_other` 保持严格）。
+    只读；不修改任何检查的严格性。
+    """
+    files: set = set()
+    for p in sorted((ROOT / "output" / "g5" / "attn").glob(f"{STAGE2B_ROUND['tag']}_*_rep*_*.json")):
+        try:
+            j = json.loads(p.read_text(encoding="utf-8-sig"))
+        except Exception:                                        # noqa: BLE001
+            continue
+        if not isinstance(j, dict) or j.get("tool") != STAGE2B_ROUND["tool"]:
+            continue
+        fam = (((j.get("smoke") or {}).get("input") or {}).get("family") or {}).get("family_id")
+        if fam not in STAGE2B_ROUND["families"]:
+            continue
+        sa = j.get("smoke_artifact")
+        if sa:
+            files.add(Path(str(sa)).name)
+    return files
+
+
 def _this_round_run_ids() -> set:
     """从 fam16 授权诊断的索引里取本轮 run_id（用于把"本轮/本轮之前"分开）。"""
     ids = set()
@@ -361,6 +391,11 @@ def main() -> int:
     # 其它 family 一律仍算「授权范围之外」；**不**扩大到任何别的 family。
     # （`REGISTERED_DIAG_FAMILIES` 现为模块级常量，供预检引用同一来源。）
     fam16_files = {f"smoke8k_cudnn_prefill_{r}.json" for r in fam16_ids}
+    # 2026-10-04（批 1 已批准）：Stage 2b 的 24 次 run 会驱动同一个 harness ⇒ 同时产出 24 份
+    # `smoke8k_eager_*.json`。授权口径 = **被授权 run 记录经 `smoke_artifact` 逐份链接**的那一些
+    # （不按 family 泛指）；未经链接的 smoke 产物仍判越界。
+    # ⚠️ 必须在下面 `smoke_other` **之前**定义（首版放在 `authorized_files` 前 ⇒ 触发 NameError）。
+    _s2b_links = _stage2b_authorized_smoke_files()
     smoke_f06 = [u for u in used
                  if (u.get("tool") or "").startswith("g5_8k_smoke_cudnn")
                  and u["file"] not in fam16_files
@@ -369,7 +404,9 @@ def main() -> int:
                    if (u.get("tool") or "").startswith("g5_8k_smoke_cudnn")
                    and u["file"] not in fam16_files
                    and (u.get("family") or {}).get("family_id") not in REGISTERED_DIAG_FAMILIES
-                   and (u.get("family") or {}).get("family_id") not in PROTOCOL_ROUND_FAMILIES]
+                   and (u.get("family") or {}).get("family_id") not in PROTOCOL_ROUND_FAMILIES
+                   # 2026-10-04：Stage 2b 授权 tag 的 run 所**链接**的 smoke 产物（逐份授权）
+                   and u["file"] not in _s2b_links]
     # 2026-10-03 协议验证轮：smoke 工具在该轮里**只允许**预登记的 4 个 family
     smoke_protocol = [u for u in used
                       if (u.get("tool") or "").startswith("g5_8k_smoke_cudnn")
@@ -377,15 +414,19 @@ def main() -> int:
                       and (u.get("family") or {}).get("family_id") in PROTOCOL_ROUND_FAMILIES]
     smoke_protocol_bad = [u for u in smoke_protocol
                           if (u.get("family") or {}).get("family_id") not in PROTOCOL_ROUND_FAMILIES]
+    # 2026-10-04（批 1 已批准）：Stage 2b 授权 run 链接的 harness smoke（逐份）并入授权集合。
     authorized_files = ({u["file"] for u in fam16} | {u["file"] for u in forensic}
                         | {u["file"] for u in smoke_f06}
                         # 2026-10-03：协议验证轮（未见数据）——**只允许预登记的 4 个 family**
-                        | {u["file"] for u in smoke_protocol})
+                        | {u["file"] for u in smoke_protocol}
+                        # 2026-10-04：Stage 2b 授权 run 链接的 harness smoke（逐份）
+                        | _s2b_links)
     outside = [u for u in used if u["file"] not in authorized_files]
     check("★ **授权范围之外**没有任何 run 消费 manifest family（授权范围 = fam16 16 格 + F06/index25 定点取证 "
-          "+ 2026-10-03 协议验证轮的 4 个预登记 family）",
+          "+ 2026-10-03 协议验证轮的 4 个预登记 family + Stage 2b 授权 tag 的 run 所链接的 harness smoke）",
           not outside, outside[:5])
-    check("★ smoke 工具的非 fam16 运行只允许已登记的定点诊断 family（F06 / F13）或协议预登记 family（F01/F02/F08/F10）",
+    check("★ smoke 工具的非 fam16 运行只允许已登记的定点诊断 family（F06 / F13）或协议预登记 family（F01/F02/F08/F10）"
+          "，或**被 Stage 2b 授权 run 链接**的产物",
           not smoke_other, [u["file"] for u in smoke_other][:4])
     check("★ 协议验证轮的 smoke 运行**只**消费预登记的 4 个 family（F01/F02/F08/F10）",
           not smoke_protocol_bad, [u["file"] for u in smoke_protocol_bad][:4])
@@ -440,10 +481,12 @@ def main() -> int:
     check("★ Stage 2b 工具的源码里只有'已授权 ∪ 候选'的 family 字面量（候选 = 待 D-3，未授权运行）",
           not _s2b_bad, dict(found=_s2b_ids, allowed=sorted(_s2b_allowed), out_of_scope=_s2b_bad))
     _cand_used = [u["file"] for u in used
-                  if (u.get("family") or {}).get("family_id") in STAGE2B_CANDIDATE_FAMILIES]
+                  if (u.get("family") or {}).get("family_id") in STAGE2B_CANDIDATE_FAMILIES
+                  and u["file"] not in _s2b_links]          # 授权 run 链接的 smoke 不算"其它工具"
     check("★ Stage 2b 的四个 family 未被**其它工具**的运行记录消费（run 级授权仅限 "
-          "tag=div8209_p2 + tool=serial_oracle_gpu）",
-          not _cand_used, dict(n_bad=len(_cand_used), bad=_cand_used[:4]))
+          "tag=div8209_p2 + tool=serial_oracle_gpu，及其 run 所链接的 harness smoke）",
+          not _cand_used, dict(n_bad=len(_cand_used), bad=_cand_used[:4],
+                               n_linked_smoke=len(_s2b_links)))
     # 2026-10-04（D-3 生效后）：**scoped run 级检查**——四个 family 的运行记录只能出现在授权 tag+tool 里。
     # 记录级、按**产物内容**判定（`smoke.input.family.family_id`），不依赖名字约定；
     # 非运行产物（`model_run_happened` 非真，例如 GB6 诊断/汇总）不构成"run"，允许引用 family。

@@ -90,7 +90,18 @@ def main() -> int:
             print(f"   {fam}: 32-gram 交集 新={others} 已用={used_ov or '（未重建）'} 调试输入={dbg_ov}")
             if any(others.values()) or any(used_ov.values()) or dbg_ov:
                 hard.append(f"{fam}: 存在非零 32-gram 交集")
-    consumed = []
+    # 2026-10-04（批 1 已批准）：Stage 2b 的 24 次 run **合法地**消费这四个 family
+    # （运行器记录 + 其 `smoke_artifact` 链接的 harness smoke 产物）。
+    # ⇒ 这里只统计**授权范围之外**的消费；授权口径与守卫**完全一致**（逐份链接，不按 family 泛指）：
+    #    * 文件属于授权 tag（`div8209_p2_*`）；
+    #    * 或文件名出现在被授权 run 记录 `smoke_artifact` 指向的集合里。
+    _auth_prefix = f"{G.STAGE2B_ROUND['tag']}_"
+    _auth_linked = G._stage2b_authorized_smoke_files()
+    # 本仓库**自己的 CPU 工具**产出的汇报文件（例如守卫的 `family_independence_cpu_check.json`）
+    # 会列出候选 family 名字，但那**不是**"消费 family 数据"（也不是 run）⇒ 单列为"仅提及"。
+    # ⚠️ 白名单**只含本仓库 CPU 工具的汇报产物**；任何**数据/运行产物**在授权范围之外出现即硬失败。
+    _report_like = ("family_independence_cpu_check.json",)
+    consumed, authorized_hits, mention_only = [], [], []
     for p in sorted((ROOT / "output" / "g5").rglob("*.json")):
         try:
             txt = p.read_text(encoding="utf-8", errors="ignore")
@@ -98,10 +109,18 @@ def main() -> int:
             continue
         for fam in new:
             if f'"{fam}"' in txt:
-                consumed.append((p.name, fam))
-    print(f"   现有产物消费这些 family 的文件数 = {len(consumed)} {consumed[:3]}")
+                if p.name.startswith(_auth_prefix) or p.name in _auth_linked:
+                    authorized_hits.append((p.name, fam))
+                elif p.name in _report_like:
+                    mention_only.append((p.name, fam))
+                else:
+                    consumed.append((p.name, fam))
+    print(f"   授权范围内的消费（Stage 2b 授权 tag + 其链接的 smoke）= {len(authorized_hits)} 份"
+          f"（示例 {authorized_hits[:2]}）")
+    print(f"   本仓库 CPU 工具汇报的**仅提及**（不计为消费）= {sorted({x[0] for x in mention_only})}")
+    print(f"   **授权范围之外**的消费 = {len(consumed)} {consumed[:3]}")
     if consumed:
-        hard.append(f"新 family 已被消费：{consumed[:3]}")
+        hard.append(f"新 family 被授权范围之外的产物消费：{consumed[:3]}")
 
     print("-- 3) 守卫登记（D-3）")
     # ⚠️ 单一授权来源：全部取自守卫模块的常量（`REGISTERED_DIAG_FAMILIES` /
