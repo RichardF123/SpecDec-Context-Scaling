@@ -33,12 +33,16 @@
 
 ## 3. serial exact equality（Gate A 的实际判据）
 
-| family | serial 与同 family AR | 两次 serial 一致 | serial 侧 D6 读数 | 窗口 cache 结构 |
+| family | serial 与同 family AR | 两次 serial 一致 | serial 侧 D6 读数 | serial 侧 cache 结构检查数（**两次重复各自**） |
 | --- | --- | --- | --- | --- |
-| F09 | **完整 token IDs 相同** | 是 | `verify_at_end=serial` → `after_cleanup=block` | ok / 52 检查 |
-| F03 | **相同** | 是 | 同上 | ok / 40 → 56 |
-| F11 | **相同** | 是 | 同上 | ok / 56 |
-| F04 | **相同** | 是 | 同上 | ok / 48 |
+| F09 | **完整 token IDs 相同** | 是 | `verify_at_end=serial` → `after_cleanup=block` | `cache_structure_n_checks = 52`（rep1 与 rep2 **均为 52**） |
+| F03 | **相同** | 是 | 同上 | `cache_structure_n_checks = 40`（rep1 与 rep2 **均为 40**） |
+| F11 | **相同** | 是 | 同上 | `cache_structure_n_checks = 56`（rep1 与 rep2 **均为 56**） |
+| F04 | **相同** | 是 | 同上 | `cache_structure_n_checks = 48`（rep1 与 rep2 **均为 48**） |
+
+> **勘误（2026-10-05，仅文档修正，未重跑任何数值实验）**：本表 F03 行原先写作"`ok / 40 → 56`"，**错误**。
+> 经只读复核：**F03 的两次 serial 重复均为 40**；**56 属于 F11**（两次均为 56）。AR 侧该字段恒为 2（AR 无投机轮）。
+> 各 family 的 production 侧值供对照：F09 `52`、F03 `38`、F11 `54`、F04 `48`（两次重复均相同）。
 
 serial 侧另通过 18 项硬检查（含 D6）、逐轮字段完整、trace 与轮记录一致；
 **`serial_failures=[]`**、`serial_equals_ar=True`、`serial_reps_identical=True`。
