@@ -8,7 +8,15 @@
 > `docs/design_freeze_fp8_kv.md`（FP8 KV 设计冻结 v1.3）、`docs/design_freeze_g4_specdec.md`（G4 协议 v0.3）、
 > `docs/plan_g4_next_steps.md`（G4 阶段状态）。
 
-## 当前状态（2026-10-04 更新）
+## 当前状态（2026-10-06 更新）
+
+**BF16 B6 已获有限范围 PASS：60次类型覆盖、6次8K融合复核，以及独立6次真实EOS补测已完成；serial 与 AR 在对应测试中完整一致。生产批量验证仍可能分歧，FP8独立B6与正式性能实验尚未完成。**
+
+见[10月6日阶段记录](docs/stage_checkpoint_2026-10-06.md)及[已批准B6状态与证据](docs/b6_status_and_evidence_index_2026-10-05.md)。下一步是修订测量规格、冻结配置与数据划分，由用户编写正式runner，再以四family pilot验证当前配置的2K/4K/8K测量稳定性。历史8K eager波动不直接决定新配置结论；不提前声明加速或生成质量等同。
+
+正式实验代码由用户本人编写；BF16与V-only FP8按各自准入分别放行。原始运行产物主要保存在本地，GitHub文档同步不等于原始数据全部上传。
+
+## 历史状态快照（2026-10-04）
 
 **引擎、V-only FP8 KV、greedy SpecDec 与测量工具已有实现；五个 BF16 family 的 serial target oracle 与 AR 逐 token 一致，但 production batched verification 仍可能分歧。分层正确性协议尚待小组批准，正式 pilot/benchmark 未通过入口门槛，不声明 SpecDec 已加速。**
 
