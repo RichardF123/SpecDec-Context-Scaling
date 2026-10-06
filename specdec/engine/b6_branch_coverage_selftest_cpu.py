@@ -77,6 +77,25 @@ def _mk(case: str, mode: str, rep: int, *, gen: list, rounds: list, stop: str = 
         fused_by_phase = {} if arm == "eager" else {"prefill": 2}
     prefill_fused = int(fused_by_phase.get("prefill") or 0)
     draft_kv = draft if draft is not None else ("not_loaded" if mode == "ar" else "fp16")
+    # ---- `smoke.checks` 逐条明细（**按真实产物结构**合成；rev.5 起验收器要逐条核对
+    #      `required/executed/ok`，因此夹具必须与真实产物同构，否则自测只会测到"夹具不像真的"）----
+    _uncovered = list(uncovered or [])
+    _entries = [
+        dict(name="finiteness:prefill/target", required=True, executed=True, ok=bool(finite),
+             detail="无条件必需（该分支必然执行）"),
+        dict(name="finiteness:prefill/draft", required=True, executed=True, ok=bool(finite),
+             detail="无条件必需（该分支必然执行）"),
+        dict(name="dispatch_only_prefill", required=True, executed=True, ok=True, detail="仅 prefill 融合"),
+        dict(name="attention_assert", required=True, executed=True, ok=True, detail="策略断言=ok"),
+        dict(name="weights_bitmatch", required=True, executed=True, ok=True, detail="逐张量相等"),
+        dict(name="round_invariants", required=True, executed=True, ok=bool(inv_ok), detail="逐轮不变量"),
+        dict(name="accounting_identity", required=True, executed=True, ok=bool(accounting_matches),
+             detail="调用计数恒等式"),
+    ] + [dict(name=nm, required=False, executed=False, ok=None, detail="该分支本次未执行（非必需）")
+         for nm in _uncovered]
+    _n_req = sum(1 for e in _entries if e["required"] is True)
+    _failures = ([] if checks_passed else
+                 [dict(name="（合成夹具）未通过项", detail="fixture: checks_passed=False")])
     rec = dict(
         tool="serial_oracle_gpu", tag=(tag_in_record or TAG), run_id=RUNID, case=(case_in_record or case),
         mode=(mode_in_record or mode), rep=rep, stage=stage, model_run_happened=True,
@@ -95,8 +114,11 @@ def _mk(case: str, mode: str, rep: int, *, gen: list, rounds: list, stop: str = 
                    stop_reason=stop, gen_ids_in_vocab=True, prefill_logits_finite=finite,
                    checks_passed=checks_passed, n_rounds=len(rounds), rounds=rounds,
                    decision_coverage=True,
-                   checks=dict(passed=checks_passed, n_required=14, uncovered=list(uncovered or []),
-                               failures=[],
+                   checks=dict(passed=checks_passed, n_required=_n_req, n_checks=len(_entries),
+                               uncovered=list(_uncovered), failures=_failures,
+                               not_applicable=["finiteness:propose/target", "finiteness:verify/draft"],
+                               checks=_entries,
+                               rule="只有 passed=True 才允许 exit 0；执行结束 ≠ 验证通过",
                                finiteness_coverage=dict(n_checked=148, first_bad=None,
                                                         by_phase_model={"prefill/target": dict(ok=True),
                                                                         "verify/target": dict(ok=True)})),
@@ -635,6 +657,104 @@ def main() -> int:
         else:
             ck("G21n_旧产物缺新增字段⇒只记证据不足（不改历史判决）", False, "无历史产物可测")
             ck("G21o_旧产物序列一致性未被本修复影响（serial==AR）", False, "无历史产物可测")
+
+        # ---------------- G22：`smoke.checks` 覆盖规则的**分类修正**回归（rev.5，2026-10-05）----------------
+        # 修正的事实依据（本地实测、可复核）：`smoke_checks.evaluate` **只在** `required=False` 且未执行时
+        # 才写 `uncovered`；必需但缺失写 `failures` 且 `passed=False`。
+        # ⇒ `uncovered` 非空**本身不是**失败（此前误判成失败：natural-2 prod 实测 triggered）。
+        # 新规则更细：failures 必须空 + uncovered 每条必须 required=False/executed=False + 必需条目须已执行且通过。
+        def _c22(mut) -> dict:
+            """构造一份**完全合法**的产物再按 `mut(rec)` 变形，返回 CHK 判决（三模式 × 两 rep）。"""
+            recs = _trio("strict", ar_gen=AR16, prod_gen=list(AR16), serial_gen=list(AR16),
+                         rounds=[_round(0, 4, 4), _round(1, 3, 2)])
+            for r in recs:
+                mut(r)
+            return ev("strict", DECL["strict"], recs)
+
+        def _set_unc(rec, names):
+            ch = rec["smoke"]["checks"]
+            ch["uncovered"] = list(names)
+            ch["checks"] = [e for e in ch["checks"] if e["name"] not in names]
+            ch["checks"] += [dict(name=nm, required=False, executed=False, ok=None,
+                                  detail="该分支本次未执行（非必需）") for nm in names]
+
+        # (a) uncovered 非空但全为"非必需且未执行" ⇒ **不再**判失败；仍如实记录覆盖缺口
+        r22a = _c22(lambda rec: _set_unc(rec, ["finiteness:repair/draft", "finiteness:repair/target"]))
+        ck("G22a_uncovered 非空但均为非必需未执行⇒**不判失败**（rev.5 修分类漏洞）",
+           r22a["verdict"] == "CASE_PASS", (r22a["verdict"], r22a["reasons"][:2]))
+        ck("G22a_覆盖缺口被如实记为只读覆盖记录",
+           any("未执行" in n for ns in (r22a.get("coverage_notes") or {}).values()
+               for n in (ns.get("rep1") or [])), r22a.get("coverage_notes"))
+        # (a2) 缺 `checks.checks[]` 逐条明细 ⇒ **证据不足**（不是失败）——防止"无法核对却当通过"
+        def _drop_entries(rec):
+            rec["smoke"]["checks"].pop("checks", None)
+        r22a2 = _c22(_drop_entries)
+        ck("G22a2_缺逐条明细⇒INCOMPLETE（不得当通过）", r22a2["verdict"] == "CASE_INCOMPLETE",
+           (r22a2["verdict"], r22a2["reasons"][:1]))
+        # (b) uncovered 里出现**必需**条目 ⇒ FAIL（防止把必需检查塞进 uncovered 混过去）
+        def _unc_required(rec):
+            _set_unc(rec, ["finiteness:repair/draft"])
+            for e in rec["smoke"]["checks"]["checks"]:
+                if e["name"] == "finiteness:repair/draft":
+                    e["required"] = True
+        r22b = _c22(_unc_required)
+        ck("G22b_uncovered 含必需条目⇒CASE_FAIL（与 harness 契约矛盾）",
+           r22b["verdict"] == "CASE_FAIL", (r22b["verdict"], r22b["reasons"][:1]))
+        # (c) uncovered 里出现**已执行**条目 ⇒ FAIL
+        def _unc_executed(rec):
+            _set_unc(rec, ["finiteness:repair/draft"])
+            for e in rec["smoke"]["checks"]["checks"]:
+                if e["name"] == "finiteness:repair/draft":
+                    e["executed"] = True
+        r22c = _c22(_unc_executed)
+        ck("G22c_uncovered 含已执行条目⇒CASE_FAIL", r22c["verdict"] == "CASE_FAIL",
+           (r22c["verdict"], r22c["reasons"][:1]))
+        # (d) uncovered 里有名字在逐条明细里**不存在** ⇒ FAIL（无逐条明细可核对）
+        r22d = _c22(lambda rec: rec["smoke"]["checks"]["uncovered"].append("finiteness:不存在/x"))
+        ck("G22d_uncovered 出现无明细的名字⇒CASE_FAIL", r22d["verdict"] == "CASE_FAIL",
+           (r22d["verdict"], r22d["reasons"][:1]))
+        # (e) harness failures 非空 ⇒ FAIL
+        r22e = _c22(lambda rec: rec["smoke"]["checks"].__setitem__(
+            "failures", [dict(name="finiteness:verify/target", detail="预期检查缺失")]))
+        ck("G22e_harness failures 非空⇒CASE_FAIL", r22e["verdict"] == "CASE_FAIL",
+           (r22e["verdict"], r22e["reasons"][:1]))
+        # (f) 必需条目未执行 / 未通过 ⇒ FAIL（即便 passed 字段被伪造成 True）
+        def _req_notexec(rec):
+            for e in rec["smoke"]["checks"]["checks"]:
+                if e["name"] == "dispatch_only_prefill":
+                    e["executed"] = False
+        r22f = _c22(_req_notexec)
+        ck("G22f_必需条目未执行（即使 passed=True）⇒CASE_FAIL", r22f["verdict"] == "CASE_FAIL",
+           (r22f["verdict"], r22f["reasons"][:1]))
+
+        def _req_notok(rec):
+            for e in rec["smoke"]["checks"]["checks"]:
+                if e["name"] == "finiteness:prefill/target":
+                    e["ok"] = False
+        r22g = _c22(_req_notok)
+        ck("G22g_必需条目 ok=False（即使 passed=True）⇒CASE_FAIL", r22g["verdict"] == "CASE_FAIL",
+           (r22g["verdict"], r22g["reasons"][:1]))
+        # (h) 缺 `checks.uncovered` 字段 ⇒ INCOMPLETE
+        r22h = _c22(lambda rec: rec["smoke"]["checks"].pop("uncovered", None))
+        ck("G22h_缺 checks.uncovered⇒INCOMPLETE（证据不足）", r22h["verdict"] == "CASE_INCOMPLETE",
+           (r22h["verdict"], r22h["reasons"][:1]))
+        # (i) 融合路径覆盖记录：真的融合 ⇒ 记为"已实际发生"；短块合法回退 ⇒ 记为"未覆盖"
+        r22i = _c22(lambda rec: None)
+        ck("G22i_真融合⇒覆盖记录写明'已实际发生'",
+           any("已实际发生" in n for ns in (r22i.get("coverage_notes") or {}).values()
+               for n in (ns.get("rep1") or [])), r22i.get("coverage_notes"))
+        r22j = ev("strict", DECL["strict"],
+                  _trio("strict", ar_gen=AR16, prod_gen=list(AR16), serial_gen=list(AR16),
+                        rounds=[_round(0, 4, 4), _round(1, 3, 2)], fused_by_phase={},
+                        fallbacks=[dict(phase="prefill", s=1,
+                                        reason="s=1 < PREFILL_FUSED_MIN_S=2（cuDNN 不支持 seq_len=1）",
+                                        kind="short_block_seq_len_lt_min")],
+                        reasons={"short_block_seq_len_lt_min": 1}))
+        ck("G22j_短块合法回退⇒覆盖记录写明'融合路径未被覆盖'",
+           any("融合路径未被覆盖" in n for ns in (r22j.get("coverage_notes") or {}).values()
+               for n in (ns.get("rep1") or [])), r22j.get("coverage_notes"))
+        ck("G22j_短块回退在有记录理由时不算失败", r22j["verdict"] == "CASE_PASS",
+           (r22j["verdict"], r22j["reasons"][:1]))
 
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

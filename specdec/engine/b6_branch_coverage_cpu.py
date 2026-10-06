@@ -28,6 +28,22 @@
 `find_runs()` **不**静默覆盖同一 `(mode, rep)` 的多份产物、**不**偷偷取"最后一份"：
 重复产物、非法 `rep`、身份字段（tag/case/mode）与请求不一致 ⇒ **显式报告并判非 PASS**。
 
+## rev.5（2026-10-05）：修 `harness_checks_uncovered_empty` 的**分类漏洞**
+旧版规则写"`smoke.checks.uncovered` 非空 ⇒ FAIL"，但 `smoke_checks.evaluate` **只在**
+`meta["required"] is False` 且该检查未执行时才写 `uncovered`（必需但缺失走 `failures` 且
+`passed=False`，见 `smoke_checks.py:197-204`）⇒ `uncovered` 非空**本身不是失败**，而是
+"该分支本次没有执行（因而不在必需集合里）"的**如实记录**。
+**首次真实触发**：`natural-2` 生产模式（`mismatch_rounds=0`、`rollbacks=0`、`all_accept_rounds=4`
+⇒ `repair` 按设计未执行）⇒ `checks.uncovered=['finiteness:repair/draft','finiteness:repair/target']`，
+而同一产物 `passed=True`、`failures=[]`、两条逐条记录均为 `required=False, executed=False`；
+对照 `natural-1`（`mismatch_rounds=6`）repair 必需且已执行、`uncovered=[]`。
+历史 24 份 Stage 2b 产物 `mismatch_rounds≥8` ⇒ 该规则此前**从未**被真实数据触发。
+**新判定（逐条核对，比旧版更细，不是放宽）**：① `checks.failures` 必须为空；
+② `uncovered` 每条必须存在逐条明细且 `required=False, executed=False`；
+③ 所有 `required=True` 的条目必须 `executed=True` 且 `ok=True`。
+另新增**只读** `coverage_notes()`：如实记录"哪些事没有被这次 run 覆盖"，特别是
+**短输入合法回退 ⇒ 融合路径未被覆盖**（不得当作"融合 prefill 已验证"）。
+
 退出码：`0` 全部 `CASE_PASS` · `1` 存在 INCOMPLETE/FAIL · `3` 参数非法（不写产物）。
 """
 from __future__ import annotations
@@ -353,14 +369,77 @@ def hard_checks(rec: dict) -> list:
             rows.append(("finiteness_n_checked>0 / by_phase_model ok", "ok", f"n_checked={n}"))
     else:
         rows.append(("finiteness_coverage", "missing", "smoke.checks.finiteness_coverage 缺失"))
-    # harness 的必需检查覆盖
-    unc = _dig(rec, "smoke.checks.uncovered")
-    if unc is None:
-        rows.append(("harness_checks_uncovered_empty", "missing", "字段缺失"))
-    elif unc:
-        rows.append(("harness_checks_uncovered_empty", "fail", f"未覆盖必需检查：{unc}"))
+    # harness 的必需检查覆盖（**rev.5 修分类漏洞**，2026-10-05）
+    # ⚠️ 漏洞：旧版写"`checks.uncovered` 非空 ⇒ FAIL"，但 `smoke_checks.evaluate` **只在**
+    #    `meta["required"] is False` 且该检查未执行时才写入 `uncovered`
+    #    （必需但缺失走 `failures` 且 `passed=False`；见 `smoke_checks.py:197-204`）
+    #    ⇒ `uncovered` 非空**本身不是失败**，它是"该分支本次没有执行（因而不在必需集合里）"的**如实记录**。
+    #    首次真实触发：`natural-2` prod（`mismatch_rounds=0` ⇒ repair 未执行，
+    #    `checks.uncovered=['finiteness:repair/draft','finiteness:repair/target']`，
+    #    同时 `passed=True`、`failures=[]`、两条逐条记录均为 `required=False, executed=False`）。
+    # 现在的判定**更细**（逐条核对 required/executed/ok），**不是放宽**：
+    #   ① `checks.failures` 必须为空；
+    #   ② `uncovered` 的每一条必须在 `checks.checks[]` 里存在对应条目，且 required=False、executed=False；
+    #   ③ 所有 `required=True` 的条目必须 executed=True 且 ok=True。
+    checks_blk = _dig(rec, "smoke.checks")
+    entries = None
+    if isinstance(checks_blk, dict) and isinstance(checks_blk.get("checks"), list):
+        entries = [e for e in checks_blk["checks"] if isinstance(e, dict)]
+    if not isinstance(checks_blk, dict):
+        rows.append(("harness_checks_block", "missing", "smoke.checks 缺失或类型非法"))
     else:
-        rows.append(("harness_checks_uncovered_empty", "ok", "无未覆盖必需检查"))
+        fails = checks_blk.get("failures")
+        if fails is None:
+            rows.append(("harness_checks_failures_empty", "missing", "字段缺失"))
+        elif not isinstance(fails, list):
+            rows.append(("harness_checks_failures_empty", "illegal",
+                         f"类型非法（{type(fails).__name__}，期望 list）"))
+        elif fails:
+            rows.append(("harness_checks_failures_empty", "fail",
+                         f"harness 记录的失败检查 {len(fails)} 条：{[f.get('name') for f in fails[:3]]}"))
+        else:
+            rows.append(("harness_checks_failures_empty", "ok", "harness 记录 0 条失败检查"))
+        unc = checks_blk.get("uncovered")
+        if unc is None:
+            rows.append(("harness_uncovered_entries_not_required", "missing", "字段缺失"))
+        elif not isinstance(unc, list):
+            rows.append(("harness_uncovered_entries_not_required", "illegal",
+                         f"类型非法（{type(unc).__name__}，期望 list）"))
+        elif entries is None:
+            rows.append(("harness_uncovered_entries_not_required", "missing",
+                         "缺 `checks.checks[]` 逐条明细 ⇒ 无法核对 uncovered 的 required/executed"))
+        else:
+            byname = {e.get("name"): e for e in entries}
+            bad_unc = []
+            for nm in unc:
+                e = byname.get(nm)
+                if e is None:
+                    bad_unc.append(f"{nm}（无逐条明细）")
+                elif e.get("required") is not False or e.get("executed") is not False:
+                    bad_unc.append(f"{nm}（required={e.get('required')!r}, executed={e.get('executed')!r}）")
+            if bad_unc:
+                rows.append(("harness_uncovered_entries_not_required", "fail",
+                             f"`uncovered` 里出现**必需或已执行**的检查 ⇒ 与 harness 契约矛盾：{bad_unc[:3]}"))
+            elif unc:
+                rows.append(("harness_uncovered_entries_not_required", "ok",
+                             f"{len(unc)} 条均为 required=False 且 executed=False（**覆盖记录**，非失败）："
+                             f"{unc[:2]}"))
+            else:
+                rows.append(("harness_uncovered_entries_not_required", "ok", "无 uncovered 条目"))
+        if entries is None:
+            rows.append(("harness_required_entries_ok", "missing", "缺 `checks.checks[]` 逐条明细"))
+        else:
+            req_bad = [f"{e.get('name')}(executed={e.get('executed')!r}, ok={e.get('ok')!r})"
+                       for e in entries
+                       if e.get("required") is True
+                       and (e.get("executed") is not True or e.get("ok") is not True)]
+            if req_bad:
+                rows.append(("harness_required_entries_ok", "fail",
+                             f"必需检查未执行或未通过：{req_bad[:3]}"))
+            else:
+                n_req = sum(1 for e in entries if e.get("required") is True)
+                rows.append(("harness_required_entries_ok", "ok",
+                             f"{n_req} 条必需检查均已执行且通过"))
     # 决策覆盖
     dc = _dig(rec, "smoke.decision_coverage")
     if dc is None:
@@ -370,6 +449,37 @@ def hard_checks(rec: dict) -> list:
     else:
         rows.append(("decision_coverage", "fail", f"decision_coverage={dc}"))
     return rows
+
+
+def coverage_notes(rec: dict) -> list:
+    """**只读覆盖记录**（不参与判定；rev.5 新增）：把"哪些事情**没有**被这次 run 覆盖"讲清楚。
+
+    规则（与判据严格分离——判据在 `hard_checks`/`backend_report`，这里只**记录**）：
+      * `smoke.checks.uncovered` 非空 ⇒ 如实列出这些**非必需且未执行**的检查
+        （典型：无 mismatch 轮 ⇒ repair 分支未执行 ⇒ 其有限性检查不在本次范围内）；
+      * **融合路径覆盖**：`fused_by_phase["prefill"] > 0` ⇒ 记录"已实际融合"及其 s_max；
+        否则若回退理由里出现 `short_block_seq_len_lt_min` ⇒ 记录
+        "**按既有分派规则合法回退 eager（理由与计数一致），但融合路径**未被覆盖**"
+        —— 明确禁止把此类 run 当作"融合 prefill 已验证"的证据。
+    """
+    notes: list = []
+    unc = (_dig(rec, "smoke.checks.uncovered") or [])
+    if isinstance(unc, list) and unc:
+        notes.append(f"本次**未执行**的非必需检查（harness 记为 uncovered，required=False）：{unc}"
+                     f"（常见原因：`mismatch_rounds=0` ⇒ `repair` 分支未执行）")
+    fused_by = (_dig(rec, "smoke.attention_stats.fused_by_phase") or {})
+    kinds = (_dig(rec, "smoke.attention_stats.eager_reason_kinds") or {})
+    s_max = (_dig(rec, "smoke.attention_stats.s_max_by_phase") or {})
+    pf = fused_by.get("prefill") if isinstance(fused_by, dict) else None
+    if isinstance(pf, int) and pf > 0:
+        notes.append(f"prefill 融合**已实际发生**：fused_by_phase={fused_by}，"
+                     f"fused_s_max_by_phase={_dig(rec, 'smoke.attention_stats.fused_s_max_by_phase')}")
+    elif isinstance(kinds, dict) and kinds.get("short_block_seq_len_lt_min"):
+        notes.append("**融合路径未被覆盖**：本次 prefill 全部为短块（s < PREFILL_FUSED_MIN_S=2）"
+                     f"⇒ 按既有分派规则**合法回退** eager，理由与计数一致"
+                     f"（short_block_seq_len_lt_min={kinds['short_block_seq_len_lt_min']}，"
+                     f"s_max_by_phase={s_max}）；**不得**据此声称融合 prefill 已验证")
+    return notes
 
 
 def consistency_checks(rec: dict) -> list:
@@ -661,6 +771,10 @@ def evaluate_case(case_id: str, declared: dict, runs: dict, *, expect_backend: s
                     diag_missing.append(f"{mode}/rep{rep}: {name} → {detail}")
                 elif state == "illegal":
                     diag_illegal.append(f"{mode}/rep{rep}: {name} → {detail}")
+            # 覆盖记录（**只读、不影响判定**；rev.5）
+            for nt in coverage_notes(rec):
+                res.setdefault("coverage_notes", {}).setdefault(mode, {})[f"rep{rep}"] = \
+                    list(res.get("coverage_notes", {}).get(mode, {}).get(f"rep{rep}", [])) + [nt]
     # 分支覆盖
     obs_total = {}
     for mode in ("prod", "serial"):
@@ -811,6 +925,10 @@ def main() -> int:
               for k, v in r["gate"]["serial_vs_ar"].items()}
         pv = {k: v["kind"] for k, v in r["gate"]["production_vs_ar"].items()}
         print(f"      serial vs AR（严格）：{sa}   production vs AR（**只记录**）：{pv}")
+        for mode, per_rep in (r.get("coverage_notes") or {}).items():
+            for rep, notes in per_rep.items():
+                for nt in notes:
+                    print(f"      [覆盖记录] {mode}/{rep}: {nt}")
     set_branches, types_seen = {}, set()
     for c, r in out["cases_result"].items():
         for b, n in (r.get("branch_observations_total") or {}).items():

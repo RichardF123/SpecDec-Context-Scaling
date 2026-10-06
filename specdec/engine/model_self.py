@@ -537,13 +537,100 @@ def _record_attention_call(path: str, phase: str, s: int, T: int, reason: str | 
 
 
 def assert_strategy_used() -> dict:
-    """**防止"忘了标注阶段"导致静默不融合**：策略已切到 cudnn_prefill 但一次都没融合 ⇒ 抛错。"""
+    """**防止"忘了标注阶段"导致静默不融合**：策略已切到 `cudnn_prefill` 时，必须能由**已记录的调用证据**
+    证明"没有违反既有分派规则（`decide_attention_path`）"。
+
+    ⚠️ 2026-10-05 修正（**只修「断言」与「既有分派规则」之间的矛盾**；
+       不改分派、不改阈值、不改计算精度、不改任何模型数值路径）：
+    旧实现只要 `calls["fused"] == 0` 就抛错 ⇒ 对"输入本身短到无法融合"的**合法回退**
+    （`decide_attention_path` 对 `s < PREFILL_FUSED_MIN_S` 明确返回 `eager` 且给出理由）也报
+    "静默不生效"。新实现把两件事**分开**：
+      * **策略执行是否符合规则**（本函数负责）：矛盾才抛；
+      * **融合路径是否真的被覆盖**（本函数**不**负责断言）：由 `fused_by_phase` 如实记录，
+        并由 8K 复核单独证明。
+
+    判定顺序（每一条都要求**调用长度 / 回退理由 / 计数**三者一致）：
+      ① **非 prefill 阶段**出现融合 ⇒ 抛（与"仅 prefill 允许融合"矛盾）；
+      ② 存在**满足融合条件**的 prefill 调用（`s_max_by_phase['prefill'] >= PREFILL_FUSED_MIN_S`）
+         却一次都没融合 ⇒ 抛；
+      ③ 连 prefill 调用都没有（`by_phase` 无 `prefill`）⇒ 抛（疑似忘了标注阶段）；
+      ④ 全部 prefill 调用都短（`s_max < PREFILL_FUSED_MIN_S`）：
+         * 非融合的 prefill 调用**逐条有记录** `short_block_seq_len_lt_min`，
+           且**理由计数 == prefill 阶段的 eager 调用数**，且**没有其它未解释的理由类别**
+           ⇒ **合法回退，不抛**（附 `strategy_check.verdict="legal_short_block_fallback"` 且
+           `fused_path_covered=False`，明确"融合路径**未**被覆盖"）；
+         * 理由缺失、计数不一致、或存在未解释的回退类别 ⇒ 抛
+           （**不得**凭"存在 short 理由"整体豁免）。
+
+    ⚠️ **不得**把本函数的"合法回退"读成"融合已通过"：短输入用例只能报告
+    "合法回退通过、融合路径未覆盖"；"真的发生了融合"必须由 `fused_by_phase` 与 8K 复核证明。
+    """
     st = attention_stats()
-    if ATTENTION_STRATEGY == "cudnn_prefill" and st["calls"]["fused"] == 0:
+    if ATTENTION_STRATEGY != "cudnn_prefill":
+        return st
+    fused_by = st.get("fused_by_phase") or {}
+    eager_by = st.get("eager_by_phase") or {}
+    by_phase = st.get("by_phase") or {}
+    s_max = st.get("s_max_by_phase") or {}
+    kinds = st.get("eager_reason_kinds") or {}
+    n_fused = int((st.get("calls") or {}).get("fused") or 0)
+    # ① 非 prefill 阶段融合 ⇒ 与分派规则矛盾
+    bad_nonprefill = {ph: n for ph, n in fused_by.items() if ph != "prefill" and n}
+    if bad_nonprefill:
         raise RuntimeError(
-            "策略=cudnn_prefill 但 fused 调用数为 0 —— 说明没有任何调用点标注了 "
+            f"策略=cudnn_prefill 但**非 prefill 阶段**出现融合调用 {bad_nonprefill} —— "
+            f"与既有分派规则（仅 prefill 允许融合）矛盾，必须显式排查。")
+    if n_fused > 0:
+        st["strategy_check"] = dict(
+            verdict="ok_with_fusion",
+            reason=(f"prefill 融合已实际发生：fused_by_phase={fused_by}，"
+                    f"fused_s_max_by_phase={st.get('fused_s_max_by_phase')}"),
+            fused_calls=n_fused, fused_by_phase=dict(fused_by), s_max_by_phase=dict(s_max),
+            fused_path_covered=True)
+        return st
+    prefill_smax = int(s_max.get("prefill") or 0)
+    prefill_eager = int(eager_by.get("prefill") or 0)
+    prefill_calls = int(by_phase.get("prefill") or 0)
+    # ③ 连 prefill 调用都没有 ⇒ 无法解释（保留旧实现"静默不生效"的报警意图）
+    if prefill_calls == 0:
+        raise RuntimeError(
+            "策略=cudnn_prefill 但 **prefill 阶段一次注意力调用都没有** —— 说明没有任何调用点标注了 "
             "attention_phase('prefill')，**这属于静默不生效**，必须显式排查。"
             f"（已见阶段：{st['phases_seen']}；回退数：{st['fallback_count']}）")
+    # ② 存在满足融合条件的 prefill 调用却零融合 ⇒ 与分派规则矛盾
+    if prefill_smax >= PREFILL_FUSED_MIN_S:
+        raise RuntimeError(
+            f"策略=cudnn_prefill 且存在**满足融合条件**的 prefill 调用（s_max_by_phase['prefill']="
+            f"{prefill_smax} ≥ PREFILL_FUSED_MIN_S={PREFILL_FUSED_MIN_S}）却**没有任何融合** ⇒ "
+            f"与既有分派规则矛盾（疑似静默不生效）。（fused_by_phase={fused_by}；"
+            f"eager_by_phase={eager_by}；eager_reason_kinds={kinds}）")
+    # ④ 全部 prefill 调用都短 ⇒ 必须逐条有记录且计数一致
+    n_short = int(kinds.get("short_block_seq_len_lt_min") or 0)
+    # `phase_not_prefill` 是**非 prefill 阶段的正常路径**（不是回退）；其余 kind 一律算"未解释"
+    unexplained = {k: v for k, v in kinds.items()
+                   if k not in ("short_block_seq_len_lt_min", "phase_not_prefill") and v}
+    if unexplained:
+        raise RuntimeError(
+            f"策略=cudnn_prefill、无融合，且存在**未解释的回退理由类别** {unexplained} —— "
+            f"不得凭『存在 short_block_seq_len_lt_min 理由』整体豁免，必须显式排查。"
+            f"（eager_reason_kinds={kinds}；fallbacks={st.get('fallbacks')}）")
+    if prefill_eager == 0 or n_short != prefill_eager:
+        raise RuntimeError(
+            f"策略=cudnn_prefill、无融合，且**回退理由与调用计数不一致**：prefill 阶段 eager 调用 "
+            f"{prefill_eager} 次，记录在案的 `short_block_seq_len_lt_min` 理由 {n_short} 条 ⇒ "
+            f"存在**未解释的回退**（缺理由/多记/少记），必须显式排查。"
+            f"（s_max_by_phase={s_max}；eager_reason_kinds={kinds}；"
+            f"fallbacks={st.get('fallbacks')}）")
+    st["strategy_check"] = dict(
+        verdict="legal_short_block_fallback",
+        reason=(f"全部 prefill 调用都短（s_max_by_phase['prefill']={prefill_smax} < "
+                f"PREFILL_FUSED_MIN_S={PREFILL_FUSED_MIN_S}）⇒ 按既有分派规则**合法**回退 eager；"
+                f"理由与计数一致（short_block_seq_len_lt_min={n_short} == prefill eager 调用 "
+                f"{prefill_eager}）"),
+        fused_path_covered=False,
+        note="**融合路径未被覆盖**：本次 run 不能作为『融合 prefill 已验证』的证据。",
+        fused_calls=0, fused_by_phase=dict(fused_by), eager_by_phase=dict(eager_by),
+        s_max_by_phase=dict(s_max), eager_reason_kinds=dict(kinds), policy=SHORT_BLOCK_POLICY)
     return st
 
 

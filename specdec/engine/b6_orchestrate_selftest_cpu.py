@@ -317,6 +317,38 @@ def main() -> int:
         ck("O20_只记录类型全部在预登记白名单内",
            {f["kind"] for f in (g8["findings"] + g9["findings"] + g19["findings"])}
            <= set(O.RECORD_ONLY_KINDS), None)
+
+        # ---------------- O21：rev.5 覆盖规则修正后，编排判定不得把"非必需未执行"当失败 ----------------
+        # `uncovered` 非空但逐条为 required=False/executed=False ⇒ 编排必须 CONTINUE（只记录）。
+        def _unc_nonreq(rec: dict) -> None:
+            ch = rec["smoke"]["checks"]
+            ch["uncovered"] = ["finiteness:repair/draft", "finiteness:repair/target"]
+            ch["checks"] = [e for e in ch["checks"] if e["name"] not in ch["uncovered"]]
+            ch["checks"] += [dict(name=nm, required=False, executed=False, ok=None,
+                                  detail="该分支本次未执行（非必需）") for nm in ch["uncovered"]]
+
+        recs21 = _trio("o21", ar_gen=AR16, prod_gen=list(AR16), serial_gen=list(AR16),
+                       rounds=ROUNDS_OK)
+        for r in recs21:
+            _unc_nonreq(r)
+        g21 = group("o21", recs21, _spec())
+        ck("O21_非必需未执行的检查⇒CONTINUE（不再误判为失败）",
+           g21["decision"] == "CONTINUE" and g21["case_verdict"] == "CASE_PASS",
+           (g21["decision"], g21["case_verdict"], g21["stop_categories"]))
+        ck("O21_覆盖缺口被如实记录（含'未执行'字样）",
+           any("未执行" in n for n in g21["notes"]), g21["notes"][:2])
+
+        # ---------------- O22：短块合法回退 ⇒ CONTINUE，且明确记录"融合路径未被覆盖" ----------------
+        g22 = group("o22", _trio("o22", ar_gen=AR16, prod_gen=list(AR16), serial_gen=list(AR16),
+                                 rounds=ROUNDS_OK, fused_by_phase={},
+                                 fallbacks=[dict(phase="prefill", s=1,
+                                                 reason="s=1 < PREFILL_FUSED_MIN_S=2（cuDNN 不支持 seq_len=1）",
+                                                 kind="short_block_seq_len_lt_min")],
+                                 reasons={"short_block_seq_len_lt_min": 1}), _spec_none())
+        ck("O22_短块合法回退⇒CONTINUE（不算硬失败）", g22["decision"] == "CONTINUE",
+           (g22["decision"], g22["stop_categories"]))
+        ck("O22_必须明确记录'融合路径未被覆盖'",
+           any("融合路径未被覆盖" in n for n in g22["notes"]), g22["notes"][:3])
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

@@ -183,6 +183,8 @@ def evaluate_group(tag: str, case: str, modes, reps, spec: dict, *, outdir=None,
                                eager_reason_kinds=br.get("eager_reason_kinds"))
         if br["problems"]:
             add_stop("BACKEND_FUSION_PROBLEM", f"{m}/rep{r}: {br['problems']}")
+        for nt in (br.get("notes") or []):
+            out["notes"].append(f"{m}/rep{r}: {nt}")
         for ins in br.get("insufficient") or []:
             if spec.get("expect_prefill_fused") is None:
                 add_finding("DISPATCH_RULE_EVIDENCE_BOUNDARY", f"{m}/rep{r}: {ins}")
@@ -206,6 +208,12 @@ def evaluate_group(tag: str, case: str, modes, reps, spec: dict, *, outdir=None,
                             run_problems=run_problems)
     out["case_verdict"] = res["verdict"]
     out["case_reasons"] = list(res["reasons"])
+    # 覆盖记录（**只读**、不影响 decision；含"短块合法回退 ⇒ 融合路径未被覆盖"）
+    out["coverage_notes"] = res.get("coverage_notes") or {}
+    for mode, per_rep in out["coverage_notes"].items():
+        for rep, notes in per_rep.items():
+            for nt in notes:
+                out["notes"].append(f"[覆盖记录] {mode}/{rep}: {nt}")
     out["branches"] = {b: v["verdict"] for b, v in (res.get("branches") or {}).items()}
     out["branch_observations"] = res.get("branch_observations_total")
     for p in res.get("duplicate_or_identity_problems") or []:

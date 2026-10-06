@@ -300,6 +300,120 @@ def main() -> int:
     M.reset_attention_stats()
     M._fused_prefill_attention = real_fused
 
+    # ---- 6. `assert_strategy_used()` 与既有分派规则的一致性（2026-10-05 修正的**反例回归**）----
+    # 修正范围：**只**修断言与"既有分派规则"的矛盾；不改分派、阈值、精度、数值路径。
+    # 判定要求：调用长度 / 回退理由 / 计数**三者一致**才算合法回退；
+    #           "合法回退"≠"融合已通过"（必须显式给出 fused_path_covered=False）。
+    print("\n== 6. 策略断言与分派规则一致性（short 合法回退 vs 真矛盾）==")
+
+    def _fake_stats(**kw) -> dict:
+        """直接构造统计（不跑模型），逐条覆盖 assert 的判定分支。"""
+        st = M._fresh_stats()
+        st.update({k: v for k, v in kw.items()})
+        st["strategy"] = "cudnn_prefill"
+        return st
+
+    def _assert_with(st: dict) -> tuple:
+        """把给定统计装进 `_ATTENTION_STATS` 后调用断言，返回 (是否抛, 消息/返回值)。"""
+        saved = M._stats()
+        M.set_attention_strategy("cudnn_prefill")
+        try:
+            M._ATTENTION_STATS = st                                     # noqa: SLF001（测试内直填）
+            try:
+                return False, M.assert_strategy_used()
+            except RuntimeError as e:
+                return True, str(e)
+        finally:
+            M._ATTENTION_STATS = saved
+            M.set_attention_strategy("eager")
+
+    def _prefill_only_stats(*, s: int, eager_calls: int, short_reasons: int, fused: int,
+                            other_kinds: dict | None = None, extra_fused_phase=None) -> dict:
+        st = M._fresh_stats()
+        st["calls"] = dict(eager=eager_calls, fused=fused)
+        st["by_phase"] = {"prefill": eager_calls + fused}
+        st["eager_by_phase"] = {"prefill": eager_calls} if eager_calls else {}
+        st["fused_by_phase"] = ({"prefill": fused} if fused else {})
+        st["s_max_by_phase"] = {"prefill": s} if (eager_calls + fused) else {}
+        st["fused_s_max_by_phase"] = ({"prefill": s} if fused else {})
+        st["eager_reason_kinds"] = dict(other_kinds or {})
+        if short_reasons:
+            st["eager_reason_kinds"]["short_block_seq_len_lt_min"] = short_reasons
+        st["fallback_count"] = eager_calls
+        st["phases_seen"] = ["prefill"]
+        if extra_fused_phase:
+            st["fused_by_phase"].update(extra_fused_phase)
+            st["calls"]["fused"] += sum(extra_fused_phase.values())
+        return st
+
+    # (1) 全部 prefill 调用都短 + 理由计数一致 ⇒ **合法回退，不抛**，且明确"融合路径未覆盖"
+    raised, res = _assert_with(_prefill_only_stats(s=1, eager_calls=2, short_reasons=2, fused=0))
+    check("⑥a 全部 prefill s<min 且理由/计数一致 ⇒ 不抛（合法回退）", raised is False, res if raised else "")
+    check("⑥b 合法回退必须显式标注 fused_path_covered=False（≠ 融合已通过）",
+          (not raised) and res.get("strategy_check", {}).get("verdict") == "legal_short_block_fallback"
+          and res["strategy_check"].get("fused_path_covered") is False,
+          "" if raised else res.get("strategy_check", {}).get("verdict"))
+
+    # (2) 存在满足融合条件的 prefill 调用却零融合 ⇒ 仍抛
+    raised, msg = _assert_with(_prefill_only_stats(s=8, eager_calls=1, short_reasons=0, fused=0))
+    check("⑥c 有满足融合条件的 prefill（s≥min）却零融合 ⇒ 必须抛",
+          raised and "满足融合条件" in msg, msg)
+
+    # (3) 混合长短：短块记了理由，但长块没融合 ⇒ 也抛（不得凭"存在 short 理由"整体豁免）
+    raised, msg = _assert_with(_prefill_only_stats(s=8, eager_calls=3, short_reasons=1, fused=0))
+    check("⑥d 混合长短且长块未融合 ⇒ 必须抛（不得整体豁免）",
+          raised and "满足融合条件" in msg, msg)
+
+    # (4) 理由缺失 / 计数不一致 ⇒ 抛（存在未解释的回退）
+    raised, msg = _assert_with(_prefill_only_stats(s=1, eager_calls=2, short_reasons=0, fused=0))
+    check("⑥e 短块回退但**无理由记录** ⇒ 必须抛",
+          raised and "未解释的回退" in msg, msg)
+    raised, msg = _assert_with(_prefill_only_stats(s=1, eager_calls=3, short_reasons=1, fused=0))
+    check("⑥f 短块回退理由计数与 prefill eager 调用数**不一致** ⇒ 必须抛",
+          raised and "未解释的回退" in msg, msg)
+    raised, msg = _assert_with(_prefill_only_stats(
+        s=1, eager_calls=2, short_reasons=2, fused=0, other_kinds={"other": 1}))
+    check("⑥g 存在 kind=other 的未解释回退（计数不一致）⇒ 必须抛",
+          raised and "未解释的回退" in msg, msg)
+
+    # (5) 非 prefill 阶段融合 ⇒ 仍抛
+    raised, msg = _assert_with(_prefill_only_stats(s=8, eager_calls=0, short_reasons=0, fused=1,
+                                                   extra_fused_phase={"verify": 1}))
+    check("⑥h 非 prefill 阶段出现融合 ⇒ 必须抛",
+          raised and "非 prefill" in msg, msg)
+
+    # (6) 零 prefill 调用（忘了标注阶段）⇒ 仍抛（旧报警意图保留）
+    st_none = M._fresh_stats()
+    st_none["phases_seen"] = ["prefill"]
+    raised, msg = _assert_with(st_none)
+    check("⑥i prefill 阶段零调用（忘标注）⇒ 必须抛", raised and "静默不生效" in msg, msg)
+
+    # (7) 真的融合 ⇒ 返回 ok_with_fusion 且 fused_path_covered=True
+    raised, res = _assert_with(_prefill_only_stats(s=8, eager_calls=1, short_reasons=0, fused=2))
+    check("⑥j 真的发生 prefill 融合 ⇒ 不抛且 fused_path_covered=True",
+          (not raised) and res["strategy_check"]["verdict"] == "ok_with_fusion"
+          and res["strategy_check"]["fused_path_covered"] is True, "" if raised else res)
+
+    # (8) 端到端（真跑一次短输入）：断言不抛，且统计里能读出"融合未覆盖"
+    M.set_attention_strategy("cudnn_prefill")
+    M.reset_attention_stats()
+    tgt2 = tiny_model(0)
+    real3, M._fused_prefill_attention = M._fused_prefill_attention, FusedRecorder()
+    try:
+        M.chunked_prefill(tgt2, torch.randint(0, 64, (1, 1)), chunk=8)     # 单块 s=1
+        st_e2e = M.assert_strategy_used()
+    finally:
+        M._fused_prefill_attention = real3
+        M.set_attention_strategy("eager")
+        M.reset_attention_stats()
+    check("⑥k 端到端 1-token prompt：断言不抛、融合未发生且理由/计数一致",
+          st_e2e["strategy_check"]["verdict"] == "legal_short_block_fallback"
+          and st_e2e["calls"]["fused"] == 0
+          and st_e2e["eager_reason_kinds"].get("short_block_seq_len_lt_min")
+          == st_e2e["eager_by_phase"].get("prefill")
+          and st_e2e["eager_by_phase"].get("prefill", 0) > 0,
+          st_e2e.get("strategy_check"))
+
     print(f"\nCPU 自测：PASS {len(PASS)} / FAIL {len(FAIL)}")
     if FAIL:
         print("失败项：" + ", ".join(FAIL))
