@@ -58,6 +58,89 @@ def _read_sites(name: str) -> list:
     return funcs
 
 
+ACCESSOR_FUNCS = ("diag_precision", "set_diag_precision", "set_diag_preset")
+
+
+def read_site_roles(name: str = "DIAG_QK_FP32", *, co_switch: str = "_SERIAL_QK",
+                    source: str | None = None) -> list:
+    """把 `name` 的读取点**按角色**分类（静态、可复查）。
+
+    | role | 判据 | 含义 |
+    | --- | --- | --- |
+    | `accessor` | 位于 `diag_precision()` / `set_diag_precision()` / `set_diag_preset()` | 只读取并**报告**状态，不参与计算 |
+    | `precision` | 读取点**本身**就是某个 `if`/`elif` 的测试（`elif DIAG_QK_FP32:`） | 直接决定**精度表达式**（QK FP32 分支） |
+    | `guard` | 读取点位于某个 `BoolOp`（and/or）内 | **路径选择/联合条件**；若该 `BoolOp` 是 `and` 且**首个操作数**测试 `co_switch`（`_SERIAL_QK`），则默认（`co_switch is None`）时**短路**、不参与任何决策 |
+    | `unclassified` | 以上都不是 | ⇒ **必须为 0**（防止未来静默新增一个语义未定的读取点） |
+
+    为什么要分类：`DIAG_QK_FP32` 的"作用范围"由**两类**读取点共同决定 —— 一类改精度，另一类只选路径；
+    把它们混成一个计数（首版自测的做法）既会在新增 guard 时误报，也会掩盖"guard 是否默认惰性"这个真问题。
+
+    `source` 可传入**合成源码**（默认读 `model_self.py`）⇒ 分类器本身可被回归测试
+    （见 `qk_scope_selftest_cpu` 的 §1b：`if S:` ⇒ precision；`(_C is not None and not S)` ⇒ 惰性 guard；
+    `(S and _C is not None)` ⇒ guard 但**不**惰性；`S + 1` ⇒ unclassified）。
+    """
+    src = source if source is not None else Path(M.__file__).read_text(encoding="utf-8")
+    tree = ast.parse(src)
+    parents: dict = {}
+    for parent in ast.walk(tree):
+        for child in ast.iter_child_nodes(parent):
+            parents[id(child)] = parent
+    out: list = []
+
+    def _names(node) -> set:
+        return {n.id for n in ast.walk(node) if isinstance(n, ast.Name)}
+
+    class V(ast.NodeVisitor):
+        def __init__(self):
+            self.stack = []
+
+        def visit_FunctionDef(self, node):                       # noqa: N802
+            self.stack.append(node.name)
+            self.generic_visit(node)
+            self.stack.pop()
+
+        def visit_Name(self, node):                              # noqa: N802
+            if node.id != name or not isinstance(node.ctx, ast.Load):
+                self.generic_visit(node)
+                return
+            func = self.stack[-1] if self.stack else None
+            cur, role, detail = node, None, {}
+            while True:
+                par = parents.get(id(cur))
+                if par is None:
+                    break
+                if isinstance(par, ast.BoolOp):
+                    first = par.values[0]
+                    ops = {type(o).__name__ for o in par.values[1:]}
+                    detail = dict(
+                        boolop=type(par.op).__name__,
+                        first_operand_names=sorted(_names(first)),
+                        co_switch=co_switch,
+                        co_switch_in_same_boolop=co_switch in _names(par),
+                        target_in_first_operand=name in _names(first),
+                        other_operands=sorted(ops))
+                    role = "guard"
+                    break
+                if isinstance(par, ast.If) and par.test is node:
+                    detail = dict(test_is_switch=True)
+                    role = "precision"
+                    break
+                cur = par
+            if role is None:
+                role = "accessor" if func in ACCESSOR_FUNCS else "unclassified"
+                detail = dict(why=("读取器：只报告状态" if role == "accessor"
+                                   else "未归类：既非 if/elif 测试、也不在 BoolOp 内"))
+            inert = bool(role == "guard" and detail.get("boolop") == "And"
+                         and not detail.get("target_in_first_operand")
+                         and co_switch in detail.get("first_operand_names", []))
+            out.append(dict(line=node.lineno, func=func, role=role, inert_by_default=inert,
+                            **detail))
+            self.generic_visit(node)
+
+    V().visit(tree)
+    return sorted(out, key=lambda r: r["line"])
+
+
 def static_scope_proof() -> dict:
     """把"开关到底改变哪些算子、哪些阶段生效"变成可复查的结构化事实。"""
     fused_src = inspect.getsource(M._fused_prefill_attention)
@@ -66,6 +149,12 @@ def static_scope_proof() -> dict:
     # `diag_precision()` 是**读取器**（它把开关读出来报告），不算"影响计算的读取点"。
     ACCESSORS = ("diag_precision", "set_diag_precision", "set_diag_preset")
     compute_sites = [s for s in qk_sites if s["func"] not in ACCESSORS]
+    # ---- 2026-10-05：按**角色**分类（`n_qk_compute_read_sites` 的含义**不变**：仍是非读取器的读取点）----
+    roles = read_site_roles("DIAG_QK_FP32")
+    precision = [r for r in roles if r["role"] == "precision"]
+    guards = [r for r in roles if r["role"] == "guard"]
+    accessor_sites = [r for r in roles if r["role"] == "accessor"]
+    unclassified = [r for r in roles if r["role"] == "unclassified"]
     coverage = {}
     for ph in PHASES:
         for s in (1, 4):
@@ -78,10 +167,25 @@ def static_scope_proof() -> dict:
         prob_read_sites=prob_sites,
         n_qk_read_sites=len(qk_sites),
         n_qk_compute_read_sites=len(compute_sites),
+        qk_read_roles=roles,
+        qk_precision_read_sites=precision,
+        n_qk_precision_read_sites=len(precision),
+        qk_guard_read_sites=guards,
+        n_qk_guard_read_sites=len(guards),
+        qk_accessor_read_sites=accessor_sites,
+        n_qk_accessor_read_sites=len(accessor_sites),
+        qk_unclassified_read_sites=unclassified,
+        n_qk_unclassified_read_sites=len(unclassified),
+        all_non_accessor_sites_classified=not unclassified,
+        guards_inert_by_default=all(g["inert_by_default"] for g in guards) if guards else True,
+        role_note="`precision` = 直接决定精度表达式（`elif DIAG_QK_FP32:`）；"
+                  "`guard` = 只在 `BoolOp` 里与 `_SERIAL_QK` 联合判定的**路径选择**读取点"
+                  "（默认 `_SERIAL_QK is None` ⇒ 短路，不参与任何决策）；"
+                  "`unclassified` 必须为 0。两类读取点的**总数**仍等于 `n_qk_compute_read_sites`。",
         qk_read_only_in_eager_branch=bool(
-            len(compute_sites) == 1 and compute_sites[0]["func"] == "forward"),
+            len(precision) == 1 and precision[0]["func"] == "forward"),
         accessor_note="`diag_precision()` 只是读取并报告状态，不参与计算；"
-                      "**影响计算的读取点**见 `qk_compute_read_sites`",
+                      "**影响计算的读取点**见 `qk_compute_read_sites`（= precision + guard）",
         fused_bypasses_qk=("DIAG_QK_FP32" not in fused_src),
         fused_bypasses_prob=("DIAG_PROB_FP32" not in fused_src),
         fused_impl="model_self._fused_prefill_attention",

@@ -37,20 +37,62 @@ def _run() -> int:
             nfail += 1
             print(f"  [FAIL] {name} {extra}")
 
-    print("== 1. 开关的唯一读取点与算子范围（静态可复查） ==")
+    print("== 1. 开关的读取点按**角色**分类（静态可复查）==")
     proof = S.static_scope_proof()
-    check("模块里 DIAG_QK_FP32 的读取点共 2 处（含状态读取器）",
-          proof["n_qk_read_sites"] == 2, proof["qk_read_sites"])
-    check("★ **影响计算**的读取点只有 1 处（排除 diag_precision 这类读取器）",
-          proof["n_qk_compute_read_sites"] == 1, proof["qk_compute_read_sites"])
-    check("该唯一读取点位于 attention 的 eager 分支（forward 内）",
-          proof["qk_read_only_in_eager_branch"] is True, proof["qk_compute_read_sites"])
+    roles = {r["line"]: r for r in proof["qk_read_roles"]}
+    print("    读取点明细：" + " | ".join(
+        f"L{r['line']}/{r['func']}={r['role']}" + ("(默认短路)" if r.get("inert_by_default") else "")
+        for r in proof["qk_read_roles"]))
+    check("★ 每个读取点都已按角色分类（unclassified 必须为 0）",
+          proof["n_qk_unclassified_read_sites"] == 0, proof["qk_unclassified_read_sites"])
+    check("★ **precision**（直接决定精度表达式）的读取点恰好 1 处，且位于 attention 的 forward 内",
+          proof["n_qk_precision_read_sites"] == 1 and proof["qk_read_only_in_eager_branch"] is True,
+          proof["qk_precision_read_sites"])
+    check("precision 读取点就是该分支的 `if`/`elif` 测试本身",
+          all(r.get("test_is_switch") is True for r in proof["qk_precision_read_sites"]),
+          proof["qk_precision_read_sites"])
+    check("guard 读取点（与 `_SERIAL_QK` 联合判定路径选择）全部**默认惰性**："
+          "`and` 的首操作数判 `_SERIAL_QK`、开关在其后的操作数里",
+          proof["guards_inert_by_default"] is True and bool(proof["qk_guard_read_sites"]),
+          proof["qk_guard_read_sites"])
+    check("guard 与 precision 都在 `forward` 内（没有别的函数读该开关）",
+          all(r["func"] == "forward" for r in proof["qk_precision_read_sites"]
+              + proof["qk_guard_read_sites"]),
+          [(r["line"], r["func"], r["role"]) for r in proof["qk_read_roles"]])
+    check("非读取器读取点总数 == precision + guard（分类完整、无遗漏）",
+          proof["n_qk_compute_read_sites"] == proof["n_qk_precision_read_sites"]
+          + proof["n_qk_guard_read_sites"], proof["n_qk_compute_read_sites"])
+    check("accessor 读取点只在 `diag_precision()` 这类报告器里",
+          all(r["func"] in ("diag_precision", "set_diag_precision", "set_diag_preset")
+              for r in proof["qk_accessor_read_sites"]),
+          proof["qk_accessor_read_sites"])
     check("★ 融合 prefill 的源码里**没有**该开关名 ⇒ 融合 prefill 绕过它",
           proof["fused_bypasses_qk"] is True and proof["fused_bypasses_prob"] is True)
     check("输出 dtype 明确标为不变（干预不改变张量类型）",
           proof["output_dtype_unchanged"] is True)
     for op in ("o_proj / MLP / RMSNorm / lm_head / 权重 / 缓存 dtype",):
         check(f"明确不改动的部分含：{op}", op in proof["unchanged_ops"])
+
+    print("== 1b. 角色分类器自身的回归（合成源码；防止未来静默新增/写反顺序）==")
+
+    def _roles(src: str) -> list:
+        return S.read_site_roles("S", co_switch="_C", source=src)
+
+    r_prec = _roles("def f():\n    if S:\n        return 1\n")
+    r_guard_ok = _roles("def f():\n    return 1 if (_C is not None and not S) else None\n")
+    r_guard_bad = _roles("def f():\n    return 1 if (S and _C is not None) else None\n")
+    r_unc = _roles("def f():\n    return S + 1\n")
+    check("合成：`if S:` ⇒ precision 且测试就是开关本身",
+          [r["role"] for r in r_prec] == ["precision"] and r_prec[0]["test_is_switch"] is True,
+          r_prec)
+    check("合成：`(_C is not None and not S)` ⇒ guard 且**默认惰性**",
+          [r["role"] for r in r_guard_ok] == ["guard"] and r_guard_ok[0]["inert_by_default"] is True,
+          r_guard_ok)
+    check("合成：顺序写反 `(S and _C is not None)` ⇒ guard 但**不**惰性（应被门拒绝）",
+          [r["role"] for r in r_guard_bad] == ["guard"]
+          and r_guard_bad[0]["inert_by_default"] is False, r_guard_bad)
+    check("合成：`S + 1` ⇒ unclassified（应被门拒绝）",
+          [r["role"] for r in r_unc] == ["unclassified"], r_unc)
 
     print("== 2. 阶段分流：哪些阶段吃到这个开关 ==")
     cov = proof["coverage_by_phase"]
@@ -167,6 +209,40 @@ def _run() -> int:
         M.set_diag_precision(qk32=False)
     check("★ 全局开关不干净时 install() 直接断言失败", refused is True)
     check("清理后开关为 False", M.diag_precision()["qk_fp32"] is False)
+
+    print("== 8. `DIAG_QK_FP32` × `_SERIAL_QK` 诊断的交互（guard 读取点的**可观测后果**）==")
+    # 这一节把"guard 到底做了什么"变成**动态**事实：它不改变精度表达式，只决定由哪条路径算 QK。
+    m2 = _tiny_model()
+    m2.eval()
+    x2 = torch.randn(1, 8, m2.embed_tokens.weight.shape[1]).to(torch.bfloat16)
+    attn0 = m2.layers[0].self_attn
+    n_off = n_on = None
+    with torch.inference_mode(), M.attention_phase("decode"):
+        M.set_diag_precision(qk32=False, prob32=False)
+        M.set_serial_qk(attn0, label="scope-interaction")
+        try:
+            m2._run(x2, None, need_logits=True)
+            n_off = M.serial_qk_state()["n_applied"]
+        finally:
+            M.clear_serial_qk()
+        M.set_diag_precision(qk32=True)
+        M.set_serial_qk(attn0, label="scope-interaction")
+        try:
+            m2._run(x2, None, need_logits=True)
+            n_on = M.serial_qk_state()["n_applied"]
+        finally:
+            M.clear_serial_qk()
+            M.set_diag_precision(qk32=False, prob32=False)
+    check("qk_fp32=False（默认）：逐行 serial-QK 路径**生效**（applied ≥ 1）",
+          isinstance(n_off, int) and n_off >= 1, n_off)
+    check("★ qk_fp32=True：guard 短路掉逐行路径（applied == 0）⇒ 两个 QK 诊断**互斥**，"
+          "且这是**默认关闭**的 guard 造成的、不是精度范围的扩大",
+          n_on == 0, n_on)
+    check("该交互结束后全局开关与 serial-QK 均已复位",
+          M.diag_precision()["qk_fp32"] is False
+          and M.serial_qk_state()["active"] is False)
+    check("交互不改变张量 dtype（仍是 bf16）",
+          m2._run(x2, None, need_logits=True)[0].dtype == torch.bfloat16)
 
     print(f"\nCPU 自测：PASS {npass} / FAIL {nfail}")
     return 0 if nfail == 0 else 1
