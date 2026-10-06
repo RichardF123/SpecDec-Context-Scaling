@@ -1,198 +1,107 @@
-# SpecDec — 从零实现的小型 LLM 推理引擎（课程项目）
+# SpecDec：上下文长度与推理性能研究
 
-> **2026-10-04 状态**：五页[课程 proposal 提交版](docs/pdf/specdec_course_proposal_2026-10-04_final.pdf)已生成，**尚未确认已提交**。主实验 6 个 BF16 条件 + 8K V-only FP8 补充 2 条件；旧文档中的 12 条件是历史计划。[给协作者的阶段报告](docs/collaborator_status_2026-10-04.md)（[PDF](docs/pdf/collaborator_status_2026-10-04.pdf)）汇总了数字、证据边界与下一步。
+在 RTX 4060 Laptop 8GB 上实现 Qwen2.5 推理引擎，研究固定模型对、精度与推理配置时，上下文长度如何影响 greedy speculative decoding 相对自回归解码（AR）的性能。DSAI 4207 课程项目。
 
-> 从零实现 Qwen2 系推理引擎 + KV-cache 解码 + 优化阶梯（KV 压缩 → 投机解码），
-> 在 8GB 笔记本 GPU 上做可复现测量。
-> 权威文档：`docs/plan_v7_1_protocol_freeze.md`（实验协议冻结 + Amendment v7.2）、`docs/data_ledger.md`（数据台账）、
-> `docs/design_freeze_fp8_kv.md`（FP8 KV 设计冻结 v1.3）、`docs/design_freeze_g4_specdec.md`（G4 协议 v0.3）、
-> `docs/plan_g4_next_steps.md`（G4 阶段状态）。
+团队实现模型前向、KV cache、量化辅助函数和投机解码控制循环；张量运算依赖 PyTorch，权重与 tokenizer 来自 Hugging Face，prefill 融合 attention 使用库提供的 cuDNN 路径。**自写推理引擎不等于所有 CUDA 算子均为手写。**
 
-## 当前状态（2026-10-06 更新）
+## 当前状态（2026-10-07）
 
-**BF16 B6 已获有限范围 PASS：60次类型覆盖、6次8K融合复核，以及独立6次真实EOS补测已完成；serial 与 AR 在对应测试中完整一致。生产批量验证仍可能分歧，FP8独立B6与正式性能实验尚未完成。**
+**BF16 正确性在已测试范围内通过；正式配置与输入集合已登记。正式 runner 由用户编写，pilot 和正式性能采集尚未完成。** 当前没有正式加速结论，也不声称生产 SpecDec 与 AR 始终逐 token 一致。
 
-见[10月6日阶段记录](docs/stage_checkpoint_2026-10-06.md)及[已批准B6状态与证据](docs/b6_status_and_evidence_index_2026-10-05.md)。下一步是修订测量规格、冻结配置与数据划分，由用户编写正式runner，再以四family pilot验证当前配置的2K/4K/8K测量稳定性。历史8K eager波动不直接决定新配置结论；不提前声明加速或生成质量等同。
-
-正式实验代码由用户本人编写；BF16与V-only FP8按各自准入分别放行。原始运行产物主要保存在本地，GitHub文档同步不等于原始数据全部上传。
-
-## 历史状态快照（2026-10-04）
-
-**引擎、V-only FP8 KV、greedy SpecDec 与测量工具已有实现；五个 BF16 family 的 serial target oracle 与 AR 逐 token 一致，但 production batched verification 仍可能分歧。分层正确性协议尚待小组批准，正式 pilot/benchmark 未通过入口门槛，不声明 SpecDec 已加速。**
-
-当前提案范围为 **6 个主条件（2K/4K/8K × AR/Spec，base BF16）+ 2 个补充条件（8K V-only FP8 × AR/Spec）**，不是历史 12 条件矩阵。提案定稿不等于执行协议、后端和正确性已全部验收。
-
-| 最新进展 | 已验证结果 | 结论边界 |
+| 工作 | 已完成 | 边界与待办 |
 |---|---|---|
-| Serial oracle（BF16） | F13/F01/F02/F08/F10 各 64 token 与 target-only AR 完整一致，独立重复；生成期 target `s=1`、零次 block verify | 只支持这五个输入上的控制逻辑；serial 耗时不进性能结果，V-only FP8 尚无同口径 Gate A |
-| Production BF16 | 上述 family 仍有可重复的首 token 分歧位置：F13@47、F01@14、F02@7、F08@52、F10@8 | 不等于控制逻辑错误，也不等于“无害”；历史 B6-bf16 CHECK 19/20 保留 |
-| 局部机制实验 | 同一历史样本上，attention QK 与四个 projection 受 `M=1`/`M=4` 执行形状影响 | 未获得 kernel 级证据；不能外推为所有 production 分歧的唯一原因 |
-| V-only FP8 | 独立 40 窗 `Delta NLL +0.000397`、relative `Delta PPL +0.040%`；8K target 逻辑 KV 约 `1.32x` | K 仍 BF16；不是整机峰值或性能同比收益；质量数不自动迁移到新 backend |
+| 自写引擎 | Embedding、RMSNorm、RoPE、GQA、SwiGLU、KV-cache、LM head、greedy generation、chunked prefill；参考实现对齐 | 历史 CPU FP32 与 GPU BF16 对齐证据有各自输入和配置范围 |
+| 投机解码 | Draft 提议、target 批量验证、拒绝修复、cache 回滚、EOS 与长度处理 | 限定范围 BF16 B6 PASS，不等于生产批量验证与 AR 全局 exact-id 等价 |
+| 正确性取证 | 类型覆盖、8K 融合复核、真实 EOS 补测；serial oracle 在对应测试中与 AR 完整一致 | serial 是诊断控制，不进入正式 speedup；生产批量验证仍可能出现可重复的数值分歧 |
+| V-only FP8 KV | K 保持 BF16，V 使用 FP8 E4M3、per-token × per-head scale、group=128 | 历史 eager 质量与压缩结果已记录；新后端独立准入与质量回归待完成 |
+| 测量与数据准备 | 阶段计时、显存记录、环境门、失败落盘、独立进程诊断；正式 16-family 清单及 CPU 校验 | 工具准备完成不等于正式实验完成；还需实现 runner 并通过 pilot |
 
-**下一步**：先决定[分层正确性协议 v2 草案](docs/specdec_correctness_protocol_v2_2026-10-04.md)的执行路径与 production 分歧解释口径；再对预登记新 family 和 V-only FP8 分别补 Gate A/B 证据，之后做四-family pilot。不得把 serial oracle 的 PASS 写成 production exact-id PASS，也不得在协议尚待批准时启动正式 16-family 速度矩阵。
+下一步：**编写 runner → CPU dry-run 与记录校验 → 四-family pilot → 按协议处理稳定性及失败 → 获准后正式采集。** 不用历史 eager 波动提前否决当前 cuDNN-prefill 配置的 8K 条件。
 
-详见：[完整阶段报告](docs/collaborator_status_2026-10-04.md)、[serial oracle 实测](docs/serial_oracle_stage2_2026-10-03.md)、[协议待决事项](docs/specdec_correctness_protocol_v2_2026-10-04.md)。下方旧状态快照作为历史保留，其当时的“下一步”不再是当前任务。
+## 研究范围与实验条件
 
-## 历史状态快照（2026-09-27）
+主问题只有一个：**上下文增长如何改变固定配置下的 SpecDec 性能？** 自写引擎是实验基础，KV 压缩是次要消融，不把所有实现模块作为并列研究问题。
 
-以下保留当时记录，后续状态以上方 2026-10-02 更新为准；其中“下一步”及 12 条件范围均为历史计划。
+| 实验线 | 上下文 token 数 | Target KV | 解码策略 | 条件数 |
+|---|---|---|---|---|
+| BF16 主实验 | 2048 / 4096 / 8192 | 未量化 BF16 | AR / SpecDec | 6 |
+| 次要压缩消融 | 8192 | K BF16 + V FP8 | AR / SpecDec | 2 |
 
-**已完成引擎、V-only FP8 KV 和投机解码实现；当前重点是 8K 测量稳定性与 prefill-only cuDNN 验证，尚未完成正式 12 条件实验矩阵。** 以下新结果来自截至 2026-09-26 的已归档实验，不代表后续测试已经通过。
+旧的 **3×2×2、12 条件矩阵是历史计划**，不是当前主实验规格。FP8 按自己的准入条件放行，不阻塞 BF16 主线。
 
-| 阶段 | 当前结果 | 结论边界 |
+当前登记配置：
+
+- Target：`Qwen/Qwen2.5-1.5B-Instruct`；draft：`Qwen/Qwen2.5-0.5B-Instruct`；计算精度 BF16。
+- Attention：`cudnn_prefill` 仅融合符合长度策略的 prefill；decode / propose / verify / repair 保持 eager。
+- `k=4`、`chunk=2048`、`max_new=64`；greedy argmax，命中 EOS 即停并记录实际长度；诊断精度干预关闭。
+- AR 使用 target-only 进程；SpecDec 使用双模型进程。加载不进入推理计时。
+- Pilot：开发用 family `F09/F03/F11/F04`；正式：`FF01–FF16`，按清单重建输入并核对长度/hash。
+- 每个 family × condition 合计 5 次 measured，跨两个随机测量 block 按 3+2 分配；每个 `(family, condition, block)` 独立进程做一次 warm-up 并丢弃。
+
+配置冻结不等于正式采集批准。见[配置记录](docs/config_freeze_2026-10-06.md)、[runner 规格](docs/formal_runner_spec_2026-10-06.md)和[准入清单](docs/bf16_formal_admission_2026-10-05.md)。恢复运行规则与引擎基线/runner 版本关系仍需在实现时明确。
+
+## 已有发现与结论边界
+
+| 发现 | 实测结果 | 适用范围 |
 |---|---|---|
-| G1 / G3 | target 正确性通过；V-only FP8 设计冻结 | 正式计算口径为 BF16；V-only 不等于 K/V 全 FP8 |
-| G4 | B6 FP32：20/20 组合逐 token 一致；BF16：19/20，CHECK | FP32 实现证据不替代 BF16 exact-id 门；216/348 是 accepted/proposed，不是正确率 |
-| G5 测量系统 | canonical v1.2、阶段计时、独立进程探针、P-state 预检及失败记录已实现；已有 151 项 CPU 自测记录 | 测量工具完成不代表正式实验完成 |
-| 8K eager 双模型 | 历史可行性测试跑通过；后续出现 OOM/崩溃和计时不稳定 | “能跑一次”不等于可进行稳定的正式性能测量 |
-| prefill-only cuDNN | 可选分支已接入，默认仍为 eager；CPU 43/43，GPU 路径复核符合预期 | 只融合显式 prefill；decode/propose/verify/repair 保持 eager |
-| cuDNN 对齐验证 | 算子级 8/12 行未过门；模型级 5 配置 × 2 次重复均未过门，ctx512/base 生成发生分歧 | 未通过预登记 eager 对齐判据；不直接等同于融合实现错误，也不改写为 PASS |
+| V-only FP8 固定文本质量 | 独立 40 个 2048-token 窗口：平均 ΔNLL `+0.000397`，相对 ΔPPL `+0.040%` | Qwen2.5-1.5B、BF16 compute、历史 eager 路径；不证明分歧后的生成质量等同 |
+| Target 8K 逻辑 KV 压缩 | `224.00 → 169.75 MiB`，约 `1.32×`，含 scale 元数据 | 仅 target KV，不是整模型或双模型显存压缩比 |
+| 压缩不必然加速 | 历史 paired eager 测试峰值仅降约 `0.06 GiB`，decode 未加速 | 反量化有成本；不能直接外推到当前后端 |
+| K-FP8 负结果 | 被测配置下 ΔNLL 约 `+2.4` 或更高，V-only 明显更温和 | 仅本模型、在线 max-abs E4M3 与被测实现，不宣称所有 K 量化不可行 |
+| 批量验证数值行为 | 同历史局部样本中，QK 与 projection 对 `M=1` / `M=4` 形状敏感；生产轨迹可能分歧 | 控制逻辑正确与逐 token 数值复现是不同问题；未证明统一、唯一的 kernel 级根因 |
 
-### 关键实测数据
+正式性能指标为 `speedup = T_AR / T_Spec`，大于 1 表示 SpecDec 更快。若输出轨迹不同，须同时报告分歧、实际长度、接受率和调用量，不能称为“相同输出的无损加速”。插桩、serial oracle 和 profiler 计时不作为正式速度数据。
 
-| 数据 | 结果 | 测量范围 |
-|---|---|---|
-| V-only FP8 质量 | 独立 40 窗：ΔNLL +0.000397，relative ΔPPL +0.040% | 已冻结 eager 路径；不外推到新后端 |
-| target 8K 逻辑 KV | 224.00 → 169.75 MiB，约 1.32× 压缩 | 仅 target KV，不是双模型总显存 |
-| 2K base_bf16 探索性结果 | decode speedup 0.406×；e2e 0.434×，未加速 | 缩小版 stability probe；合并 measured reps 取中位数后相除，不是 ≥16-family 正式矩阵 |
-| 8K eager SpecDec 波动 | 同配置三次 decode：10.04 / 11.18 / 16.22 s，极差约 61%（相对最小值） | 不支持正式速度倍数声明 |
-| target attention 临时显存 | s=2048、T=2048：496 → 18 MiB；s=2048、T=8192：1984 → 54 MiB | eager → cuDNN，单算子测试，不是整模型峰值 |
-| draft attention 临时显存 | s=2048、T=8192：2284 → 51.5 MiB | 同上；profiler 确认 cuDNN attention 路径 |
+显存分别记录 PyTorch `allocated`、`reserved` 和设备侧占用；`reserved` 不等于物理驻留，不能仅凭它超过 8 GiB 就断言分页或物理超限。旧 FAIL/CHECK 保留，后续 PASS 不覆盖历史记录。
 
-`s` 是当前 query 块长度，`T` 是含历史缓存的总 KV 长度；`s=2048,T=8192` 不是 prefill 第一块。`allocated` 是 PyTorch 跟踪的张量分配，`reserved` 是分配器保留池，两者都不能直接等同于整卡物理占用；单凭 reserved 超过 8 GiB 不能证明发生分页。
+## 本地环境与检查
 
-**数值归因仍需补证**：合成 Q/K/V 对照支持 BF16 中间舍入是重要原因，但尚不能断言真实模型全部差异只来自 score 舍入，或 cuDNN 内部“全程 FP32”。保留原 FAIL，区分数值差异、生成差异与质量损失。
-
-**下一步顺序**：真实模型同一份 Q/K/V 的精度定位 → 固定短窗口独立 NLL/PPL 对照 → 在证据支持后进行独立进程完整 8K 双模型 smoke → 重复稳定性与新后端 correctness 验证。新旧后端数据分开记录，正式 AR/SpecDec 使用一致的后端策略；当前不启动正式矩阵，不声明 8K 已解决或 SpecDec 已加速。
-
-来源：[数据台账](docs/data_ledger.md)（§3.5.3、§4.14、§4.20、§4.22）、[G5 测量协议](docs/g5_measurement_protocol.md)、[cuDNN 阶段报告](docs/cudnn_prefill_stage_report.md)。阶段报告中的唯一根因表述仍需上述真实张量实验补证，不能据此认定已完成验证。
-
-## 已完成阶段与历史验收
-
-以下为对应时间和配置下的历史记录，不代表当前 8K 正式测量或新后端已经通过。
-
-- ✅ **引擎正确性基线**：L1 从零前向对齐 0.000（fp32 CPU，vs transformers）；L2 KV-cache + 贪心生成对齐 PASS；
-- ✅ **G1 — target 1.5B correctness**（fp32 CPU）：full-forward `3.1e-05`、cached-vs-full `2.0e-05`、argmax same、生成序列一致 → **PASS**；
-- ✅ **BF16 GPU 对齐（质量口径）**：OURS vs HF 512-token `max|Δ|=0`、argmax 100%、NLL/PPL 相等。本机 CUDA FP16 对该 Qwen 路径会产生 NaN，因此**正式质量计算一律 BF16**；
-- ✅ **G2 — 8K × 1.5B operational**（chunked prefill、3 runs 稳定、无 OOM）→ **PASS**；
-- ✅ **G3 — FP8 KV FROZEN**：正式方案 = **Asymmetric V-only FP8 KV**（K cache BF16 不量化 + V cache FP8 E4M3，per-token×per-head scale，group=128）。独立 40 窗（不与 pilot 重叠）结果：`ΔNLL +0.000397`、`relative ΔPPL +0.040%`；V2 生成前缀 32/32、V3 chunk 行为一致；8K KV cache 224.00 → 169.75 MiB（**1.32×**）。**诚实边界**：eager decode 无加速且有 V 反量化开销；整机峰值仅降 ~0.06 GiB；1.32× 仅指 KV cache 逻辑压缩；K-FP8 / full-FP8 为 negative ablation（ΔNLL ≥ +2.4，**限定 Qwen2.5-1.5B + 在线 max-abs E4M3 + eager attention，不外推**）；
-- ✅ **G4-0 — draft 正确性**：**CONDITIONAL PASS（BF16 shape drift 已表征）**——OURS full==HF full、OURS cached==HF cached；HF 自身 full/cached 亦同处分歧；FP32 恢复一致 ⇒ 非引擎 bug、非不确定性。block-vs-serial 被测 argmax 一致、cache 终长一致、**无 off-by-one**；但 cache 数值差 max\|Δ\|≈2.0 → exact-id 门保留为风险；
-- ✅ **G4-B3 — 双模型 8GB 可行性**：**PASS 4/4**（1.5B+0.5B 同驻 bf16；ctx512 alloc 4.34/4.336 GiB；ctx8192 alloc 6.16 GiB、resv 8.92 GiB；无 OOM、finite、3 轮稳定）；
-- ✅ **G4-B4 — cache 操作 API**：**PASS**（用户实现 `spec_cache.py`：`cache_length` / `trim_cache` / `check_consistent`；base 与 v_fp8 两档全 True）；
-- ✅ **G4-B5 — greedy SpecDec 主循环**：**PASS**（用户实现 `spec_dec.py`；T1–T4 单测 + 真实投机 smoke：rounds 8 / proposed 27 / accepted 11 / mismatch 5 / all_accept 3；每轮不变量 `tgt_len==drf_len==pre+(m+1 or Kp)` 全成立；`target_block_calls` 8、`draft_calls` 27 实测）。**EOS 修复后已 GPU 复验**（两档逐轮 trace 全 `ok`，B5 记录对应当前代码）；另登记结构性恒等式 `gen_len == accepted + mismatch_rounds`；
-- ✅ **G4-B6 — correctness gate（两档并列登记）**：
-  - **B6-fp32 = 实现正确性证据 → PASS**：10 case × 2 KV 档 = **20/20 组合逐 token id 全等**（CPU/float32，参照 = 同引擎 cached AR；总 216/348；finite、确定性、非空过、case 与档位跑满）。判据在运行前入库；"dtype 不是被测对象"已明确；
-  - **B6-bf16 = 性能档行为 → CHECK 19/20**：唯一分歧 `natural-2@7` 经实测归因为 **bf16 数值不可判定位置**（候选对精确并列 22.8750；signal 0.1491 ≤ noise 0.1491），fp32 真值 = spec 侧 token。**严格口径：不设例外、不放宽 exact-id 门**，该记录原样保留并作为已知数值限制披露；
-- ✅ **EOS 路径 bug 修复**：`_propose` 的 EOS 检查位置导致 draft cache 少 1，全接受分支 `trim_cache` 越界（生成以 EOS 正常收尾时必踩）→ 已修 + 纯逻辑回归测试（含旧实现对照复现 ValueError）；
-- **后续正式实验**：先完成上方数值与稳定性验证，再推进 ≥16 prompt families（2K⊂4K⊂8K）的 pilot/final 与 break-even 分析；G5 instrumentation 和 Part 4 探索测量已有实现与结果，不再列为未启动；
-- 测量纪律：只记录实测（数据见 `docs/data_ledger.md`）；跨脚本显存数字不作比较；进度与决策变更走 amendment/日志而非改写已冻结方案。
-
-## 项目简介
-
-**在做什么**：从零手写 Qwen2 架构推理引擎（RMSNorm / RoPE / GQA attention /
-SwiGLU / KV-cache 解码 / 贪心生成），目前沿 **KV-cache → V-only FP8 KV
-压缩 → 投机解码** 进行实现与验证，用可复现测量表回答研究问题：
-> 固定模型对、精度和配置时，上下文长度如何影响 8GB 小卡上 greedy 投机解码相对 AR 的解码速度？V-only FP8 只作为 8K 补充消融。
-
-**意义**：课程要求"原创 + hands-on LLM system"——我们交付自写引擎 + 质量×成本
-测量表（decode tokens/s / 显存 / 接受率 / ppl），而不是跑教程报一个数字；结果
-可作为小模型部署的决策表；亲手实现 transformer 与推理引擎也正是 AI Infra
-方向的核心技能。
-
-**技术栈**：Python + PyTorch 2.6（cu124）；自写引擎 `specdec/engine/model_self.py`（OURS）；
-HuggingFace 用于权重加载、tokenizer 与参考实现（LIB）；自写缓存、V-only FP8 量化及 greedy 投机循环。
-新增的可选 prefill 融合路径通过 PyTorch 调用 cuDNN attention（LIB）。
-非 GEMM 算子（RMSNorm、RoPE、SwiGLU、causal GQA）另有 CUDA / Triton 实现，用法和一条不加载权重的样例在 [`specdec/kernels/README.md`](specdec/kernels/README.md)。
-int8/int4 权重量化仍不在当前推进范围；测量遵循 G5 协议并落盘保存真实数据。
-
-**为什么这么做**：调 API/库只能看整机表现，研究问题（缓存、量化、投机解码的收益）
-需要引擎内部控制权（缓存布局、解码循环、计时插桩）——这是自建引擎的必要性而非炫技；
-"从零"配上对齐基线（0.000）才让每个结论可复现、可归因；同时遵守风险分层纪律
-（只承诺纯 PyTorch MUST，高方差项为加分轨）。
-
-## 快速开始
+以下为项目已使用的 Windows / PowerShell 环境命令，不是正式实验启动命令。
 
 ```powershell
-# 1) 建环境（方式 A：conda / 方式 B：venv）
-conda create -n specdec python=3.11 -y ; conda activate specdec
-# 或：
-py -3.11 -m venv .venv ; .\.venv\Scripts\Activate.ps1
-
-# 2) 安装依赖（必须装 CUDA 版 —— CPU wheel 会让 cuda=False，静默失败）
-pip install -U pip
-pip install torch==2.6.0+cu124 --index-url https://download.pytorch.org/whl/cu124
-pip install -r requirements-local.txt
-pip install -e .
-
-# 3) 验证机器（第 0 步门）
+py -3.11 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -U pip
+python -m pip install torch==2.6.0+cu124 --index-url https://download.pytorch.org/whl/cu124
+python -m pip install -r requirements-local.txt
+python -m pip install -e .
 python -m specdec.cli env-check
 ```
-预期输出：`cuda available: True`、`NVIDIA GeForce RTX 4060 Laptop GPU`、显存约 8GiB。
 
-> 若 HuggingFace 下载慢/失败，先执行：`set HF_HOME=D:\hf-cache` 和
-> `set HF_ENDPOINT=https://hf-mirror.com`，再跑下面的验收命令。
-> Windows 说明：官方 `triton` 没有 Windows 版——kernel 轨（L3）在 WSL2 里做，
-> 或按 go/no-go 规则保持 eager（详见 `docs/plan_v6.md`）。
-
-## 验收命令（仓库根目录 + venv 已激活）
+本机目标环境：PyTorch 2.6.0+cu124、RTX 4060 Laptop 8GB。GPU 测试串行运行；环境检查失败时保留失败证据，不绕过护栏伪装成功。
 
 ```powershell
-python -m specdec.engine.align_ours          # L1 门 —— 预期 0.000，PASS
-python -m specdec.engine.test_cache_equiv    # L2 缓存==全量 —— 预期 < 1e-3，PASS
-python -m specdec.engine.align_generate      # L2 生成对齐 —— 预期 PASS
-python -m specdec.engine.bench_basic         # 性能基线（CPU，有 GPU 则含 GPU）
+# CPU 正式输入校验；需要本地数据与 tokenizer
+python -X utf8 scripts/verify_formal_families_cpu.py
+
+# 历史基础对齐工具，不代替当前完整准入
+python -m specdec.engine.align_ours
+python -m specdec.engine.test_cache_equiv
+python -m specdec.engine.align_generate
 ```
 
-G4 门（投机解码；GPU 脚本请在交互式终端串行运行）：
+离线模式可使用 `$env:HF_HUB_OFFLINE = "1"`，前提是所需文件已缓存。Manifest 只存来源、长度和 hash，不包含完整 token IDs。原始运行产物主要保存在本地；GitHub 文档同步不等于原始数据全部上传。
 
-```powershell
-python -m specdec.engine.g4_b3_dual_model_feasibility   # B3 双模型 8GB 可行性 —— PASS 4/4
-python -m specdec.engine.g4_b4_cache_tests              # B4 cache API —— PASS（base + v_fp8）
-python -m specdec.engine.g4_b5_helper_tests             # B5 辅助函数 T1–T4 —— PASS
-python -m specdec.engine.g4_b5_smoke                    # B5 主循环 smoke —— PASS
-python -m specdec.engine.g4_b5_eos_branch_tests         # EOS 分支回归（纯逻辑 CPU，秒级）—— PASS
-python -m specdec.engine.g4_b6_correctness              # B6-bf16 exact-id 门 —— CHECK 19/20（已归因）
-python -m specdec.engine.g4_b6_fp32_correctness         # B6-fp32 实现正确性门（CPU/float32）—— PASS 20/20
-python -m specdec.engine.g4_b6_tie_diag                 # 分歧位置的 signal-vs-noise 归因
-```
+## 代码与文档导航
 
-`g4_b6_fp32_correctness` 支持 `set B6F_LIMIT=N` 跑小样（仅验证环境/耗时；**小样永远不会打印 PASS**）。设 `set HF_HUB_OFFLINE=1` 可避免 tokenizer 联网抖动。
+| 路径 | 用途 |
+|---|---|
+| `specdec/engine/model_self.py` | 自写模型、attention、KV-cache、量化接入与生成 |
+| `specdec/engine/spec_dec.py` | Greedy SpecDec 控制循环 |
+| `specdec/engine/spec_cache.py` | Cache 长度、裁剪与一致性契约 |
+| `specdec/engine/` | 对齐、正确性、数值诊断与测量工具 |
+| `specdec/kernels/` | 隔离的 CUDA / Triton 算子研究，不默认等于正式配置所用路径 |
+| `scripts/build_formal_families.py` | 确定性构建正式 family 清单 |
+| `scripts/verify_formal_families_cpu.py` | 输入、消费隔离、hash、分层与嵌套校验 |
 
-## 讲解文档（投机解码）
+- [课程 proposal](docs/pdf/specdec_course_proposal_2026-10-04_final.pdf)：主 6 条件 + 次要 2 条件；存在提交版 PDF 不代表已确认提交。
+- [正式输入清单](docs/prompt_families_formal_manifest.json)：`formal-v1`；16 个 family、三档前缀，18 项 CPU 校验通过。分层为候选集合内相对标签。
+- [G5 测量协议](docs/g5_measurement_protocol.md)：计时、随机化、环境与失败记录。
+- [B6 状态与证据](docs/b6_status_and_evidence_index_2026-10-05.md)、[分层正确性协议](docs/specdec_correctness_protocol_v2_2026-10-04.md)：正确性声明范围。
+- [10 月 6 日阶段记录](docs/stage_checkpoint_2026-10-06.md)、[协作者阶段报告](docs/collaborator_status_2026-10-04.md)：历史进展与证据索引；历史“下一步”不替代当前配置。
+- [数据台账](docs/data_ledger.md)：实测结果、配置与历史 FAIL/CHECK。
+- [FP8 设计](docs/design_freeze_fp8_kv.md)、[SpecDec 设计](docs/design_freeze_g4_specdec.md)、[cache 契约](docs/design_g4_cache_api.md)。
+- [投机解码教学](docs/specdec_explained.md)（[PDF](docs/pdf/specdec_speculative_decoding_explained.pdf)）：原理、张量与代码；历史 exact-id 说明应结合当前数值证据阅读。
+- [协作者 PR 评审](docs/collaborator_pr_review_2026-10-02.md)、[kernel 研究说明](specdec/kernels/README.md)。
 
-- 📄 **`docs/pdf/specdec_speculative_decoding_explained.pdf`**（19 页）— **投机解码：原理、代码与实现细节**。八节：①原理（为什么 decode 慢、凭什么省、为什么 greedy 下输出不变）②一次生成的全景数据流（含真实轮次演算与 8 轮真实 trace）③逐行讲 `spec_dec.py`（每个输入/输出张量的形状/dtype/含义，每个 PyTorch 操作在算什么）④引擎侧 cache 与 FP8 量化算子逐行 ⑤逐行讲 `spec_cache.py` 与契约 ⑥正确性证据（两档门 + "差一个 token"案例的完整归因 + 三个真实 bug）⑦常见误解 Q&A ⑧速查表（形状/不变量/统计字段/命令）。
-- 源文件 `docs/specdec_explained.md`（可 diff、可评审）；重新生成：`python scripts/generate_specdec_explained_pdf.py`（需要 `reportlab`，见 `requirements-local.txt`）。
-
-## 文档
-
-- [合作者 PR #2 / #3 评审与隔离研究归档](docs/collaborator_pr_review_2026-10-02.md) — 保留 KV 压缩、two-pass attention 和性能归因成果；未整包合并旧引擎，不改变现有默认或正式验收。
-- `docs/plan_v7_1_protocol_freeze.md` — 实验协议冻结（v7.1 + §0 **Amendment v7.2**：Compute=BF16、KV 因子、12 conditions）
-- `docs/plan_v7.md` — v7 方案（方向、承诺、裁剪序）；`docs/plan_v6.md` — v6/v6.1 历史方案
-- `docs/data_ledger.md` — 实测数据台账（§3.4 G1、§3.5.x FP8 KV、§4.5.1 G2、§4.5.2 B3、§4.5.3 B4、§4.5.4 B5、§4.5.5 B6-bf16、§4.5.6 B6-fp32）
-- `docs/status_note_fp8_v4.md` — FP8 KV：根因、修复、正式判定、G4 前置清单
-- `docs/design_freeze_fp8_kv.md` — FP8 KV 设计冻结（v1.0→v1.3）
-- `docs/design_freeze_g4_specdec.md` — G4 投机解码协议（v0.3：logits 对齐、回滚语义、`_propose` 出口不变量、EOS 规则）
-- `docs/design_g4_cache_api.md` — cache 接口契约；`docs/plan_g4_next_steps.md` — G4 七阶段规划与状态
-- `docs/specdec_explained.md` + `docs/pdf/specdec_speculative_decoding_explained.pdf` — 投机解码原理/代码/实现细节讲解（19 页）
-- `docs/daily_report_2026-09-15b_G4_B5B6_EOSfix.md` — 本日日报（B5/B6/EOS 修复）
-- `docs/daily_report_2026-09-15.md`、`docs/daily_report_2026-09-08b_G1G2G3_FP8KV.md` — 阶段归档日报
-- `docs/stage_report_l1_l2.md`、`docs/L1_code_teaching.md`、`docs/debug_lesson_alignment.md` — 阶段与教学文档
-
-## 包结构
-
-```
-specdec/
-  cli.py          CLI：env-check、run
-  config.py       RunConfig + config_hash / run_id（复现哈希链）
-  results.py      只追加 results.jsonl 台账
-  engine/         model_self.py（OURS 自写）+ 对齐/测试/基准工具
-  kernels/        CUDA / Triton：RMSNorm、RoPE、SwiGLU、causal GQA（见 kernels/README.md）
-  quant/          Phase 4：int8/int4（OURS）
-  kv_quant/       Phase 4b：KV 量化（OURS）
-  spec_dec/       Phase 5：投机解码（OURS）
-  bench/          Phase 7：基准测试
-```
-
-诚实性规则：`results.jsonl` 只追加真实测量数据，绝不写假行。引擎、缓存与投机循环由团队
-编写，底层张量运算依赖 PyTorch；权重加载、tokenizer、参考实现及可选 cuDNN 融合 attention
-使用第三方库。历史 eager 与新后端的实验口径必须分别记录，不混表、不把诊断数据当正式结论。
+旧版 v6/v7/v7.1 计划与阶段日报保留在 `docs/` 供复盘；其中 12 条件、旧精度口径和历史验收不作为当前正式执行合同。性能与质量声明须指向真实测量及对应配置，不把诊断结果或外推估计写成正式实验结果。
