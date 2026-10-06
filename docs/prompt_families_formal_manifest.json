@@ -1,0 +1,635 @@
+{
+  "manifest_version": "formal-v1",
+  "purpose": "正式评估输入：**未用于调试、未参与 pilot** 的 16 个窗口。与 `v1-draft` 并存；**不修改**旧文件。",
+  "source_manifest": "docs/prompt_families_manifest.json",
+  "source_manifest_sha256": "2f06ad98562080cc0a1d86a813ee553ff1ed47d4d86871e6bba0593ccf7ca2bf",
+  "builder": "scripts/build_formal_families.py",
+  "rules": "见 builder 文件头 R0–R5（先写死再执行；无模型推理、无结果驱动筛选）",
+  "corpus": "data/wikitext-2-raw-v1.zip :: wikitext-2-raw/wiki.train.raw",
+  "tokenizer": "Qwen/Qwen2.5-1.5B-Instruct",
+  "ctxs": [
+    2048,
+    4096,
+    8192
+  ],
+  "corpus_rule": "每 300000 字符一个 block；块内按 8192 token 对齐切分；不跨 block；不插合成填充",
+  "selection_rule": "候选 = 池 − 已消费身份（10 个）；集合内分层 S1c/S2c/S3c 各 4、其余 S4c；先取 S1c+S2c+S3c（12），再按 (block, window) 升序从 S4c 贪心补齐至 16；每 block 上限 5；凑不满则报错退出",
+  "strata_rule": "集合内相对排序：S1c=distinct_token_ratio 最小 4；S2c=余下 markup_ratio 最大 4；S3c=余下 letter_ratio−2·markup_ratio 最大 4；S4c=其余",
+  "strata_note": "⚠️ `c` 后缀表示**候选/集合内**相对排序：**不得**与 `v1-draft` 的 `S1..S4` 直接比较，**不得**宣称恢复原分布或与原分层可比",
+  "per_block_cap": 5,
+  "windows_pool": 32,
+  "candidates": 22,
+  "n_families": 16,
+  "excluded": [
+    {
+      "window": [
+        0,
+        0
+      ],
+      "family_id": "F01",
+      "reason": "协议轮（serial oracle Stage 2）"
+    },
+    {
+      "window": [
+        0,
+        1
+      ],
+      "family_id": "F02",
+      "reason": "协议轮（serial oracle Stage 2）"
+    },
+    {
+      "window": [
+        0,
+        2
+      ],
+      "family_id": "F03",
+      "reason": "Stage 2b + **pilot**"
+    },
+    {
+      "window": [
+        0,
+        3
+      ],
+      "family_id": "F04",
+      "reason": "Stage 2b + **pilot**"
+    },
+    {
+      "window": [
+        0,
+        5
+      ],
+      "family_id": "F06",
+      "reason": "定点诊断（L27/index25 取证）"
+    },
+    {
+      "window": [
+        1,
+        3
+      ],
+      "family_id": "F08",
+      "reason": "协议轮（serial oracle Stage 2）"
+    },
+    {
+      "window": [
+        1,
+        6
+      ],
+      "family_id": "F09",
+      "reason": "Stage 2b + B6 的 8K 融合复核 + **pilot**"
+    },
+    {
+      "window": [
+        2,
+        1
+      ],
+      "family_id": "F10",
+      "reason": "协议轮（serial oracle Stage 2）"
+    },
+    {
+      "window": [
+        3,
+        1
+      ],
+      "family_id": "F11",
+      "reason": "Stage 2b + **pilot**"
+    },
+    {
+      "window": [
+        3,
+        3
+      ],
+      "family_id": "F13",
+      "reason": "定位/历史（div8209 系列）"
+    }
+  ],
+  "pilot_family_ids": [
+    "F09",
+    "F03",
+    "F11",
+    "F04"
+  ],
+  "pilot_note": "pilot 的 4 个 family 已被 R1 排除 ⇒ 正式集合与 pilot **身份级不相交**",
+  "positional_non_overlap": "同 block 内为 [i·8192,(i+1)·8192) 对齐切分 ⇒ 位置互不重叠；block 间为不相交字符区间；family 取自 train.raw、质量窗取自 test.raw",
+  "content_dedup_check": {
+    "note": "**位置不重叠 ≠ 文本内容绝不重复**：这里只**测量**内容重复，不据此筛选样本",
+    "selected_pair_duplicate_text_sha1": [],
+    "selected_vs_excluded_duplicate_text_sha1": [],
+    "whole_pool_duplicate_text_sha1": [],
+    "n_selected": 16
+  },
+  "no_token_ids_stored": "`prefixes` 只存 `n_tokens` 与 `token_sha1`（**不存 token IDs**）⇒ 运行器必须按 source/block/window/tokenizer 重建再核对",
+  "families": [
+    {
+      "family_id": "FF01",
+      "formal_stratum": "S4c_mixed",
+      "source": "wikitext-2-raw-v1/wiki.train.raw",
+      "block": 0,
+      "window_index": 4,
+      "window_token_start": 32768,
+      "n_tokens_window": 8192,
+      "prefixes": {
+        "2048": {
+          "n_tokens": 2048,
+          "token_sha1": "cc483e8680402744"
+        },
+        "4096": {
+          "n_tokens": 4096,
+          "token_sha1": "d86be47fe69e480e"
+        },
+        "8192": {
+          "n_tokens": 8192,
+          "token_sha1": "50ab668c9699b84a"
+        }
+      },
+      "features": {
+        "letter_ratio": 0.7683,
+        "digit_ratio": 0.0098,
+        "markup_ratio": 0.0023,
+        "nonascii_ratio": 0.001,
+        "distinct_token_ratio": 0.2494
+      },
+      "text_sha1": "d48455252bf6fcdc",
+      "text_head": " the team 's top offensive centres , he scored 94 points in the Penguins ' first 65 games and played"
+    },
+    {
+      "family_id": "FF02",
+      "formal_stratum": "S1c_low_entropy",
+      "source": "wikitext-2-raw-v1/wiki.train.raw",
+      "block": 0,
+      "window_index": 6,
+      "window_token_start": 49152,
+      "n_tokens_window": 8192,
+      "prefixes": {
+        "2048": {
+          "n_tokens": 2048,
+          "token_sha1": "a0be64529ccfeee2"
+        },
+        "4096": {
+          "n_tokens": 4096,
+          "token_sha1": "a320b9e37e83ddae"
+        },
+        "8192": {
+          "n_tokens": 8192,
+          "token_sha1": "a8bbb18bbedf7e35"
+        }
+      },
+      "features": {
+        "letter_ratio": 0.7658,
+        "digit_ratio": 0.0132,
+        "markup_ratio": 0.0033,
+        "nonascii_ratio": 0.0007,
+        "distinct_token_ratio": 0.2257
+      },
+      "text_sha1": "aeccfde106b56a47",
+      "text_head": " . It was like fast double @-@ bass , fast kicks during the whole song . That was very inspiring for"
+    },
+    {
+      "family_id": "FF03",
+      "formal_stratum": "S4c_mixed",
+      "source": "wikitext-2-raw-v1/wiki.train.raw",
+      "block": 0,
+      "window_index": 7,
+      "window_token_start": 57344,
+      "n_tokens_window": 8192,
+      "prefixes": {
+        "2048": {
+          "n_tokens": 2048,
+          "token_sha1": "ce6e669c821ecbf4"
+        },
+        "4096": {
+          "n_tokens": 4096,
+          "token_sha1": "f669bf841bcbb4f0"
+        },
+        "8192": {
+          "n_tokens": 8192,
+          "token_sha1": "4e128dee0852ba93"
+        }
+      },
+      "features": {
+        "letter_ratio": 0.7639,
+        "digit_ratio": 0.0135,
+        "markup_ratio": 0.0025,
+        "nonascii_ratio": 0.0014,
+        "distinct_token_ratio": 0.2593
+      },
+      "text_sha1": "73d9a0208e0df6c0",
+      "text_head": " even untenable \" by commercial operators . However this position has resulted in extensive Class A "
+    },
+    {
+      "family_id": "FF04",
+      "formal_stratum": "S3c_prose",
+      "source": "wikitext-2-raw-v1/wiki.train.raw",
+      "block": 1,
+      "window_index": 0,
+      "window_token_start": 0,
+      "n_tokens_window": 8192,
+      "prefixes": {
+        "2048": {
+          "n_tokens": 2048,
+          "token_sha1": "8538e150619db51b"
+        },
+        "4096": {
+          "n_tokens": 4096,
+          "token_sha1": "aca2507e64bf8a72"
+        },
+        "8192": {
+          "n_tokens": 8192,
+          "token_sha1": "5d85ce1c69750b2d"
+        }
+      },
+      "features": {
+        "letter_ratio": 0.7771,
+        "digit_ratio": 0.0091,
+        "markup_ratio": 0.0029,
+        "nonascii_ratio": 0.0023,
+        "distinct_token_ratio": 0.2482
+      },
+      "text_sha1": "356e72410ffbcca6",
+      "text_head": "t time production would exceed a million — the mintage fell to 6 @,@ 200 in 1863 and remained low fo"
+    },
+    {
+      "family_id": "FF05",
+      "formal_stratum": "S3c_prose",
+      "source": "wikitext-2-raw-v1/wiki.train.raw",
+      "block": 1,
+      "window_index": 1,
+      "window_token_start": 8192,
+      "n_tokens_window": 8192,
+      "prefixes": {
+        "2048": {
+          "n_tokens": 2048,
+          "token_sha1": "c7e6a614200a8f1c"
+        },
+        "4096": {
+          "n_tokens": 4096,
+          "token_sha1": "5b9060a53b82f56f"
+        },
+        "8192": {
+          "n_tokens": 8192,
+          "token_sha1": "968e8543cb75934f"
+        }
+      },
+      "features": {
+        "letter_ratio": 0.773,
+        "digit_ratio": 0.0095,
+        "markup_ratio": 0.0023,
+        "nonascii_ratio": 0.0008,
+        "distinct_token_ratio": 0.2625
+      },
+      "text_sha1": "22446d9b84be1062",
+      "text_head": " and that his economic and social policies were basically progressive .   The novel 's title is take"
+    },
+    {
+      "family_id": "FF06",
+      "formal_stratum": "S4c_mixed",
+      "source": "wikitext-2-raw-v1/wiki.train.raw",
+      "block": 1,
+      "window_index": 2,
+      "window_token_start": 16384,
+      "n_tokens_window": 8192,
+      "prefixes": {
+        "2048": {
+          "n_tokens": 2048,
+          "token_sha1": "9e4456e0d2a64856"
+        },
+        "4096": {
+          "n_tokens": 4096,
+          "token_sha1": "434cc4849b68e0f4"
+        },
+        "8192": {
+          "n_tokens": 8192,
+          "token_sha1": "06d922b14f744c46"
+        }
+      },
+      "features": {
+        "letter_ratio": 0.7442,
+        "digit_ratio": 0.0203,
+        "markup_ratio": 0.0019,
+        "nonascii_ratio": 0.0007,
+        "distinct_token_ratio": 0.2544
+      },
+      "text_sha1": "cb8f79339a115e65",
+      "text_head": " ness and efficiency of all ranks \" , particularly considering the challenging environment . When Fa"
+    },
+    {
+      "family_id": "FF07",
+      "formal_stratum": "S4c_mixed",
+      "source": "wikitext-2-raw-v1/wiki.train.raw",
+      "block": 1,
+      "window_index": 4,
+      "window_token_start": 32768,
+      "n_tokens_window": 8192,
+      "prefixes": {
+        "2048": {
+          "n_tokens": 2048,
+          "token_sha1": "8d102933a468ab35"
+        },
+        "4096": {
+          "n_tokens": 4096,
+          "token_sha1": "818de13d6d4ecd05"
+        },
+        "8192": {
+          "n_tokens": 8192,
+          "token_sha1": "3f123b19e7548f6a"
+        }
+      },
+      "features": {
+        "letter_ratio": 0.7573,
+        "digit_ratio": 0.0123,
+        "markup_ratio": 0.0025,
+        "nonascii_ratio": 0.0005,
+        "distinct_token_ratio": 0.2368
+      },
+      "text_sha1": "2236fa7fdbfb59cd",
+      "text_head": " has a circumambulatory path ( Pradakshina @-@ path ) around it . At the back of the portico , near "
+    },
+    {
+      "family_id": "FF08",
+      "formal_stratum": "S3c_prose",
+      "source": "wikitext-2-raw-v1/wiki.train.raw",
+      "block": 1,
+      "window_index": 5,
+      "window_token_start": 40960,
+      "n_tokens_window": 8192,
+      "prefixes": {
+        "2048": {
+          "n_tokens": 2048,
+          "token_sha1": "616bacd83db9f532"
+        },
+        "4096": {
+          "n_tokens": 4096,
+          "token_sha1": "115f7d178c1e7a2b"
+        },
+        "8192": {
+          "n_tokens": 8192,
+          "token_sha1": "ad880e912899b60f"
+        }
+      },
+      "features": {
+        "letter_ratio": 0.7696,
+        "digit_ratio": 0.0153,
+        "markup_ratio": 0.0028,
+        "nonascii_ratio": 0.0012,
+        "distinct_token_ratio": 0.2607
+      },
+      "text_sha1": "f86da6c8f18cc175",
+      "text_head": " his heavy use of reverb and delay effects . He has expressed that he has no taste for shred guitar "
+    },
+    {
+      "family_id": "FF09",
+      "formal_stratum": "S1c_low_entropy",
+      "source": "wikitext-2-raw-v1/wiki.train.raw",
+      "block": 2,
+      "window_index": 2,
+      "window_token_start": 16384,
+      "n_tokens_window": 8192,
+      "prefixes": {
+        "2048": {
+          "n_tokens": 2048,
+          "token_sha1": "8f5337b96a8f229b"
+        },
+        "4096": {
+          "n_tokens": 4096,
+          "token_sha1": "ba32eff6a9980baf"
+        },
+        "8192": {
+          "n_tokens": 8192,
+          "token_sha1": "b392c0d4bad7ddba"
+        }
+      },
+      "features": {
+        "letter_ratio": 0.7536,
+        "digit_ratio": 0.021,
+        "markup_ratio": 0.0021,
+        "nonascii_ratio": 0.0006,
+        "distinct_token_ratio": 0.226
+      },
+      "text_sha1": "c7614b2cc3afd3cb",
+      "text_head": " , where the flesh decomposed , before the bodies were then rearranged within the tomb itself . Thes"
+    },
+    {
+      "family_id": "FF10",
+      "formal_stratum": "S2c_high_markup",
+      "source": "wikitext-2-raw-v1/wiki.train.raw",
+      "block": 2,
+      "window_index": 3,
+      "window_token_start": 24576,
+      "n_tokens_window": 8192,
+      "prefixes": {
+        "2048": {
+          "n_tokens": 2048,
+          "token_sha1": "bf8c4fcc1baddf7f"
+        },
+        "4096": {
+          "n_tokens": 4096,
+          "token_sha1": "ee4cf89a7c95f2c2"
+        },
+        "8192": {
+          "n_tokens": 8192,
+          "token_sha1": "796ae681f8623ce4"
+        }
+      },
+      "features": {
+        "letter_ratio": 0.7427,
+        "digit_ratio": 0.0146,
+        "markup_ratio": 0.0035,
+        "nonascii_ratio": 0.0008,
+        "distinct_token_ratio": 0.2351
+      },
+      "text_sha1": "051a048bd1a4557b",
+      "text_head": " States in 1986 .   In 1987 , the song won Best Single at the Brit Awards , and Best International H"
+    },
+    {
+      "family_id": "FF11",
+      "formal_stratum": "S2c_high_markup",
+      "source": "wikitext-2-raw-v1/wiki.train.raw",
+      "block": 2,
+      "window_index": 5,
+      "window_token_start": 40960,
+      "n_tokens_window": 8192,
+      "prefixes": {
+        "2048": {
+          "n_tokens": 2048,
+          "token_sha1": "e6be4977951bfe05"
+        },
+        "4096": {
+          "n_tokens": 4096,
+          "token_sha1": "80eb2965b4d2be6b"
+        },
+        "8192": {
+          "n_tokens": 8192,
+          "token_sha1": "ecb038655b16498c"
+        }
+      },
+      "features": {
+        "letter_ratio": 0.7412,
+        "digit_ratio": 0.0232,
+        "markup_ratio": 0.0039,
+        "nonascii_ratio": 0.0018,
+        "distinct_token_ratio": 0.2374
+      },
+      "text_sha1": "813ad857345c925a",
+      "text_head": " United States during a visit from President Barack Obama .   Several songs from the soundtrack were"
+    },
+    {
+      "family_id": "FF12",
+      "formal_stratum": "S2c_high_markup",
+      "source": "wikitext-2-raw-v1/wiki.train.raw",
+      "block": 3,
+      "window_index": 0,
+      "window_token_start": 0,
+      "n_tokens_window": 8192,
+      "prefixes": {
+        "2048": {
+          "n_tokens": 2048,
+          "token_sha1": "8451fefc4d12d1a4"
+        },
+        "4096": {
+          "n_tokens": 4096,
+          "token_sha1": "8cb50a8602e77b60"
+        },
+        "8192": {
+          "n_tokens": 8192,
+          "token_sha1": "a7ab6f8397565db6"
+        }
+      },
+      "features": {
+        "letter_ratio": 0.751,
+        "digit_ratio": 0.0153,
+        "markup_ratio": 0.0038,
+        "nonascii_ratio": 0.0028,
+        "distinct_token_ratio": 0.2611
+      },
+      "text_sha1": "a1a7d896dbabebe6",
+      "text_head": "ved from metallic antimony . It has the same crystal structure as red phosphorus and black arsenic ,"
+    },
+    {
+      "family_id": "FF13",
+      "formal_stratum": "S3c_prose",
+      "source": "wikitext-2-raw-v1/wiki.train.raw",
+      "block": 3,
+      "window_index": 2,
+      "window_token_start": 16384,
+      "n_tokens_window": 8192,
+      "prefixes": {
+        "2048": {
+          "n_tokens": 2048,
+          "token_sha1": "bce83e40963e3297"
+        },
+        "4096": {
+          "n_tokens": 4096,
+          "token_sha1": "99c667be927c8503"
+        },
+        "8192": {
+          "n_tokens": 8192,
+          "token_sha1": "7b822d363a1cb6cc"
+        }
+      },
+      "features": {
+        "letter_ratio": 0.7755,
+        "digit_ratio": 0.0118,
+        "markup_ratio": 0.0016,
+        "nonascii_ratio": 0.0003,
+        "distinct_token_ratio": 0.2579
+      },
+      "text_sha1": "17e09e269eec3388",
+      "text_head": " in archaeology , anthropology , and natural history being asked to identify artefacts which had bee"
+    },
+    {
+      "family_id": "FF14",
+      "formal_stratum": "S1c_low_entropy",
+      "source": "wikitext-2-raw-v1/wiki.train.raw",
+      "block": 3,
+      "window_index": 4,
+      "window_token_start": 32768,
+      "n_tokens_window": 8192,
+      "prefixes": {
+        "2048": {
+          "n_tokens": 2048,
+          "token_sha1": "2499e23c3d4209b0"
+        },
+        "4096": {
+          "n_tokens": 4096,
+          "token_sha1": "5b1487a5f1679a69"
+        },
+        "8192": {
+          "n_tokens": 8192,
+          "token_sha1": "dae1e1991fb9f9ff"
+        }
+      },
+      "features": {
+        "letter_ratio": 0.727,
+        "digit_ratio": 0.0285,
+        "markup_ratio": 0.0052,
+        "nonascii_ratio": 0.0011,
+        "distinct_token_ratio": 0.1932
+      },
+      "text_sha1": "f3d1bcce5f72e654",
+      "text_head": " poem by the 15th @-@ century Scottish poet Robert Henryson and part of his collection of moral fabl"
+    },
+    {
+      "family_id": "FF15",
+      "formal_stratum": "S1c_low_entropy",
+      "source": "wikitext-2-raw-v1/wiki.train.raw",
+      "block": 3,
+      "window_index": 5,
+      "window_token_start": 40960,
+      "n_tokens_window": 8192,
+      "prefixes": {
+        "2048": {
+          "n_tokens": 2048,
+          "token_sha1": "50621f0a54e69667"
+        },
+        "4096": {
+          "n_tokens": 4096,
+          "token_sha1": "e9890cb40c9fe6c2"
+        },
+        "8192": {
+          "n_tokens": 8192,
+          "token_sha1": "e94aa6da29ba4589"
+        }
+      },
+      "features": {
+        "letter_ratio": 0.7317,
+        "digit_ratio": 0.0275,
+        "markup_ratio": 0.0032,
+        "nonascii_ratio": 0.001,
+        "distinct_token_ratio": 0.2002
+      },
+      "text_sha1": "122f7f1b532799ca",
+      "text_head": " hockey players at the time was $ 600 . Ross received a cash bonus of $ 400 to play in a Stanley Cup"
+    },
+    {
+      "family_id": "FF16",
+      "formal_stratum": "S2c_high_markup",
+      "source": "wikitext-2-raw-v1/wiki.train.raw",
+      "block": 3,
+      "window_index": 7,
+      "window_token_start": 57344,
+      "n_tokens_window": 8192,
+      "prefixes": {
+        "2048": {
+          "n_tokens": 2048,
+          "token_sha1": "95c035034dffc537"
+        },
+        "4096": {
+          "n_tokens": 4096,
+          "token_sha1": "4c4ac420f9e1387e"
+        },
+        "8192": {
+          "n_tokens": 8192,
+          "token_sha1": "2399397c4a4f52a0"
+        }
+      },
+      "features": {
+        "letter_ratio": 0.7469,
+        "digit_ratio": 0.015,
+        "markup_ratio": 0.0045,
+        "nonascii_ratio": 0.0019,
+        "distinct_token_ratio": 0.2332
+      },
+      "text_sha1": "cbe0c80ee66cef62",
+      "text_head": " a second time , he decides he cannot simply quit , but get fired . This proves difficult as he is u"
+    }
+  ]
+}

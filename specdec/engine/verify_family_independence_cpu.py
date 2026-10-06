@@ -82,6 +82,9 @@ MANIFEST_MACHINERY = {
     "family16_summary.py",               # 16 格汇总
     "verify_family_independence_cpu.py",  # 本文件
     "verify_readiness_selftest_cpu.py",   # G1–G5 自测
+    # 2026-10-06 经用户授权登记：正式集合的**构建**与**校验**工具（只读/构建 manifest，不跑模型）
+    "build_formal_families.py",          # 生成 `docs/prompt_families_formal_manifest.json`（确定性规则）
+    "verify_formal_families_cpu.py",     # 正式集合的 CPU 校验（身份/哈希/重建/嵌套/配额/去重）
 }
 # 本轮**新增**的 opt-in 消费方：只有它带 manifest 输入路径，且默认关闭（SMOKE_FAMILY 未设即 legacy）。
 OPT_IN_CONSUMERS = {"g5_8k_smoke_cudnn.py",      # fam16 授权轮（SMOKE_FAMILY，默认关闭）

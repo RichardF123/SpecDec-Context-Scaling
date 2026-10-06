@@ -35,8 +35,12 @@
 额外的 **6 cells**（`ctx × KV × AR-dual-resident-control`）是**诊断控制，不计入 factorial**，
 启用方式 `P5_INCLUDE_DUAL_AR_CONTROL=1`；汇总中必须单独分组，**不得写成"18 条件 factorial"**。
 
-**speedup 方向统一**：`speedup = T_AR / T_Spec`（>1 = SpecDec 更快，<1 = 更慢），
-且只能同 context、同 KV、分子为 SpecDec、分母为 **AR-primary**。
+**speedup 方向统一（2026-10-06 修正措辞）**：`speedup = T_AR / T_Spec`
+—— **分子 = `AR`**（`AR-primary`，target-only）、**分母 = `Spec`**（production SpecDec）；**`>1` ⇒ SpecDec 更快**、`<1` 更慢。
+⚠️ `AR-primary` 是**比较基线**（被比较的参照单元），**不是**公式的分母：旧版此处括注"分子为 SpecDec、分母为 AR-primary"
+与本式**自相矛盾**（同一行内既写 `T_AR/T_Spec` 又写"分子为 SpecDec"），已按上式统一；本式与
+`data_ledger`/`handoff_to_analysis_agent` 的表述一致（残留反向措辞清单见 `docs/bf16_formal_admission_2026-10-05.md` §0.3）。
+且只能同 context、同 KV 相比。
 **residency penalty**：`penalty = T_AR(target-only) / T_AR(dual)`；`penalty < 1`（等价
 `slowdown = T_dual/T_target > 1`）⇒ **双驻留本身**就拖慢了 AR。
 
@@ -70,7 +74,14 @@ INELIGIBLE FOR FORMAL SPEEDUP TABLE**（它可以证明显存饱和与顺序敏�
 - **`AR + target_only` 要求该进程从未加载 draft** ⇒ 不能与 SpecDec 条件同进程
   （`results_schema.plan_process()` 强制；违反直接报错）；
 - 每 block 条件顺序由固定 seed 随机化（seed 记档可重放），至少 2 个独立 block；
-- 每条件 warm-up 1 次 + measured reps 5；条件间 cooldown 不进计时；
+- **重复次数与 warm-up（2026-10-06 统一；以定稿 proposal 为准）**：
+  * **每个 `(family, condition)` 合计 5 次 measured repetitions**，**分布**在两个随机 block 上（默认 **3+2**）；
+    **不是**"每 block 各 5 次"——旧措辞"每条件 warm-up 1 次 + measured reps 5"字面可被读成 10 次/条件，现已澄清；
+  * **每个 `(family, condition, block)` 各 1 次 warm-up 并丢弃**（该单元 = 一个**独立子进程** ⇒ 两个 block 共 2 次 warm-up）；
+    warm-up **不计入** 5 次 measured，也**不进**计时；
+  * **缺次数必须标"未完成"**：若某 condition 的 measured 次数 < 5（含因环境门被跳过的 block），
+    报告中必须显式写"**未完成 n/5**"，**不得**在减少次数后仍宣称完整；该 condition 的 `measurement_status` 不得为"完整 OK"表述；
+- 条件间 cooldown 不进计时；
 - 每个 block 开始前记录系统状态。
 
 理由：8 GB 卡上 8K 双模型时分配器池会越过物理显存，池状态可改变同一格耗时（实测 6.44s ↔ 10.87s）；
@@ -156,7 +167,9 @@ pstate_reason`；**不在正式计时区间内轮询 `nvidia-smi`**。
 
 ### 7b.4 正式 speedup 的声明资格（10 条全满足才允许 `speedup_claim_allowed=true`）
 
-1. 分母是 `AR` 且 `ar_residency=target_only`；2. `speedup_denominator_eligible=true`；
+1. **基线侧**是 `AR` 且 `ar_residency=target_only`（在 `speedup = T_AR/T_Spec` 中 AR 位于**分子**，语义上是**比较基线**）；
+2. `speedup_denominator_eligible=true`（**历史字段名保留**；其含义 = **基线侧单元合规**，**不得**据此把 AR 读成公式的分母；
+   建议新 runner 另写同值字段 `speedup_baseline_eligible` 并在报告中只用"基线"表述——由实现者决定）；
 3. 两侧 `context_actual` / `target_kv` / `max_new_tokens` / **`input_token_hash`** 一致；
 4. 两侧 measured reps 完整；5. 两侧 `measurement_status=OK`；
 6. 两侧 between-block 未超诊断线；7. 无 OOM / NaN / ENV_INVALID；
@@ -165,6 +178,19 @@ pstate_reason`；**不在正式计时区间内轮询 `nvidia-smi`**。
 
 任意一项不满足 ⇒ `speedup_claim_allowed=false`，且**必须打印具体原因**
 （`NO CLAIM：AR between-block CHECK` 等），**不得**输出"可作确定声明"。
+
+### 7b.5 环境拒绝与补跑规则（2026-10-06 明确；只规定"如何记录与如何恢复"，不改任何声明资格判据）
+
+1. **保留失败记录**：因环境门（P-state / 入口门槛 / harness 安全线）被拒绝的运行，其行、日志与产物**一律保留**并标
+   `ENV_INVALID`；**不删除、不覆盖、不改写**；
+2. **不得挑样本**：**禁止**只删慢 rep、只留快 rep，或按结果挑 block；块内任一 primary cell 因环境失败 ⇒ 该块**整体**重跑
+   （与 §7b.3 既有规则一致）；
+3. **不得自动重复直到合格**：**禁止**"失败就重跑，直到拿到合格结果"的循环。每次重跑**必须先记录理由**
+   （环境原因 / 机器状态 / 明确的缺失槽位），写入该行 `rerun_reason` 并在报告中可见；
+4. **恢复只补明确缺失槽位**：运行中断（进程被杀 / 崩溃 / 断电）后恢复时，**只补**计划中**确实缺失**的
+   `(family, condition, block, rep)` 槽位；**已存在**的槽位**不得**重跑（产物已存在 ⇒ 报错，见 §2）。补齐后仍须满足
+   "每 `(family, condition)` 合计 5 次、跨 ≥2 block"的分布要求，否则按 §3.5 标"**未完成 n/5**"；
+5. 本条**不**放宽 §7b.4 的 10 条声明资格，也**不**改变 §7 对不稳定单元的处理（仍须保留在完整表中并标 `CHECK`）。
 
 ---
 
@@ -293,7 +319,7 @@ canonical 行自身也必须一致（`validate_row` / `validate_canonical` 双�
 | `g5_stability_probe` | 12 条件 × 2 随机 block 的稳定性探针 | 已运行（第 1 次 ENV_INVALID；缩小版 2K/8K 见 ledger §4.14） |
 | `g5_cost_breakdown` | AR/SpecDec 阶段成本分解 | 已实现，**未运行**（等环境 Gate） |
 | `g5_k_sweep` | k ∈ {1,2,4,8} 诊断扫描 | 已实现，**未运行**（等环境 Gate） |
-| `g5_8k_spec_variance_probe` | 8K SpecDec **跨进程速度双档**专项定位（正式 pass 与插桩 pass 分离） | 已实现，**未运行** |
+| `g5_8k_spec_variance_probe` | 8K SpecDec **跨进程速度双档**专项定位（正式 pass 与插桩 pass 分离） | **已运行**（2026-09-23/24；产物 `output/g5/variance/p5v_*`，含 summary）——结论见 §11 第 3 项与 §11b |
 
 > `g5_8k_spec_variance_probe` 的**预登记**双档检出规则：把各进程的 SpecDec decode 中位数排序，
 > 若存在切分点使**两侧各 ≥2 个进程**且 `min(高档)/max(低档) ≥ P5V_BIMODAL_RATIO`（默认 1.5），
@@ -320,12 +346,25 @@ canonical 行自身也必须一致（`validate_row` / `validate_canonical` 双�
 
 1. 所有运行可审计且不覆盖旧数据 —— ✅（schema + run_id + 拒绝覆盖；`g5_schema_selftest_cpu` 151 项 / `g4_part4_selftest_cpu` 68 项全 PASS）
 2. AR/SpecDec 驻留与计时边界一致 —— ✅（§3：AR-primary = target-only；边界写死）
-3. 跨顺序差异已量化 —— ⬜ **8K SpecDec 仍 42.7%（缩小版实测）** ⇒ 先跑 `g5_8k_spec_variance_probe`
+3. 跨顺序差异已量化 —— ✅/**结论为"限制"**（2026-10-06 更正）：探针**已运行**（`output/g5/variance/p5v_*`），
+   结论 = **8K SpecDec 在 2026-09 的 `eager` 配置下**同配置噪声量级最高 **61%**（§4.19/§4.20，属**风险证据**）；
+   **当前候选配置（`cudnn_prefill`）的正式计时稳定性尚未测** ⇒ 由 **pilot** 判定（§11b）
 4. 8K 显存饱和被明确标注 —— ✅（§6 + 探针自动判定）
 5. 性能不稳定时有预先规定的处理 —— ✅（§7 / §7b / §7c）
 6. profiling 与正式 timing 完全分离 —— ✅（§9）
 7. 正确性状态未因追求速度而降低 —— ✅（§8；FP32 B6 PASS 保持）
 8. canonical 记账自洽（映射/等价性/分层/声明纪律）—— ✅（§7c；写盘前强制校验）
+
+### 11b. 8K 条件的三条路线（2026-10-06 预登记；pilot 后按结果择一，**不预判**）
+
+| 路线 | 触发条件（pilot 结果） | 处理 |
+| --- | --- | --- |
+| **A 正常保留** | 2K/4K/8K 的 within-run 与 between-block 均在诊断线内、P-state 合格 | C5/C6 照常进入正式矩阵并按 §7b.4 判声明资格 |
+| **B 需修复** | pilot 发现**可归因、可修复**的问题（例如用结构性手段消除大额瞬时申请） | **另立预登记**的改动 + 验证（含正确性与质量重估），**不得**边跑边改、**不得**边改边采 |
+| **C 无法稳定测量** | pilot 后仍超诊断线且无法归因/修复 | **保留全部原始数据**；8K 登记为**受限条件**：只报资源/显存证据 + "计时不可复现"，**不发布** 8K 速度倍数 |
+
+* **禁止**用历史（2026-09 `eager`）波动**预判**当前配置失败；**禁止**在未跑 pilot 前砍掉 C5/C6（条件数保持 6）。
+* 三条路线的选择必须**在 pilot 结果出来之后**、按本表**事先写明的触发条件**执行，并登记选择理由。
 
 ## 12. 命令清单
 
