@@ -165,6 +165,19 @@ SERIAL_ORACLE_ROUND = dict(tag="div8209_so", tool="serial_oracle_gpu",
 STAGE2B_ROUND = dict(tag="div8209_p2", tool="serial_oracle_gpu",
                      families=STAGE2B_CANDIDATE_FAMILIES)
 
+# 2026-10-05（**用户对本轮的明确授权**，P-A/P-B）：B6 覆盖轮使用**新 tag** `div8209_b6`。
+# 授权来源 = 本轮任务书 §4：行 A = 10 个固定字面用例 × 3 模式 × 2 次 = 60 runs（新 tag）；
+#            行 B = `F09`（8K）融合 prefill 复核 × 3 模式 × 2 次 = 6 runs（同一新 tag）。
+# 口径（**不放宽任何既有检查**）：
+#   * run 级授权从"单一 tag"扩为"**授权 tag 集合**"：`tool` 与 `families` 口径**逐字不变**；
+#   * 其它 tag、其它 tool 使用这四个 family 仍一律判**越界**（下方 scoped 检查按集合判定）；
+#   * 字面 prompt 用例的记录 `source_kind="literal_prompt"`（family=null）本就不构成 family 消费，
+#     因此行 A 不需要（也不获得）任何 family 放宽 —— 这条登记只为行 B（F09）与链接的 smoke 产物。
+B6_ROUND = dict(tag="div8209_b6", tool="serial_oracle_gpu",
+                families=STAGE2B_CANDIDATE_FAMILIES)
+AUTHORIZED_ROUNDS = (STAGE2B_ROUND, B6_ROUND)
+AUTHORIZED_RUN_TAGS = tuple(r["tag"] for r in AUTHORIZED_ROUNDS)
+
 
 def _manifest_consumers() -> list:
     """**区分大小写**扫描：除 manifest 机器本身外，是否还有工具读取 manifest 字段。
@@ -255,19 +268,20 @@ def _stage2b_authorized_smoke_files() -> set:
     只读；不修改任何检查的严格性。
     """
     files: set = set()
-    for p in sorted((ROOT / "output" / "g5" / "attn").glob(f"{STAGE2B_ROUND['tag']}_*_rep*_*.json")):
-        try:
-            j = json.loads(p.read_text(encoding="utf-8-sig"))
-        except Exception:                                        # noqa: BLE001
-            continue
-        if not isinstance(j, dict) or j.get("tool") != STAGE2B_ROUND["tool"]:
-            continue
-        fam = (((j.get("smoke") or {}).get("input") or {}).get("family") or {}).get("family_id")
-        if fam not in STAGE2B_ROUND["families"]:
-            continue
-        sa = j.get("smoke_artifact")
-        if sa:
-            files.add(Path(str(sa)).name)
+    for rnd in AUTHORIZED_ROUNDS:
+        for p in sorted((ROOT / "output" / "g5" / "attn").glob(f"{rnd['tag']}_*_rep*_*.json")):
+            try:
+                j = json.loads(p.read_text(encoding="utf-8-sig"))
+            except Exception:                                    # noqa: BLE001
+                continue
+            if not isinstance(j, dict) or j.get("tool") != rnd["tool"]:
+                continue
+            fam = (((j.get("smoke") or {}).get("input") or {}).get("family") or {}).get("family_id")
+            if fam not in rnd["families"]:
+                continue
+            sa = j.get("smoke_artifact")
+            if sa:
+                files.add(Path(str(sa)).name)
     return files
 
 
@@ -508,14 +522,16 @@ def main() -> int:
         _n_cand_recs += 1
         _tool, _tag = _d.get("tool"), _d.get("tag")
         if _tool == STAGE2B_ROUND["tool"]:
-            # 运行器记录：必须在授权 tag 内，且 family 必须在授权集合内
-            if _tag != STAGE2B_ROUND["tag"]:
+            # 运行器记录：必须在**授权 tag 集合**内，且 family 必须在授权集合内
+            if _tag not in AUTHORIZED_RUN_TAGS:
                 _bad_cand_scope.append(_f.name)
             elif _fam not in STAGE2B_ROUND["families"]:
                 _bad_s2b_fam.append(_f.name)
         elif _d.get("model_run_happened"):
             _bad_cand_scope.append(f"{_f.name}（tool={_tool} 产生了 run）")
-    check("★ Stage 2b 四个 family 的**运行记录**只出现在授权范围（tag=div8209_p2 + tool=serial_oracle_gpu）",
+    check("★ Stage 2b 四个 family 的**运行记录**只出现在授权范围（tag ∈ "
+          f"{list(AUTHORIZED_RUN_TAGS)} + tool=serial_oracle_gpu；"
+          "10-04 批 1 的 div8209_p2 与 10-05 B6 轮的 div8209_b6）",
           not _bad_cand_scope,
           dict(n_records=_n_cand_recs, bad=_bad_cand_scope[:4],
                note="非运行产物（诊断/汇总）不构成 run，允许引用 family"))

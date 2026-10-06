@@ -92,10 +92,12 @@ def main() -> int:
                 hard.append(f"{fam}: 存在非零 32-gram 交集")
     # 2026-10-04（批 1 已批准）：Stage 2b 的 24 次 run **合法地**消费这四个 family
     # （运行器记录 + 其 `smoke_artifact` 链接的 harness smoke 产物）。
+    # 2026-10-05：**授权 tag 集合**扩为 {div8209_p2（批 1）, div8209_b6（B6 轮，P-A/P-B 授权）}；
+    # `tool` 与 `families` 口径不变（见守卫的 `AUTHORIZED_ROUNDS`）。
     # ⇒ 这里只统计**授权范围之外**的消费；授权口径与守卫**完全一致**（逐份链接，不按 family 泛指）：
-    #    * 文件属于授权 tag（`div8209_p2_*`）；
+    #    * 文件属于任一授权 tag（`<tag>_*`）；
     #    * 或文件名出现在被授权 run 记录 `smoke_artifact` 指向的集合里。
-    _auth_prefix = f"{G.STAGE2B_ROUND['tag']}_"
+    _auth_prefixes = tuple(f"{t}_" for t in G.AUTHORIZED_RUN_TAGS)
     _auth_linked = G._stage2b_authorized_smoke_files()
     # 本仓库**自己的 CPU 工具**产出的汇报文件（例如守卫的 `family_independence_cpu_check.json`）
     # 会列出候选 family 名字，但那**不是**"消费 family 数据"（也不是 run）⇒ 单列为"仅提及"。
@@ -109,7 +111,7 @@ def main() -> int:
             continue
         for fam in new:
             if f'"{fam}"' in txt:
-                if p.name.startswith(_auth_prefix) or p.name in _auth_linked:
+                if p.name.startswith(_auth_prefixes) or p.name in _auth_linked:
                     authorized_hits.append((p.name, fam))
                 elif p.name in _report_like:
                     mention_only.append((p.name, fam))
@@ -129,15 +131,18 @@ def main() -> int:
     reg = {f: dict(diag=(f in G.REGISTERED_DIAG_FAMILIES),
                    proto=(f in G.PROTOCOL_ROUND_FAMILIES),
                    round=(f in G.SERIAL_ORACLE_ROUND["families"]),
-                   stage2b=(f in G.STAGE2B_ROUND["families"])) for f in new}
+                   stage2b=(f in G.STAGE2B_ROUND["families"]),
+                   b6=(f in G.B6_ROUND["families"])) for f in new}
     for fam, v in reg.items():
         print(f"   {fam}: 定点诊断={v['diag']} 协议轮={v['proto']} 串行oracle轮={v['round']} "
-              f"Stage2b授权={v['stage2b']} "
-              f"⇒ 会被判越界={not (v['diag'] or v['proto'] or v['round'] or v['stage2b'])}")
+              f"Stage2b授权={v['stage2b']} B6轮授权={v['b6']} "
+              f"⇒ 会被判越界={not (v['diag'] or v['proto'] or v['round'] or v['stage2b'] or v['b6'])}")
     unregistered = [f for f, v in reg.items()
-                    if not (v["diag"] or v["proto"] or v["round"] or v["stage2b"])]
+                    if not (v["diag"] or v["proto"] or v["round"] or v["stage2b"] or v["b6"])]
     print(f"   授权范围（批 1 批准，2026-10-04）：tag={G.STAGE2B_ROUND['tag']} · "
           f"tool={G.STAGE2B_ROUND['tool']} · families={list(G.STAGE2B_ROUND['families'])}")
+    print(f"   授权范围（B6 轮批准，2026-10-05）：tag={G.B6_ROUND['tag']} · "
+          f"tool={G.B6_ROUND['tool']} · families={list(G.B6_ROUND['families'])}")
 
     print("-- 4) 工具就绪（tag/family/reps 必填）")
     src = (ROOT / "specdec" / "engine" / "stage2b_verdict.py").read_text(encoding="utf-8")

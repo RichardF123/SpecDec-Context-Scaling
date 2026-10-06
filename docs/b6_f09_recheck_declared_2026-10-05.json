@@ -1,0 +1,16 @@
+{
+ "note": "P-B（8K 融合 prefill 复核）的用例声明 —— 单一来源见 docs/b6_bf16_coverage_audit_plan_2026-10-05.md §4.6。本文件只声明**该复核要检验什么**，不改变任何门限：branches=[] 表示不为 F09 声明分支覆盖要求（分支覆盖是 10 个字面用例的事）；expect_prefill_fused=true 表示**该 run 必须真的触发 prefill 融合**（否则该组由 b6_orchestrate_cpu 判 STOP）。",
+ "cases": {
+  "F09": {
+   "kind": "manifest_family_8k",
+   "max_new": 64,
+   "branches": [],
+   "expect_prefill_fused": true,
+   "why": "Stage 2b 的 24 次 run 全部是 arm=eager（strategy=eager、fused_by_phase={}）⇒ 候选后端的**融合 prefill 路径零覆盖**；本组用同一 tag 跑 F09（8192 token 窗口，chunk=2048 ⇒ 4 个 s=2048 的 prefill 块）以证明融合 prefill 真的发生。"
+  }
+ },
+ "set_requirements": {
+  "branches": [],
+  "types": []
+ }
+}
