@@ -197,6 +197,7 @@ python -m specdec.engine.align_generate
 - [正式输入清单](docs/prompt_families_formal_manifest.json)：`formal-v1`；16 个 family、三档前缀，18 项 CPU 校验通过。分层为候选集合内相对标签。
 - [G5 测量协议](docs/g5_measurement_protocol.md)：计时、随机化、环境与失败记录。
 - [B6 状态与证据](docs/b6_status_and_evidence_index_2026-10-05.md)、[分层正确性协议](docs/specdec_correctness_protocol_v2_2026-10-04.md)：正确性声明范围。
+- [正确性归因与处理报告（2026-10-07，19 页 PDF）](docs/pdf/specdec_correctness_localization_report_2026-10-07.pdf)：从分歧发现、同历史定位和因果干预，到逐行候选评估、serial oracle、B6/EOS 收尾与最终分层处理。生成源为 `scripts/generate_correctness_localization_report.py`；保留生产数值差异与历史 FAIL/CHECK，不宣称全局 exact-id 等价。
 - [10 月 6 日阶段记录](docs/stage_checkpoint_2026-10-06.md)、[协作者阶段报告](docs/collaborator_status_2026-10-04.md)：历史进展与证据索引；历史“下一步”不替代当前配置。
 - [数据台账](docs/data_ledger.md)：实测结果、配置与历史 FAIL/CHECK。
 - [FP8 设计](docs/design_freeze_fp8_kv.md)、[SpecDec 设计](docs/design_freeze_g4_specdec.md)、[cache 契约](docs/design_g4_cache_api.md)。
