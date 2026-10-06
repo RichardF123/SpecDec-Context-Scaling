@@ -178,6 +178,14 @@ B6_ROUND = dict(tag="div8209_b6", tool="serial_oracle_gpu",
 AUTHORIZED_ROUNDS = (STAGE2B_ROUND, B6_ROUND)
 AUTHORIZED_RUN_TAGS = tuple(r["tag"] for r in AUTHORIZED_ROUNDS)
 
+# 2026-10-05（**用户对本轮的明确授权**）：真实模型 **EOS 补测**使用新 tag `div8209_eos`，
+# 单条固定字面 prompt（`docs/b6_eos_recheck_declared_2026-10-05.json`，prompt_sha1=c9d959169209c4af）、
+# AR/production/serial × 2 重复 = 6 runs。
+# 授权边界（**必须写清**）：本轮的 run 级授权**只覆盖该 tag + tool + literal prompt 用例**；
+# `families=()` ⇒ 这四个候选 family 在本次授权下**没有**任何新放宽（仍只有批 1 的 `div8209_p2`
+# 与 B6 轮的 `div8209_b6` 被授权消费它们）。下方专门加一条 scoped 检查证明"该 tag 的 run 未消费任何 family"。
+EOS_RUN_ROUND = dict(tag="div8209_eos", tool="serial_oracle_gpu", families=())
+
 
 def _manifest_consumers() -> list:
     """**区分大小写**扫描：除 manifest 机器本身外，是否还有工具读取 manifest 字段。
@@ -537,6 +545,24 @@ def main() -> int:
                note="非运行产物（诊断/汇总）不构成 run，允许引用 family"))
     check("★ Stage 2b 运行器在该 tag 内只消费授权的 4 个 family",
           not _bad_s2b_fam, dict(n_records=_n_cand_recs, bad=_bad_s2b_fam[:4]))
+    # 2026-10-05：**EOS 补测轮**（新 tag）的授权范围 = **仅 literal prompt**，不给候选 family 任何放宽。
+    # 记录级判定：该 tag 的运行记录里 `smoke.input.family.family_id` 必须为空。
+    _eos_recs, _eos_fam = 0, []
+    for _f in sorted(_o_dir.glob(f"{EOS_RUN_ROUND['tag']}_*_rep*_*.json")):
+        try:
+            _d = json.loads(_f.read_text(encoding="utf-8-sig"))
+        except Exception:                                        # noqa: BLE001
+            continue
+        if not isinstance(_d, dict) or _d.get("tool") != EOS_RUN_ROUND["tool"]:
+            continue
+        _eos_recs += 1
+        _fam = (((_d.get("smoke") or {}).get("input") or {}).get("family") or {}).get("family_id")
+        if _fam:
+            _eos_fam.append((_f.name, _fam))
+    check("★ EOS 补测轮（新 tag `div8209_eos`）的授权**只限 literal prompt**："
+          "其运行记录未消费任何 manifest family（该授权不给候选 family 任何放宽）",
+          not _eos_fam, dict(n_records=_eos_recs, bad=_eos_fam[:3], families=list(EOS_RUN_ROUND["families"]),
+                             note="families=() ⇒ 空集合；literal 用例的 input.family 必须为空"))
     scoped = [u for u in used if (u.get("tool") or "").startswith("prefill_sb_replay_f06")]
     bad_family = [u["file"] for u in scoped
                   if (u.get("family") or {}).get("family_id") != "F06"]

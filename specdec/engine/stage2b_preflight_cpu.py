@@ -143,6 +143,9 @@ def main() -> int:
           f"tool={G.STAGE2B_ROUND['tool']} · families={list(G.STAGE2B_ROUND['families'])}")
     print(f"   授权范围（B6 轮批准，2026-10-05）：tag={G.B6_ROUND['tag']} · "
           f"tool={G.B6_ROUND['tool']} · families={list(G.B6_ROUND['families'])}")
+    print(f"   授权范围（EOS 补测轮，2026-10-05）：tag={G.EOS_RUN_ROUND['tag']} · "
+          f"tool={G.EOS_RUN_ROUND['tool']} · families={list(G.EOS_RUN_ROUND['families'])}"
+          f"（**只限 literal prompt 用例**，不给候选 family 任何放宽；由守卫的 scoped 检查证明）")
 
     print("-- 4) 工具就绪（tag/family/reps 必填）")
     src = (ROOT / "specdec" / "engine" / "stage2b_verdict.py").read_text(encoding="utf-8")

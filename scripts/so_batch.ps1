@@ -96,6 +96,19 @@ if ($caseTable.Count -eq 0) {
   Write-Host "[warn] 未能读取 b6_cases.py 用例表 ⇒ 字面用例无法自动注入 prompt（非字面用例不受影响）"
 }
 
+# ---- 声明文件里的逐用例 `text`/`max_new`（2026-10-05 新增；用于**非内建**的字面用例，例如 EOS 补测 `eos1`）----
+# 口径：**声明文件优先于内建表**；只有声明里明确给了 `text` 才走 literal 模式，否则仍走 manifest（既有行为不变）。
+$declTable = @{}
+if ($Declared -ne '' -and (Test-Path -LiteralPath $Declared)) {
+  try {
+    $dj = Get-Content -Raw -Encoding UTF8 -LiteralPath $Declared | ConvertFrom-Json
+    foreach ($p in $dj.cases.PSObject.Properties) { $declTable[$p.Name] = $p.Value }
+    Write-Host "[decl] 声明文件用例：$(($declTable.Keys | Sort-Object) -join ',')"
+  } catch {
+    Write-Host "[warn] 声明文件无法解析（$($_.Exception.Message)）⇒ 不注入声明用例的 prompt"
+  }
+}
+
 # ---- 计划内已有产物？默认停；-Resume 则跳过已有槽位 ----
 $existing = @()
 foreach ($c in $Cases) { foreach ($m in $Modes) { foreach ($r in $Reps) {
@@ -145,7 +158,13 @@ foreach ($c in $Cases) {
       Remove-Item Env:SMOKE_PROMPT -ErrorAction SilentlyContinue
       Remove-Item Env:SMOKE_PROMPT_ID -ErrorAction SilentlyContinue
       Remove-Item Env:SMOKE_FAMILY -ErrorAction SilentlyContinue
-      if ($caseTable.ContainsKey($c)) {
+      if ($declTable.ContainsKey($c) -and $declTable[$c].text) {
+        # 声明文件里**明确给了 text** ⇒ literal 模式（用于非内建字面用例，如 EOS 补测 eos1）
+        $env:SO_PROMPT = [string]$declTable[$c].text
+        $env:SO_PROMPT_ID = $(if ($declTable[$c].prompt_id) { [string]$declTable[$c].prompt_id } else { $c })
+        $env:SO_MAXNEW = "$($declTable[$c].max_new)"
+        $srcDesc = "literal_prompt(declared) id=$($env:SO_PROMPT_ID) max_new=$($declTable[$c].max_new)"
+      } elseif ($caseTable.ContainsKey($c)) {
         $env:SO_PROMPT = [string]$caseTable[$c].text
         $env:SO_PROMPT_ID = $c
         $env:SO_MAXNEW = "$($caseTable[$c].max_new)"

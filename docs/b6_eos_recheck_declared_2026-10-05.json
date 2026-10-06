@@ -1,0 +1,34 @@
+{
+ "note": "真实模型 EOS 补测（仅此一条 prompt；见 docs/b6_eos_qk_closeout_2026-10-05.md §5.A 与本轮任务书 §二）。prompt **逐字**取自 CPU 编码记录，不在运行时重新设计；literal 输入模式（add_special_tokens=True，**不**套 chat template）；max_new=24 预先声明、非自适应；未命中即判『真实模型 EOS 覆盖仍缺失』并停止。",
+ "cases": {
+  "eos1": {
+   "kind": "eos_real_model",
+   "text": "<|im_start|>user\nWhat is 2+2?<|im_end|>\n<|im_start|>assistant\n4<|im_end|>\n<|im_start|>user\nSay hi.<|im_end|>\n<|im_start|>assistant\nHi",
+   "max_new": 24,
+   "branches": [
+    "eos_stop"
+   ],
+   "expect_prefill_fused": true,
+   "prompt_sha1": "c9d959169209c4af",
+   "cpu_encoding_record": {
+    "n_tokens": 30,
+    "last_token": 13048,
+    "ends_with_eos": false,
+    "eos_id": 151645,
+    "im_end_occurrences": 3,
+    "prefill_dispatch": "fused",
+    "tokenizer": "Qwen/Qwen2.5-1.5B-Instruct",
+    "add_special_tokens": true,
+    "file": "D:\\RealDSH\\specdec\\output\\g5\\attn\\_eos_recheck_prompt_cpu.json",
+    "note": "输入里出现的 151645 **不算**生成 EOS 证据；只检查新生成部分。"
+   },
+   "why": "`eos-prone` 6/6 停在 max_new_reached ⇒ eos_stop 未覆盖；本用例用一条纯文本 chat 风格 prompt 让真实模型自然收尾，以真实 tokenizer 的 EOS id 证明该分支。"
+  }
+ },
+ "set_requirements": {
+  "branches": [
+   "eos_stop"
+  ],
+  "types": []
+ }
+}
