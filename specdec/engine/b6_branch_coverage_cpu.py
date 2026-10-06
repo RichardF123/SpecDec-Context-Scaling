@@ -126,6 +126,94 @@ def find_runs(tag: str, case: str, outdir: Path = OUTDIR) -> tuple:
 
 
 # ------------------------------------------------------------------ 字段/配置
+# 诊断精度开关的**冻结值**（必须严格为布尔 False）
+DIAG_KEYS = ("qk_fp32", "prob_fp32")
+
+
+def _strict_false(v) -> bool:
+    """**严格**判 False：`isinstance(v, bool) and v is False`。
+
+    ⚠️ 禁止 `bool(v)` 强制转换（那会把非空字符串当 True、把整数 0 当 False，正是本漏洞的成因类别）。
+    """
+    return isinstance(v, bool) and v is False
+
+
+def _strict_true(v) -> bool:
+    return isinstance(v, bool) and v is True
+
+
+def _strict_int(v):
+    """严格整数（排除 bool）。非 int ⇒ None（调用方按"类型非法"处理）。"""
+    return v if isinstance(v, int) and not isinstance(v, bool) else None
+
+
+def diag_precision_checks(rec: dict) -> list:
+    """**诊断精度验收**（rev.3 修漏洞）：不只看"字段存在"，而是逐条验值并**自行核对前后一致**。
+
+    规则（对应用户要求 1–8）：
+      1. `diag_precision_before_run` / `diag_precision_after_run` **必须是字典**；
+      2. 两份字典都必须包含 `qk_fp32`、`prob_fp32`；
+      3. 两个开关必须是**严格布尔 `False`**（不接受 `0`/`1`/`"False"`/`None`/缺键/`True`）；
+      4. `diag_precision_stable` 必须是**严格布尔 `True`**；
+      5. 检查器**自行比较前后两份记录**是否一致，**不只信任** `stable` 字段；
+      6. 缺字段/缺键（或键值为 `None`）⇒ **证据不足**（`missing` ⇒ CASE_INCOMPLETE）；
+      7. 容器非字典 ⇒ `illegal`（非 PASS）；开关违反冻结值 / `stable` 非 True / 前后不一致 ⇒ `fail`（CASE_FAIL）；
+      8. **不限制**记录里只能有这两个键：其它字段**原样保留**、不参与比较。
+         比较范围**仅限** `qk_fp32`、`prob_fp32` 两项（在此**明确声明范围**）。
+    """
+    rows: list = []
+    before = rec.get("diag_precision_before_run")
+    after = rec.get("diag_precision_after_run")
+    stable = rec.get("diag_precision_stable")
+    for name, val in (("before_run", before), ("after_run", after)):
+        if val is None:
+            rows.append((f"diag_precision_{name}", "missing", "字段缺失或为 None ⇒ 证据不足"))
+        elif not isinstance(val, dict):
+            rows.append((f"diag_precision_{name}", "illegal",
+                         f"必须是**字典**（实得 {type(val).__name__}: {val!r}）⇒ 非 PASS"))
+    for name, val in (("before_run", before), ("after_run", after)):
+        if not isinstance(val, dict):
+            continue
+        for k in DIAG_KEYS:
+            v = val.get(k, "<缺键>")
+            if k not in val or v is None:
+                rows.append((f"{name}.{k}", "missing", "缺键或为 None ⇒ 证据不足"))
+            elif _strict_false(v):
+                rows.append((f"{name}.{k}", "ok", "False"))
+            else:
+                rows.append((f"{name}.{k}", "fail",
+                             f"开关必须**严格为布尔 False**（实得 {v!r}，类型 {type(v).__name__}）"))
+    if stable is None:
+        rows.append(("diag_precision_stable", "missing", "字段缺失或为 None ⇒ 证据不足"))
+    elif _strict_true(stable):
+        rows.append(("diag_precision_stable", "ok", "True"))
+    elif _strict_false(stable):
+        rows.append(("diag_precision_stable", "fail", "stable=False ⇒ 前后不一致"))
+    else:
+        rows.append(("diag_precision_stable", "illegal",
+                     f"必须是**严格布尔 True**（实得 {stable!r}，类型 {type(stable).__name__}）"))
+    # 5) 自行核对前后一致（不信任 stable）
+    # ⚠️ 只有**两侧键值都齐全**时才比较：缺键本身已单独记"证据不足"，
+    #    若此时仍比较，会把"证据不足"误升级为 FAIL（原因分类失真）。
+    if isinstance(before, dict) and isinstance(after, dict):
+        def _complete(d):
+            return all(k in d and d.get(k) is not None for k in DIAG_KEYS)
+        if _complete(before) and _complete(after):
+            b = {k: before[k] for k in DIAG_KEYS}
+            a = {k: after[k] for k in DIAG_KEYS}
+            if b != a:
+                rows.append(("before_after_一致（自行核对）", "fail",
+                             f"前后不同：{b} vs {a}（比较范围仅 {list(DIAG_KEYS)}；"
+                             f"其它字段不限制、原样保留）"))
+            else:
+                rows.append(("before_after_一致（自行核对）", "ok",
+                             f"仅比较 {list(DIAG_KEYS)}；其它键不限制"))
+        else:
+            rows.append(("before_after_一致（自行核对）", "na",
+                         "缺键/缺值 ⇒ 不比较（已单独记『证据不足』，不升级为 FAIL）"))
+    return rows
+
+
 def missing_required_fields(rec: dict) -> list:
     """缺字段：**空容器不算缺失**（`fused_by_phase={}` 是合法取值："没有任何阶段融合"）。
     只有 `None` / 空串算没有记录；`smoke.gen` 空列表例外（无生成 = 无证据）。"""
@@ -181,14 +269,8 @@ def config_violations(rec: dict, *, expect_max_new: int | None = None) -> list:
         bad.append(f"target_kv_payload={dt.get('target_kv_payload')}")
     if expect_max_new is not None and sc.get("max_new") != expect_max_new:
         bad.append(f"max_new={sc.get('max_new')}≠用例声明 {expect_max_new}")
-    dp = rec.get("diag_precision_after_run")
-    if isinstance(dp, dict):
-        for key in ("qk_fp32", "prob_fp32"):
-            if dp.get(key) is not False:
-                bad.append(f"diag.{key}={dp.get(key)!r}≠False")
-    # 缺失一律归"证据不足"；只有**显式为 False** 才判配置漂移
-    if rec.get("diag_precision_stable") is False:
-        bad.append("diag_precision 运行前后不一致（配置漂移）")
+    # ⚠️ 诊断精度开关**不在**这里判定：它由 `diag_precision_checks()` 单独逐条验值
+    #    （曾经只判"字段存在"⇒ `"invalid"` 也能 PASS；见 rev.3）。
     return bad
 
 
@@ -255,11 +337,16 @@ def hard_checks(rec: dict) -> list:
     # 有限性覆盖（harness 的逐阶段/逐模型检查）
     fin = _dig(rec, "smoke.checks.finiteness_coverage")
     if isinstance(fin, dict):
-        n = fin.get("n_checked")
+        n = _strict_int(fin.get("n_checked"))
         by = fin.get("by_phase_model") or {}
         bad = [k for k, v in by.items() if isinstance(v, dict) and v.get("ok") is not True]
-        if not n:
-            rows.append(("finiteness_n_checked>0", "fail", f"n_checked={n}"))
+        if fin.get("n_checked") is None:
+            rows.append(("finiteness_n_checked>0", "missing", "字段缺失"))
+        elif n is None:
+            rows.append(("finiteness_n_checked>0", "illegal",
+                         f"类型非法：{type(fin.get('n_checked')).__name__}（期望 int，且不做 bool 转换）"))
+        elif n <= 0:
+            rows.append(("finiteness_n_checked>0", "fail", f"n_checked={n}（必须 >0）"))
         elif bad:
             rows.append(("finiteness_by_phase_model_ok", "fail", f"未通过：{bad}"))
         else:
@@ -356,7 +443,15 @@ def backend_report(rec: dict, *, expect_backend: str | None, expect_prefill_fuse
     bad_fused = {ph: n for ph, n in fused.items() if ph in NON_PREFILL_PHASES and n}
     if bad_fused:
         problems.append(f"非 prefill 阶段出现融合调用：{bad_fused}（**禁止**）")
-    prefill_fused = int(fused.get("prefill") or 0)
+    # ⚠️ 不做 `or 0` / `bool()` 之类强制转换：融合计数必须是严格整数
+    _pf_raw = fused.get("prefill")
+    prefill_fused = _strict_int(_pf_raw)
+    if _pf_raw is None:
+        prefill_fused = 0
+    elif prefill_fused is None:
+        problems.append(f"fused_by_phase['prefill'] 类型非法：{_pf_raw!r}"
+                        f"（{type(_pf_raw).__name__}，期望 int）")
+        prefill_fused = 0
     has_fallback_evidence = bool(fallbacks) or bool(reasons)
     # ② 按 arm 与实际分派结果判定
     if arm == "eager":
@@ -512,6 +607,7 @@ def evaluate_case(case_id: str, declared: dict, runs: dict, *, expect_backend: s
                      duplicate_or_identity_problems=list(run_problems or []))
     field_problems, config_problems, backend_problems, type_problems_ = [], [], [], []
     backend_insufficient: list = []
+    diag_fail, diag_missing, diag_illegal = [], [], []
     hard_fail, hard_missing, hard_illegal = [], [], []
     cons_fail, cons_missing, cons_illegal = [], [], []
     for mode in required_modes:
@@ -555,6 +651,16 @@ def evaluate_case(case_id: str, declared: dict, runs: dict, *, expect_backend: s
                     cons_missing.append(f"{mode}/rep{rep}: {name} → {detail}")
                 elif state == "illegal":
                     cons_illegal.append(f"{mode}/rep{rep}: {name} → {detail}")
+            # 诊断精度验收（rev.3：逐条验值 + 自行核对前后一致，不信任 stable）
+            for name, state, detail in diag_precision_checks(rec):
+                res.setdefault("diag_precision", {})[f"{mode}/rep{rep}/{name}"] = \
+                    dict(state=state, detail=detail)
+                if state == "fail":
+                    diag_fail.append(f"{mode}/rep{rep}: {name} → {detail}")
+                elif state == "missing":
+                    diag_missing.append(f"{mode}/rep{rep}: {name} → {detail}")
+                elif state == "illegal":
+                    diag_illegal.append(f"{mode}/rep{rep}: {name} → {detail}")
     # 分支覆盖
     obs_total = {}
     for mode in ("prod", "serial"):
@@ -603,10 +709,13 @@ def evaluate_case(case_id: str, declared: dict, runs: dict, *, expect_backend: s
             bystate.setdefault(v["state"], []).append(k)
         res["hard_checks_summary"] = {k: len(v) for k, v in bystate.items()}
     for lst, head in ((hard_fail, "**硬检查失败**"), (cons_fail, "**自洽性失败**"),
+                      (diag_fail, "**诊断精度失败**"),
                       (config_problems, "**配置违规**"), (backend_problems, "**后端/融合问题**"),
                       (cmp_bad, "**跨模式/跨重复不一致**"),
                       (type_problems_, "**类型非法**"), (field_problems, "**缺字段**"),
                       (hard_missing, "**硬检查字段缺失**"), (cons_missing, "**自洽性字段缺失**"),
+                      (diag_missing, "**诊断精度证据不足**"),
+                      (diag_illegal, "**诊断精度类型非法**"),
                       (hard_illegal, "**硬检查类型非法**"), (cons_illegal, "**自洽性类型非法**"),
                       (backend_insufficient, "**后端/融合证据不足**")):
         if lst:
@@ -615,12 +724,13 @@ def evaluate_case(case_id: str, declared: dict, runs: dict, *, expect_backend: s
     if uncovered:
         res["reasons"].append(f"**未覆盖分支**（未触发即不得算通过）：{uncovered}")
     # ---- 判定：FAIL > INCOMPLETE > PASS ----
-    fail_like = bool(res["duplicate_or_identity_problems"] or hard_fail or cons_fail
+    fail_like = bool(res["duplicate_or_identity_problems"] or hard_fail or cons_fail or diag_fail
                      or config_problems or backend_problems or cmp_bad or type_problems_
                      or any(not d["equal"] for d in gate["serial_vs_ar"].values())
                      or any(v is False for v in gate["repeats"].values()))
     incomplete_like = bool(field_problems or hard_missing or cons_missing or hard_illegal
                            or cons_illegal or uncovered or backend_insufficient
+                           or diag_missing or diag_illegal
                            or any(v is None for v in gate["repeats"].values()))
     if fail_like:
         res["verdict"] = "CASE_FAIL"

@@ -539,6 +539,103 @@ def main() -> int:
            r19c["verdict"] == "CASE_FAIL"
            and any("case=" in x for x in r19c["duplicate_or_identity_problems"]),
            (r19c["verdict"], r19c["duplicate_or_identity_problems"][:2]))
+        # ---------------- G21：诊断精度验收（rev.3 修漏洞）----------------
+        # 旧行为（漏洞）：before/after/stable 全为 "invalid" ⇒ 三条检查路径都不覆盖 ⇒ CASE_PASS。
+        # 现在：逐条验值 + 自行核对前后一致，**不信任** stable 字段，且不做 bool() 强制转换。
+        def _dp_case(mut) -> dict:
+            recs = _base_trio()
+            for r in recs:
+                mut(r)
+            return ev("strict", DECL["strict"], recs)
+
+        def _set_dp(rec, **kw):
+            b, a, s = (rec["diag_precision_before_run"], rec["diag_precision_after_run"],
+                       rec["diag_precision_stable"])
+            for k, v in kw.items():
+                if k in ("before", "after", "stable"):
+                    pass
+            return None
+
+        # (1) 三个字段分别为字符串 / 列表 / None（用户报告的最小复现）
+        r21 = _dp_case(lambda r: (r.__setitem__("diag_precision_before_run", "invalid"),
+                                 r.__setitem__("diag_precision_after_run", "invalid"),
+                                 r.__setitem__("diag_precision_stable", "invalid")))
+        ck("G21a_三字段全为字符串⇒非PASS（用户报告的最小复现）", r21["verdict"] in
+           ("CASE_INCOMPLETE", "CASE_FAIL"), r21["verdict"])
+        ck("G21a_原因为诊断精度类型非法",
+           any("诊断精度类型非法" in x for x in r21["reasons"]), r21["reasons"][:2])
+        for label, val in (("字符串", "x"), ("列表", [1]), ("None", None)):
+            r = _dp_case(lambda rec, v=val: rec.__setitem__("diag_precision_before_run", v))
+            ck(f"G21b_before={label}⇒非PASS", r["verdict"] != "CASE_PASS",
+               (r["verdict"], r["reasons"][:1]))
+            r = _dp_case(lambda rec, v=val: rec.__setitem__("diag_precision_after_run", v))
+            ck(f"G21c_after={label}⇒非PASS", r["verdict"] != "CASE_PASS",
+               (r["verdict"], r["reasons"][:1]))
+        # (2) 缺任一开关键
+        r = _dp_case(lambda rec: rec.__setitem__("diag_precision_before_run", dict(prob_fp32=False)))
+        ck("G21d_缺before.qk_fp32⇒INCOMPLETE（证据不足，不升级为FAIL）",
+           r["verdict"] == "CASE_INCOMPLETE"
+           and any("诊断精度证据不足" in x for x in r["reasons"]), (r["verdict"], r["reasons"][:1]))
+        r = _dp_case(lambda rec: rec.__setitem__("diag_precision_after_run", dict(qk_fp32=False)))
+        ck("G21e_缺after.prob_fp32⇒INCOMPLETE", r["verdict"] == "CASE_INCOMPLETE",
+           (r["verdict"], r["reasons"][:1]))
+        # (3) 开关为 0 / 1 / "False" / None / True
+        for label, val, want in (("0", 0, "CASE_FAIL"), ("1", 1, "CASE_FAIL"),
+                                 ("'False'", "False", "CASE_FAIL"), ("None", None, "CASE_INCOMPLETE"),
+                                 ("True", True, "CASE_FAIL")):
+            r = _dp_case(lambda rec, v=val: rec.__setitem__(
+                "diag_precision_before_run", dict(qk_fp32=v, prob_fp32=False)))
+            ck(f"G21f_before.qk_fp32={label}⇒{want}", r["verdict"] == want,
+               (r["verdict"], r["reasons"][:1]))
+            r = _dp_case(lambda rec, v=val: rec.__setitem__(
+                "diag_precision_after_run", dict(qk_fp32=False, prob_fp32=v)))
+            ck(f"G21g_after.prob_fp32={label}⇒{want}", r["verdict"] == want, r["verdict"])
+        # (4) stable 为字符串 / 整数 / None / False
+        for label, val, want in (("字符串", "true", "CASE_INCOMPLETE"), ("整数", 1, "CASE_INCOMPLETE"),
+                                 ("None", None, "CASE_INCOMPLETE"), ("False", False, "CASE_FAIL")):
+            r = _dp_case(lambda rec, v=val: rec.__setitem__("diag_precision_stable", v))
+            ck(f"G21h_stable={label}⇒{want}", r["verdict"] == want,
+               (r["verdict"], r["reasons"][:1]))
+        # (5) 前后不同但 stable=True ⇒ 必须由**自行核对**抓出（不信任 stable）
+        r = _dp_case(lambda rec: (rec.__setitem__("diag_precision_before_run",
+                                                  dict(qk_fp32=False, prob_fp32=False)),
+                                  rec.__setitem__("diag_precision_stable", True)))
+        ck("G21i_前后不同但stable=True⇒未出现（前后相同）", r["verdict"] == "CASE_PASS", r["verdict"])
+        r = _dp_case(lambda rec: (rec.__setitem__("diag_precision_after_run",
+                                                  dict(qk_fp32=True, prob_fp32=False)),
+                                  rec.__setitem__("diag_precision_stable", True)))
+        ck("G21j_前后不同且stable=True⇒CASE_FAIL（自行核对抓出）", r["verdict"] == "CASE_FAIL",
+           (r["verdict"], r["reasons"][:1]))
+        ck("G21j_理由含自行核对前后不同",
+           any("before_after_一致（自行核对）" in x for x in r["reasons"]), r["reasons"][:2])
+        # (6) 前后合法一致且 stable=True ⇒ PASS（对照组）
+        r = _dp_case(lambda rec: None)
+        ck("G21k_前后合法一致且stable=True⇒CASE_PASS", r["verdict"] == "CASE_PASS", r["verdict"])
+        # (7) 记录里可以有**其它合法字段**（不限制只能两个键），且它们不参与比较
+        r = _dp_case(lambda rec: rec.__setitem__(
+            "diag_precision_before_run",
+            dict(qk_fp32=False, prob_fp32=False, note="extra", nested=dict(a=1), other=7)))
+        ck("G21l_允许其它合法字段⇒仍PASS（不擅自限制键集）", r["verdict"] == "CASE_PASS",
+           (r["verdict"], r["reasons"][:1]))
+        ck("G21m_比较范围已明确声明（仅两个开关）",
+           any("比较范围仅" in v["detail"] or "仅比较" in v["detail"]
+               for k, v in (r.get("diag_precision") or {}).items() if "一致" in k), None)
+        # (8) 旧产物缺新增字段：只记证据不足，不改历史判决
+        runs_hist, probs_hist = C.find_runs("div8209_p2", "F09")
+        if runs_hist and any(runs_hist.values()):
+            rh = C.evaluate_case("F09", dict(branches=[], max_new=64, expect_prefill_fused=None),
+                                 runs_hist, expect_backend="CUDNN",
+                                 expect_config=dict(max_new=64), run_problems=probs_hist)
+            ck("G21n_旧产物缺新增字段⇒只记证据不足（不改历史判决）",
+               rh["verdict"] == "CASE_INCOMPLETE"
+               and any("诊断精度证据不足" in x for x in rh["reasons"]), rh["verdict"])
+            ck("G21o_旧产物序列一致性未被本修复影响（serial==AR）",
+               all(v["equal"] for v in rh["gate"]["serial_vs_ar"].values()),
+               rh["gate"]["serial_vs_ar"])
+        else:
+            ck("G21n_旧产物缺新增字段⇒只记证据不足（不改历史判决）", False, "无历史产物可测")
+            ck("G21o_旧产物序列一致性未被本修复影响（serial==AR）", False, "无历史产物可测")
+
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

@@ -158,7 +158,68 @@ B6 证据（§5 五项）与 `FULL_B6_PASS`（还需 `B6_VFP8_PASS`，下一阶�
 **P-B**（6 runs 8K 融合复核：`F09`+候选臂，需扩展 run 级授权）、**P-C/P-D**（GB6 记账与 eager 对照是否要做）。
 **本轮未运行任何 GPU 任务**，`div8209_b6` 产物数 = 0。
 
-## 9. 本轮**未执行**的部分（明确列出）
+## 9. rev.4（2026-10-05）：诊断精度验收修复 + **候选后端 GPU 清单**（待确认，本轮不启动）
+
+### 9.1 误放行漏洞：`diag_precision_*` 只判"存在"
+
+**最小复现（修复前）**：把有效夹具的三个字段改成 `diag_precision_before_run="invalid"`、
+`diag_precision_after_run="invalid"`、`diag_precision_stable="invalid"` ⇒ `evaluate_case` 返回 **`CASE_PASS`**。
+**原因**：该字段不在 `REQUIRED_PATHS` 的必要判定里、不在类型表里，且 `config_violations` 只在
+"是字典"时检查开关 ⇒ 三条路径全部绕过（"存在即通过"的同类错误）。
+
+**修复**（`diag_precision_checks()`，逐条验值、**不用 `bool()` 强制转换**）：
+1. `before_run`/`after_run` **必须是字典**（否则 `illegal` ⇒ 非 PASS）；
+2. 两份字典都必须含 `qk_fp32`、`prob_fp32`（缺键/键为 `None` ⇒ `missing` ⇒ **证据不足**）；
+3. 开关必须**严格为布尔 `False`**（`0`/`1`/`"False"`/`None`/`True` 一律非 PASS；其中显式非 False ⇒ `fail`）；
+4. `diag_precision_stable` 必须**严格布尔 `True`**（字符串/整数/`None`/`False` 非 PASS）；
+5. 检查器**自行比较前后两份记录**是否一致，**不只信任** `stable`；
+6. 原因分类清楚区分：**证据不足（missing）** vs **类型非法（illegal）** vs **明确失败（fail）**；
+   `stable=False` 与"前后不同"分别报出；
+7. **不限制**记录只能有两个键：其它字段原样保留、不参与比较；**比较范围仅 `qk_fp32`/`prob_fp32`**（已写明）。
+
+**修复后复现结果**：三字段全 `"invalid"` ⇒ **`CASE_INCOMPLETE`**（原因"诊断精度类型非法"）；
+缺 `qk_fp32` 键 ⇒ `INCOMPLETE`（"诊断精度证据不足"，**不**升级为 FAIL）；
+`qk_fp32=True` ⇒ `FAIL`；`qk_fp32=0` ⇒ `FAIL`；`stable=1` ⇒ `INCOMPLETE`（类型非法）；
+前后不同但 `stable=True` ⇒ `FAIL`（由**自行核对**抓出）；合法一致 ⇒ `CASE_PASS`。
+
+**CPU 回归**：`b6_branch_coverage_selftest_cpu` **115/0**（保留原 83 项 + 新增 G21a–G21o：
+三字段字符串/列表/None、缺任一开关键、开关 `0`/`1`/`"False"`/`None`/`True`、`stable` 字符串/整数/None/False、
+前后不同但 `stable=True`、合法一致仍 PASS、允许其它合法字段、比较范围已声明、
+旧产物缺字段只记证据不足且序列一致性不受影响）。全量套件 **406/0**。
+
+### 9.2 候选后端 GPU 清单（**仅列清单，本轮不启动**）
+
+* **tag**：**`div8209_b6`**（新 tag；不复用 `div8209_p2`，避免与既有 24 runs 的 rep 编号冲突）
+* **配置（行 A/B 同）**：`SO_ARM=cudnn_prefill`（**候选 backend，优先跑**）· `SO_KV=base_bf16`（target 与 draft 均
+  `base_bf16`）· `SO_K=4` · `SO_CHUNK=2048` · `SO_CTX=8192` · greedy · `bf16_red_red=1` · `struct_check=1`；
+  诊断精度开关 `qk_fp32=False`、`prob_fp32=False`（由运行器落盘取证）；EOS 按冻结规则
+* **输入**：字面 prompt（`SO_PROMPT`/`SO_PROMPT_ID`，取自 `specdec/engine/b6_cases.py` 单一来源，
+  文本与 `n` 与旧 `g4_b6_correctness.py:CASES` **逐字一致**）；生成长度 `SO_MAXNEW` 按用例
+  （16/16/16/16/16/16/**13/5/2**/16）；**正式配置仍 `max_new=64`**（专项用例不改默认值）
+* **进程纪律**：AR / production / serial **各自独立进程、串行执行、从头 prefill、不共享 cache**
+  （`so_batch.ps1` 一进程一 `(case, mode, rep)`）；每 `(case, mode)` **2 次独立重复**
+* **次数**：
+
+| 行 | 内容 | 次数 |
+| --- | --- | --- |
+| **A** | 10 用例 × 3 模式 × 2 次（`div8209_b6`，`cudnn_prefill`） | **60 runs** |
+| **B** | manifest family `F09`（8K）× 3 模式 × 2 次（`div8209_b6`，`cudnn_prefill`） | **6 runs** |
+| **C** | 诊断：仅当某 case 的 production 与 AR 分歧（每 case ≤1） | **≤11 次** |
+| **D** | 下游校验 `b6_branch_coverage_cpu`（CPU） | 1 次 |
+| — | eager 对照 60 runs | **未申请** |
+
+* **命令**：见 §4.4（逐 case 设 `SO_PROMPT*`/`SO_MAXNEW` 后三模式各跑 `-Reps 1,2`；
+  分歧时跑 `correctness_protocol_margins --stage2b --runs-tag div8209_b6 --families <case>`；
+  最后 `b6_branch_coverage_cpu --tag div8209_b6 --expect-backend CUDNN`）
+* **停止条件**：serial 与 AR **完整序列**不相等（含长度不同）· 硬检查显式失败 · 必需字段/键缺失或类型非法 ·
+  诊断精度开关非严格 `False` / `stable` 非严格 `True` / 前后不一致 · NaN/Inf · 结构失败 ·
+  两次重复不一致 · OOM · 原生崩溃 · 环境门拒绝 ⇒ **保产物并停**；**不重试、不换参、不换样本**；
+  EOS 未命中 ⇒ 如实记未覆盖（**不**追加运行）；环境门**不**旁路、**不**上调安全线；诊断计时**不进** speedup 结论
+* **资源预算（估算，非承诺）**：行 A ≈ **25–40 min GPU**（短 prompt，单 run ≈ 进程+模型加载 20–30 s）
+  · 行 B ≈ **6–10 min**（8K，显存余量薄，须逐批过环境门）· 行 C ≈ **≤5 min** ⇒ 合计 ≈ **36–56 min**
+* **待批准**：**P-A**（行 A）· **P-B**（行 B，含把新 tag 纳入 run 级授权）· **P-C**（是否纳入 GB6 记账）· **P-D**（eager 对照）
+
+## 10. 本轮**未执行**的部分（明确列出）
 
 * **未运行任何 GPU 任务**（无非授权 GPU 使用；`div8209_b6` 尚无产物）；
 * **未实现**：8K 融合复核的运行入口以外的任何新能力；`stage2b_verdict` 对字面用例的支持；并列双侧捕获 P-1/P-2；B6 覆盖轮之外的任何测试矩阵扩展；
