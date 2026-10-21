@@ -2,6 +2,7 @@ import json
 import math
 from pathlib import Path
 from dataclasses import asdict
+from .runtime_audit import validate_boundary_audit
 
 def validate_configuration(record):
     config = record.get("configuration")
@@ -36,8 +37,10 @@ def validate_configuration(record):
             )
     if type(config["draft_resident"]) is not bool:
         raise ValueError("draft_resident 必须是布尔值")
-def validate_record(record, eos_id):
+def validate_record(record, eos_id, *, require_runtime_audit=True):
     validate_configuration(record)
+    if require_runtime_audit or "runtime_environment_audit" in record:
+        validate_boundary_audit(record.get("runtime_environment_audit"))
     ids = record["generated_ids"]
     length = record["generated_length"]
     limit = record["max_new"]
@@ -141,7 +144,7 @@ def save_failure(failure, output_path):
     with path.open("x", encoding = "utf-8") as file:
         file.write(payload)
 
-def verify_job_results(output_dir, job, eos_id):
+def verify_job_results(output_dir, job, eos_id, *, require_runtime_audit=True):
     directory = Path(output_dir)
 
     if (directory / "failure.json").exists():
@@ -172,7 +175,7 @@ def verify_job_results(output_dir, job, eos_id):
 
     for path in files:
         record = json.loads(path.read_text(encoding = "utf-8"))
-        validate_record(record, eos_id)
+        validate_record(record, eos_id, require_runtime_audit=require_runtime_audit)
         if record["diagnostic_file"] != "diagnostics/result.json":
             raise ValueError("诊断文件关联错误")
         if record["run_id"] != diagnostic["run_id"]:

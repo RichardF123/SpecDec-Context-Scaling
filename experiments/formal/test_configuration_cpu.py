@@ -4,10 +4,19 @@ from copy import deepcopy
 import unittest
 
 from .records import validate_configuration, validate_record
+from .runtime_audit import assess_boundaries
 
 
 def sample(mode="AR"):
+    def point(start):
+        return {"snapshot": {"available": True, "clock_sm_MHz": 2500,
+                             "clock_mem_MHz": 8000},
+                "query_start_monotonic_s": start,
+                "query_end_monotonic_s": start + .1,
+                "sampling_scope": "outside_timing_boundary",
+                "active_load_verified": False}
     return {
+        "runtime_environment_audit": assess_boundaries(point(1), point(5)),
         "job": {"condition": {"mode": mode}},
         "configuration": {
             "attention_strategy": "cudnn_prefill",

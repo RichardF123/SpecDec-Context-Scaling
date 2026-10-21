@@ -11,6 +11,7 @@ import time
 import traceback
 import argparse
 from .runtime_info import collect_runtime_info
+from .runtime_audit import capture_boundary, assess_boundaries
 from pathlib import Path
 from uuid import uuid4
 from contextlib import contextmanager
@@ -469,9 +470,16 @@ def execute_job(model, draft, tokenizer, token_ids, job, provenance, run_id, out
     results = []
 
     for rep_index in range(job.measured_reps):
-        progress["stage"] = "measured"
         progress["rep_index"] = rep_index
+        progress["stage"] = "monitor_start"
+        monitor_start = capture_boundary()
+        progress["stage"] = "measured"
         result = run_once(model, draft, tokenizer, token_ids, job)
+        progress["stage"] = "monitor_end"
+        monitor_end = capture_boundary()
+        result["runtime_environment_audit"] = assess_boundaries(
+            monitor_start, monitor_end
+        )
         result.update(provenance)
         result["diagnostic_file"] = "diagnostics/result.json"
         result["same_mode_diagnostic_tokens_equal"] = (
