@@ -76,7 +76,9 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--execute", action="store_true")
     parser.add_argument("--seed", type=int, default=4207)
-    parser.add_argument("--limit", type=int, choices=(1, 2), default=1)
+    scope = parser.add_mutually_exclusive_group()
+    scope.add_argument("--limit", type=int, choices=(1, 2))
+    scope.add_argument("--pilot", action="store_true")
     args = parser.parse_args()
 
     families = ("F09", "F03", "F11", "F04")
@@ -84,10 +86,18 @@ def main():
     validate_plan(jobs, families)
 
     root = Path(__file__).resolve().parents[2]
-    selected = jobs[:args.limit]
+    if args.pilot:
+        selected = jobs
+        scope_name = "pilot"
+    else:
+        limit = 1 if args.limit is None else args.limit
+        selected = jobs[:limit]
+        scope_name = "development"
 
     print("完整计划任务数：", len(jobs))
-    print("本次开发任务数：", len(selected))
+    print("调度范围：", scope_name)
+    print("本次任务数：", len(selected))
+    print("Measured 次数：", sum(j.measured_reps for j in selected))
 
     batch = None
     if args.execute:
@@ -101,6 +111,7 @@ def main():
             "batch_id": batch_id,
             "experiment_stage": "development",
             "seed": args.seed,
+            "execution_scope": scope_name,
             "entry_environment": entry_environment,
             "jobs": [asdict(job) for job in selected],
             "completed": [],

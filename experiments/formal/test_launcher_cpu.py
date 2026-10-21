@@ -102,6 +102,34 @@ class LauncherTests(unittest.TestCase):
             environment.assert_not_called()
             child.assert_not_called()
 
+    def test_pilot_dry_run_has_complete_plan(self):
+        output = io.StringIO()
+        with (
+            patch.object(launcher.sys, "argv", ["run", "--pilot"]),
+            patch.object(launcher, "check_environment") as environment,
+            patch.object(launcher.subprocess, "run") as child,
+            redirect_stdout(output),
+        ):
+            launcher.main()
+            environment.assert_not_called()
+            child.assert_not_called()
+        text = output.getvalue()
+        self.assertIn("本次任务数： 48", text)
+        self.assertIn("Measured 次数： 120", text)
+        self.assertEqual(text.count("命令："), 48)
+
+    def test_pilot_and_limit_are_mutually_exclusive(self):
+        from contextlib import redirect_stderr
+        with (
+            patch.object(launcher.sys, "argv", ["run", "--pilot", "--limit", "2"]),
+            patch.object(launcher.subprocess, "run") as child,
+            redirect_stderr(io.StringIO()),
+        ):
+            with self.assertRaises(SystemExit) as result:
+                launcher.main()
+            self.assertEqual(result.exception.code, 2)
+            child.assert_not_called()
+
     def test_worker_failure_stops_batch_and_links_evidence(self):
         self.exercise("worker_failed")
 
