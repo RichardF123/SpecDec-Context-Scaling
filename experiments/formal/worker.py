@@ -10,7 +10,8 @@ from .environment import (
 import time
 import traceback
 import argparse
-from .runtime_info import collect_runtime_info
+import hashlib
+from .runtime_info import collect_runtime_info, require_formal_version
 from .runtime_audit import capture_boundary, assess_boundaries
 from pathlib import Path
 from uuid import uuid4
@@ -19,13 +20,13 @@ from specdec.engine import spec_dec
 from .records import save_record, save_failure
 from dataclasses import asdict
 from .plan import build_jobs
+from .input_sets import select_input_set
 
 from specdec.engine import model_self
 from specdec.engine.spec_cache import cache_length, check_consistent
 from specdec.engine import target_rope_scope
 from specdec.engine.lowmem_load import load_ours_bf16
 from specdec.engine.family_input import(
-    MANIFEST,
     TOKENIZER_ID,
     TOKENIZER_REVISION,
     eos_config,
@@ -33,14 +34,16 @@ from specdec.engine.family_input import(
     load_manifest,
 )
 
-def load_input(family_id, context_tokens):
+def load_input(family_id, context_tokens, *, input_set="pilot"):
+    manifest_path, families = select_input_set(input_set)
+    if family_id not in families:
+        raise ValueError(f"Family {family_id} 不属于 {input_set} 输入集合")
+    manifest = load_manifest(manifest_path)
     tokenizer = AutoTokenizer.from_pretrained(
         TOKENIZER_ID,
         revision = TOKENIZER_REVISION,
         local_files_only = True,
     )
-
-    manifest = load_manifest(MANIFEST)
 
     ids, metadata = load_family_ids(
         tokenizer,
@@ -56,6 +59,12 @@ def load_input(family_id, context_tokens):
     eos = eos_config(tokenizer)
     if not eos["matches_expected"]:
         raise ValueError(f"eos_token_id {eos['eos_id']} 不符合预期 {eos['eos_id_expected']}")
+    metadata = dict(metadata)
+    metadata.update(
+        input_set=input_set,
+        manifest_path=str(manifest_path),
+        manifest_sha256=hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
+    )
     return ids, metadata
 def load_target():
     if not torch.cuda.is_available():
@@ -447,7 +456,8 @@ def run_diagnostic(model, draft, tokenizer, token_ids, job):
         )
     raise ValueError(f"未知模式： {job.condition.mode}")
 
-def execute_job(model, draft, tokenizer, token_ids, job, provenance, run_id, output_dir, progress,):
+def execute_job(model, draft, tokenizer, token_ids, job, provenance, run_id, output_dir, progress,
+                *, experiment_stage="development"):
     print("输出目录：", output_dir)
     progress["stage"] = "diagnostic"
     diagnostic = run_diagnostic(
@@ -456,7 +466,7 @@ def execute_job(model, draft, tokenizer, token_ids, job, provenance, run_id, out
     diagnostic.update(provenance)
     diagnostic["run_id"] = run_id
     diagnostic["job"] = asdict(job)
-    diagnostic["experiment_stage"] = "development"
+    diagnostic["experiment_stage"] = experiment_stage
     progress["stage"] = "save_diagnostic"
     save_diagnostic(
         diagnostic,
@@ -488,7 +498,7 @@ def execute_job(model, draft, tokenizer, token_ids, job, provenance, run_id, out
         result["run_id"] = run_id
         result["rep_index"] = rep_index
         result["run_kind"] = "measured"
-        result["experiment_stage"] = "development"
+        result["experiment_stage"] = experiment_stage
         result["eos_id"] = tokenizer.eos_token_id
 
         filename = (
@@ -515,9 +525,9 @@ def execute_job(model, draft, tokenizer, token_ids, job, provenance, run_id, out
 
 def parse_args():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--input-set", choices=("pilot", "formal"), default="pilot")
     parser.add_argument(
         "--family", required = True,
-        choices = ("F09", "F03", "F11", "F04"),
     )
     parser.add_argument(
         "--ctx", required = True, type = int,
@@ -533,11 +543,19 @@ def parse_args():
         "--dry-run", action = "store_true"
     )
     parser.add_argument("--output-dir",type = Path)
-    return parser.parse_args()
+    parser.add_argument("--expected-commit")
+    args = parser.parse_args()
+    _, families = select_input_set(args.input_set)
+    if args.family not in families:
+        parser.error(f"--family {args.family} 不属于 --input-set {args.input_set}")
+    if args.input_set == "formal" and not args.dry_run and not args.expected_commit:
+        parser.error("正式采集必须由批次入口传入 --expected-commit")
+    return args
 
 if __name__ == "__main__":
     args = parse_args()
-    jobs = build_jobs(("F09", "F03", "F11", "F04"))
+    manifest_path, families = select_input_set(args.input_set)
+    jobs = build_jobs(families)
 
     job = next(
         item for item in jobs
@@ -548,14 +566,16 @@ if __name__ == "__main__":
     )
 
     if args.dry_run:
+        print("输入集合：", args.input_set, "清单：", manifest_path)
         print(asdict(job))
         raise SystemExit(0)
     run_id = uuid4().hex
+    experiment_stage = "formal" if args.input_set == "formal" else "development"
     output_dir = args.output_dir
     if output_dir is None:
         output_dir = (
             Path(__file__).resolve().parents[2]
-            / "output" / "formal_development" / run_id
+            / "output" / ("formal_worker" if experiment_stage == "formal" else "formal_development") / run_id
         )
     progress = {"stage": "environment"}
     environment = None
@@ -565,11 +585,14 @@ if __name__ == "__main__":
         environment = check_environment()
         progress["stage"] = "runtime_info"
         runtime_info = collect_runtime_info()
+        if experiment_stage == "formal":
+            require_formal_version(runtime_info, args.expected_commit)
         progress["stage"] = "gpu_preflight"
         environment["gpu"] = check_gpu_environment()
         progress["stage"] = "load_input"
         ids, metadata = load_input(
-            job.family_id, job.condition.context_tokens
+            job.family_id, job.condition.context_tokens,
+            input_set=args.input_set,
         )
 
         progress["stage"] = "load_target"
@@ -597,10 +620,17 @@ if __name__ == "__main__":
             "environment": environment,
             "runtime": runtime_info,
             "configuration": config_info,
+            "collection": {
+                "input_set": args.input_set,
+                "expected_commit": args.expected_commit,
+                "speedup_claim_allowed": False,
+                "claim_status": "raw_collection_pending_analysis",
+            },
         }
         results = execute_job(
             model, draft, tokenizer, ids, job, provenance,
             run_id, output_dir, progress,
+            experiment_stage=experiment_stage,
         )
         print("Measured 记录数：", len(results))
 
@@ -618,7 +648,7 @@ if __name__ == "__main__":
             "error_message": str(exc),
             "traceback": traceback.format_exc(),
             "environment": environment,
-            "experiment_stage": "development",
+            "experiment_stage": experiment_stage,
             "environment_failure_evidence": getattr(exc, "evidence", None),
         }
         save_failure(failure, output_dir / "failure.json")

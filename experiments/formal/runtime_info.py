@@ -6,6 +6,15 @@ from pathlib import Path
 
 import torch
 
+
+def require_formal_version(runtime, expected_commit=None):
+    if runtime["dirty_worktree"]:
+        raise RuntimeError("正式采集要求工作区 clean；请先提交代码")
+    commit = runtime["git_commit"]
+    if expected_commit is not None and commit != expected_commit:
+        raise RuntimeError("正式 worker 版本与批次冻结版本不一致")
+    return commit
+
 def collect_runtime_info():
     root = Path(__file__).resolve().parents[2]
 

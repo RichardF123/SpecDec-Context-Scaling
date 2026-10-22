@@ -9,18 +9,21 @@ from dataclasses import asdict
 from .records import verify_job_results
 from uuid import uuid4
 from .environment import check_environment
+from .input_sets import select_input_set
+from .runtime_info import collect_runtime_info, require_formal_version
+import hashlib
 
-def launch_job(job, command, root):
+def launch_job(job, command, root, *, experiment_stage="development"):
     command = list(command)
     launch_id = uuid4().hex
-    launch_dir = root / "output" / "formal_launcher_development" / launch_id
+    launch_dir = root / "output" / ("formal_launches" if experiment_stage == "formal" else "formal_launcher_development") / launch_id
     launch_dir.mkdir(parents=True, exist_ok=False)
     result_dir = launch_dir / "worker_results"
     command.extend(["--output-dir", str(result_dir)])
 
     metadata = {
         "launch_id": launch_id,
-        "experiment_stage": "development",
+        "experiment_stage": experiment_stage,
         "command": command,
         "cwd": str(root),
         "status": "planned",
@@ -47,9 +50,9 @@ def launch_job(job, command, root):
 
         stage = "verify_results"
         metadata["result_check"] = verify_job_results(
-            result_dir, job, eos_id = 151645
+            result_dir, job, eos_id = 151645, experiment_stage=experiment_stage,
         )
-        metadata["status"] = "development_job_verified"
+        metadata["status"] = f"{experiment_stage}_job_verified"
 
     except (Exception, SystemExit) as exc:
         if metadata["status"] != "worker_failed":
@@ -79,16 +82,19 @@ def main():
     scope = parser.add_mutually_exclusive_group()
     scope.add_argument("--limit", type=int, choices=(1, 2))
     scope.add_argument("--pilot", action="store_true")
+    scope.add_argument("--formal", action="store_true")
     args = parser.parse_args()
 
-    families = ("F09", "F03", "F11", "F04")
+    input_set = "formal" if args.formal else "pilot"
+    experiment_stage = "formal" if args.formal else "development"
+    manifest_path, families = select_input_set(input_set)
     jobs = build_jobs(families, seed=args.seed)
     validate_plan(jobs, families)
 
     root = Path(__file__).resolve().parents[2]
-    if args.pilot:
+    if args.pilot or args.formal:
         selected = jobs
-        scope_name = "pilot"
+        scope_name = input_set
     else:
         limit = 1 if args.limit is None else args.limit
         selected = jobs[:limit]
@@ -102,17 +108,24 @@ def main():
     batch = None
     if args.execute:
         entry_environment = check_environment(min_commit_gib=18)
+        runtime = collect_runtime_info()
+        expected_commit = require_formal_version(runtime) if args.formal else None
         batch_id = uuid4().hex
         batch_dir = (
-            root / "output" / "formal_batch_development" / batch_id
+            root / "output" / ("formal_batches" if args.formal else "formal_batch_development") / batch_id
         )
         batch_dir.mkdir(parents = True, exist_ok = False)
         batch = {
             "batch_id": batch_id,
-            "experiment_stage": "development",
+            "experiment_stage": experiment_stage,
             "seed": args.seed,
             "execution_scope": scope_name,
             "entry_environment": entry_environment,
+            "runtime": runtime,
+            "expected_commit": expected_commit,
+            "input_manifest": str(manifest_path),
+            "input_manifest_sha256": hashlib.sha256(manifest_path.read_bytes()).hexdigest(),
+            "speedup_claim_allowed": False,
             "jobs": [asdict(job) for job in selected],
             "completed": [],
             "active_index": None,
@@ -131,7 +144,10 @@ def main():
                 "--ctx", str(job.condition.context_tokens),
                 "--mode", job.condition.mode,
                 "--block", str(job.measurement_block),
+                "--input-set", input_set,
             ]
+            if args.execute and args.formal:
+                command.extend(["--expected-commit", expected_commit])
             print(f"任务 {index + 1}：", job)
             print("命令：", subprocess.list2cmdline(command))
 
@@ -142,7 +158,7 @@ def main():
             if index > 0:
                 time.sleep(10)
             try:
-                metadata = launch_job(job, command, root)
+                metadata = launch_job(job, command, root, experiment_stage=experiment_stage)
             except (Exception, SystemExit) as exc:
                 batch["failed"] = {
                     "index": index,
@@ -161,7 +177,7 @@ def main():
             batch["active_index"] = None
 
         if args.execute:
-            batch["status"] = "development_batch_verified"
+            batch["status"] = f"{experiment_stage}_batch_verified"
         else:
             print("Dry-run：未启动任何 worker")
 

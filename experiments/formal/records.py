@@ -39,6 +39,18 @@ def validate_configuration(record):
         raise ValueError("draft_resident 必须是布尔值")
 def validate_record(record, eos_id, *, require_runtime_audit=True):
     validate_configuration(record)
+    if record.get("experiment_stage") == "formal":
+        from .input_sets import FORMAL_FAMILIES
+        if record["job"]["family_id"] not in FORMAL_FAMILIES:
+            raise ValueError("正式记录混入非正式 family")
+        if record["input"]["input_set"] != "formal" or record["input"]["hash_verified"] is not True:
+            raise ValueError("正式输入集合或 hash 校验不合规")
+        if record["runtime"]["dirty_worktree"] is not False:
+            raise ValueError("正式记录来自 dirty 工作区")
+        if not record["collection"]["expected_commit"] or record["collection"]["expected_commit"] != record["runtime"]["git_commit"]:
+            raise ValueError("正式记录代码版本与冻结版本不一致")
+        if record["collection"]["speedup_claim_allowed"] is not False:
+            raise ValueError("原始正式采集不能直接声明加速")
     if require_runtime_audit or "runtime_environment_audit" in record:
         validate_boundary_audit(record.get("runtime_environment_audit"))
     ids = record["generated_ids"]
@@ -144,7 +156,10 @@ def save_failure(failure, output_path):
     with path.open("x", encoding = "utf-8") as file:
         file.write(payload)
 
-def verify_job_results(output_dir, job, eos_id, *, require_runtime_audit=True):
+def verify_job_results(output_dir, job, eos_id, *, require_runtime_audit=True,
+                       experiment_stage="development"):
+    if experiment_stage not in ("development", "formal"):
+        raise ValueError("未知实验阶段")
     directory = Path(output_dir)
 
     if (directory / "failure.json").exists():
@@ -162,7 +177,7 @@ def verify_job_results(output_dir, job, eos_id, *, require_runtime_audit=True):
         raise ValueError("诊断文件标识错误")
     if diagnostic["job"] != asdict(job):
         raise ValueError("诊断任务身份不一致")
-    if diagnostic["experiment_stage"] != "development":
+    if diagnostic["experiment_stage"] != experiment_stage:
         raise ValueError("诊断阶段标识不一致")
     coverage = diagnostic["finiteness_coverage"]
     if coverage["n_checked"] <= 0 or coverage["first_bad"] is not None:
@@ -188,8 +203,8 @@ def verify_job_results(output_dir, job, eos_id, *, require_runtime_audit=True):
             raise ValueError("结果与启动任务不一致")
         if record["run_kind"] != "measured":
             raise ValueError("混入非 measured 记录")
-        if record["experiment_stage"] != "development":
-            raise ValueError("当前只核验 development 记录")
+        if record["experiment_stage"] != experiment_stage:
+            raise ValueError("测量记录阶段与批次不一致")
         if record["eos_id"] != eos_id:
             raise ValueError("EOS 配置不一致")
 

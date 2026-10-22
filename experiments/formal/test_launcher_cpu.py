@@ -25,6 +25,9 @@ class LauncherTests(unittest.TestCase):
                              subprocess.CompletedProcess(["mock"], code)) as child,
                 patch.object(launcher, "verify_job_results") as verify,
                 patch.object(launcher.time, "sleep"),
+                patch.object(launcher, "collect_runtime_info", return_value={
+                    "git_commit": "cpu-test", "dirty_worktree": False,
+                }),
                 patch.object(launcher, "check_environment", return_value={
                     "commit_gate_passed": True, "commit_min_gib": 18,
                 }) as environment,
