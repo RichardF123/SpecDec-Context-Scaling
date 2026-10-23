@@ -3,48 +3,56 @@
   "purpose": "documentation snapshot, not new experiment",
   "formal_source_commit": "82dd4b2fc8de5c8ba87470921335e2d4642eed3f",
   "development_runs_dirty_worktree": true,
+  "text_normalization": "Published text uses LF; generated SVG trailing whitespace removed. Source hashes refer to original local bytes.",
   "published": [
     {
       "source": "output/formal_analysis/7f832b6b_audit_v1/cells.csv",
       "published": "docs/measurements/formal_cells_2026-10-24.csv",
-      "bytes": 930,
-      "sha256": "445bb27b340aebf04a58e8862bc8383e194d1fe7c07ea739822b8e3d0ab0cbd3"
+      "bytes": 923,
+      "source_sha256": "445bb27b340aebf04a58e8862bc8383e194d1fe7c07ea739822b8e3d0ab0cbd3",
+      "sha256": "108593f58410cc1aa672abdc1101bb26bcf26ef4168af676862b600b72eebc5d"
     },
     {
       "source": "output/cross_family_costs/20261023T204321Z/historical_audit/historical_four_family.csv",
       "published": "docs/measurements/historical_family_cost_audit_2026-10-24.csv",
-      "bytes": 1316,
-      "sha256": "97e9bf0470e98643a4e6bb491242601087ca2078b9fe6b8c0485ab914f9d5afa"
+      "bytes": 1311,
+      "source_sha256": "97e9bf0470e98643a4e6bb491242601087ca2078b9fe6b8c0485ab914f9d5afa",
+      "sha256": "88b8e112814fac8e720f2c8d70603afbd7556c518d245a5b4198d08c8753db2d"
     },
     {
       "source": "output/cudagraph_chain/batch_remeasure_20261023_202936/analysis/seq_cells.csv",
       "published": "docs/measurements/cudagraph_chain_corrected_2026-10-24.csv",
-      "bytes": 828,
-      "sha256": "48c5e64707a47d794db9f54d2bd0c739046f1a436cd901cd252d89ccd9dfa91e"
+      "bytes": 821,
+      "source_sha256": "48c5e64707a47d794db9f54d2bd0c739046f1a436cd901cd252d89ccd9dfa91e",
+      "sha256": "12fa81909ed7761b41d0bbcc8bdfe6060bc707196594c4d5f1581c1bb12141a6"
     },
     {
       "source": "output/figures/experiment_workflow/experiment_workflow.png",
       "published": "docs/figures/experiment_workflow.png",
       "bytes": 516102,
+      "source_sha256": "a8b51bb59d19d48728b834401f82d7c78ede982a838f37c02fe0cf1bc1746532",
       "sha256": "a8b51bb59d19d48728b834401f82d7c78ede982a838f37c02fe0cf1bc1746532"
     },
     {
       "source": "output/figures/experiment_workflow/experiment_workflow.svg",
       "published": "docs/figures/experiment_workflow.svg",
-      "bytes": 55876,
-      "sha256": "26b8313a5781214b5ee590c5dfa9c4275ef9a744e2adea25f2750a6983903edf"
+      "bytes": 53667,
+      "source_sha256": "26b8313a5781214b5ee590c5dfa9c4275ef9a744e2adea25f2750a6983903edf",
+      "sha256": "39b3deaee9d9c36cdf586ca5df9f6a591caa1e1769f94a09996a8396637cc2b0"
     },
     {
       "source": "output/figures/specdec_cost_ledger_redesign/specdec_cost_story.png",
       "published": "docs/figures/specdec_cost_story.png",
       "bytes": 410485,
+      "source_sha256": "31cfbb09722fcbd96cd41b476c7cfdbc259415130e8629101ead335df1e46d24",
       "sha256": "31cfbb09722fcbd96cd41b476c7cfdbc259415130e8629101ead335df1e46d24"
     },
     {
       "source": "output/figures/specdec_cost_ledger_redesign/specdec_cost_story.svg",
       "published": "docs/figures/specdec_cost_story.svg",
-      "bytes": 37234,
-      "sha256": "419c0e7b01568837d9b0cca7bc21a9c379b1bbdd56f1eb75c9f91863cc17b058"
+      "bytes": 36222,
+      "source_sha256": "419c0e7b01568837d9b0cca7bc21a9c379b1bbdd56f1eb75c9f91863cc17b058",
+      "sha256": "892a1164fdf60b2d6913364929979d70039f74fafa9f3ddafcdf9c323b2c3292"
     }
   ],
   "local_evidence": [

@@ -16,13 +16,21 @@ files={
 }
 index={'date_hong_kong':'2026-10-24','purpose':'documentation snapshot, not new experiment',
        'formal_source_commit':'82dd4b2fc8de5c8ba87470921335e2d4642eed3f',
-       'development_runs_dirty_worktree':True,'published':[],'local_evidence':[]}
+       'development_runs_dirty_worktree':True,
+       'text_normalization':'Published text uses LF; generated SVG trailing whitespace removed. Source hashes refer to original local bytes.',
+       'published':[],'local_evidence':[]}
 for src,dst in files.items():
     source,target=root/src,root/dst
     if not source.is_file():raise FileNotFoundError(source)
     target.parent.mkdir(parents=True,exist_ok=True)
     shutil.copyfile(source,target)
+    if target.suffix in ('.csv','.svg'):
+        content=target.read_bytes().replace(b'\r\n',b'\n')
+        if target.suffix=='.svg':
+            content=b'\n'.join(line.rstrip() for line in content.split(b'\n'))
+        target.write_bytes(content)
     index['published'].append({'source':src,'published':dst,'bytes':target.stat().st_size,
+        'source_sha256':hashlib.sha256(source.read_bytes()).hexdigest(),
         'sha256':hashlib.sha256(target.read_bytes()).hexdigest()})
 for name in [
     'output/formal_analysis/7f832b6b_audit_v1/report.md',
