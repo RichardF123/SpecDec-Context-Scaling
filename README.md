@@ -51,9 +51,13 @@
 
 V-only FP8 则改变缓存的**存储表示**：K 保持 BF16；每个 token、每个 KV head 的 128 维 V 用 max-abs scale 归一化，再舍入为 E4M3。读取时反量化回计算精度。压缩来自 FP8 payload，而非简单除以 scale；scale 元数据和反量化成本都必须计入结果。
 
-## 当前状态（2026-10-07）
+## 当前状态（2026-10-24）
 
-**BF16 正确性在已测试范围内通过；正式配置与输入集合已登记。正式 runner 由用户编写，pilot 和正式性能采集尚未完成。** 当前没有正式加速结论，也不声称生产 SpecDec 与 AR 始终逐 token 一致。
+**用户编写的正式 runner 已完成主批次：192 个进程任务、480 条 measured 均已落盘。** 但 57/96 个 family-condition 单元至少存在一项稳定性 CHECK，8K 比值仍按 route C 抑制；数据完整不等于可作加速声明。生产 SpecDec 与 AR 也不保证始终逐 token 一致。
+
+**最新协作者入口：[阶段进度与数据分析（2026-10-24）](docs/progress_and_data_analysis_2026-10-24.md)**。包含正式六条件描述性结果、四开发输入成本、GPU trace、修复后的 CUDA Graph 对照及未完成工作。
+
+![实验设计与数据流](docs/figures/experiment_workflow.png)
 
 | 工作 | 已完成 | 边界与待办 |
 |---|---|---|
@@ -61,9 +65,11 @@ V-only FP8 则改变缓存的**存储表示**：K 保持 BF16；每个 token、�
 | 投机解码 | Draft 提议、target 批量验证、拒绝修复、cache 回滚、EOS 与长度处理 | 限定范围 BF16 B6 PASS，不等于生产批量验证与 AR 全局 exact-id 等价 |
 | 正确性取证 | 类型覆盖、8K 融合复核、真实 EOS 补测；serial oracle 在对应测试中与 AR 完整一致 | serial 是诊断控制，不进入正式 speedup；生产批量验证仍可能出现可重复的数值分歧 |
 | V-only FP8 KV | K 保持 BF16，V 使用 FP8 E4M3、per-token × per-head scale、group=128 | 历史 eager 质量与压缩结果已记录；新后端独立准入与质量回归待完成 |
-| 测量与数据准备 | 阶段计时、显存记录、环境门、失败落盘、独立进程诊断；正式 16-family 清单及 CPU 校验 | 工具准备完成不等于正式实验完成；还需实现 runner 并通过 pilot |
+| 正式测量 | runner、pilot、正式六条件主批次已完成；480条边界审计完整 | 57/96单元有稳定性CHECK；正式统计与分层解释待收尾，8K比值抑制 |
+| 成本机制分析 | 历史四开发输入draft约占58%–63%；Nsight采集与Graph干预提供提交/衔接开销证据 | profiler不进入正式计时；新逐轮账本跨family复测受环境门阻断 |
+| CUDA Graph原型 | 修复不对称计时后，16步固定token增长历史B→C耗时下降约55%/77%（target/draft） | 非自由生成；捕获与显存成本高，未证明完整SpecDec加速 |
 
-下一步：**编写 runner → CPU dry-run 与记录校验 → 四-family pilot → 按协议处理稳定性及失败 → 获准后正式采集。** 不用历史 eager 波动提前否决当前 cuDNN-prefill 配置的 8K 条件。
+下一步：**正式结果分层分析与报告收尾 → 核对阶段内存预算 → 决定是否继续独立机制/优化支线。** 不再重复“runner尚未完成”的旧状态，不把Graph微基准或EAGLE-2意向当成已完成的主实验成果。
 
 ## 实现与验证历程
 
@@ -76,7 +82,7 @@ V-only FP8 则改变缓存的**存储表示**：K 保持 BF16；每个 token、�
 | G2：长上下文可运行性 | 8K chunked prefill 后继续生成，多轮记录有限性、序列与显存 | 历史单 target operational 测试无 OOM、三轮稳定；不代表当前双模型正式计时已经稳定 |
 | G3：KV 压缩 | 量化 roundtrip、缓存结构、重复确定性、chunk 对照和真实文本 NLL/PPL | 全 K/V FP8 质量损失明显，转为 K BF16 + V FP8；量化方案与证据边界已记录 |
 | G4：投机解码 | Draft 对齐、双模型可行性、cache API、主循环分支、EOS、AR/Spec 对照 | 已实现完整 greedy 流程；通过分层正确性取证区分控制逻辑与生产数值差异 |
-| G5：测量准备 | 独立进程、环境门、同步计时、记录格式、失败分类、输入重建 | 测量工具与正式输入集合已准备；用户编写正式 runner 后仍需 pilot 检验 |
+| G5：测量与主采集 | 独立进程、环境门、同步计时、记录格式、失败分类、输入重建 | 正式192任务/480条已采齐；稳定性分层、统计解释与声明资格仍需区分 |
 
 ### 为什么正确性定位花了较多时间？
 

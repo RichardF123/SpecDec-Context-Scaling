@@ -1,0 +1,84 @@
+{
+  "date_hong_kong": "2026-10-24",
+  "purpose": "documentation snapshot, not new experiment",
+  "formal_source_commit": "82dd4b2fc8de5c8ba87470921335e2d4642eed3f",
+  "development_runs_dirty_worktree": true,
+  "published": [
+    {
+      "source": "output/formal_analysis/7f832b6b_audit_v1/cells.csv",
+      "published": "docs/measurements/formal_cells_2026-10-24.csv",
+      "bytes": 930,
+      "sha256": "445bb27b340aebf04a58e8862bc8383e194d1fe7c07ea739822b8e3d0ab0cbd3"
+    },
+    {
+      "source": "output/cross_family_costs/20261023T204321Z/historical_audit/historical_four_family.csv",
+      "published": "docs/measurements/historical_family_cost_audit_2026-10-24.csv",
+      "bytes": 1316,
+      "sha256": "97e9bf0470e98643a4e6bb491242601087ca2078b9fe6b8c0485ab914f9d5afa"
+    },
+    {
+      "source": "output/cudagraph_chain/batch_remeasure_20261023_202936/analysis/seq_cells.csv",
+      "published": "docs/measurements/cudagraph_chain_corrected_2026-10-24.csv",
+      "bytes": 828,
+      "sha256": "48c5e64707a47d794db9f54d2bd0c739046f1a436cd901cd252d89ccd9dfa91e"
+    },
+    {
+      "source": "output/figures/experiment_workflow/experiment_workflow.png",
+      "published": "docs/figures/experiment_workflow.png",
+      "bytes": 516102,
+      "sha256": "a8b51bb59d19d48728b834401f82d7c78ede982a838f37c02fe0cf1bc1746532"
+    },
+    {
+      "source": "output/figures/experiment_workflow/experiment_workflow.svg",
+      "published": "docs/figures/experiment_workflow.svg",
+      "bytes": 55876,
+      "sha256": "26b8313a5781214b5ee590c5dfa9c4275ef9a744e2adea25f2750a6983903edf"
+    },
+    {
+      "source": "output/figures/specdec_cost_ledger_redesign/specdec_cost_story.png",
+      "published": "docs/figures/specdec_cost_story.png",
+      "bytes": 410485,
+      "sha256": "31cfbb09722fcbd96cd41b476c7cfdbc259415130e8629101ead335df1e46d24"
+    },
+    {
+      "source": "output/figures/specdec_cost_ledger_redesign/specdec_cost_story.svg",
+      "published": "docs/figures/specdec_cost_story.svg",
+      "bytes": 37234,
+      "sha256": "419c0e7b01568837d9b0cca7bc21a9c379b1bbdd56f1eb75c9f91863cc17b058"
+    }
+  ],
+  "local_evidence": [
+    {
+      "path": "output/formal_analysis/7f832b6b_audit_v1/report.md",
+      "sha256": "d4cb77e8be21dd3e70fb0d6088c1b2eec8d37981b9ab0abea7982e045b8c8e80"
+    },
+    {
+      "path": "output/formal_analysis/7f832b6b_audit_v1/summary.json",
+      "sha256": "b20982459f91683360facc4917635e9ac06e09661ca5dfe3915ea33afa763141"
+    },
+    {
+      "path": "output/cost_profile_2k/20261023T075505Z_a64b2ec3/manifest.json",
+      "sha256": "7de7f309068e6716832660b1f04a67b6714669bd7d388925a5de6fc6a5bda3f4"
+    },
+    {
+      "path": "output/draft_propose_trace/20261024_013123_prereg_v1/verification.json",
+      "sha256": "2c4fa240257e0dbdd880087a08e3c5d14694b157ba51a0eba97f76da6f395009"
+    },
+    {
+      "path": "output/cudagraph_chain/batch_remeasure_20261023_202936/target.json",
+      "sha256": "5699b68601cf88eabeb7a5ddd061b896653b1fc77c7538ed9bc8880e0a3347a2"
+    },
+    {
+      "path": "output/cudagraph_chain/batch_remeasure_20261023_202936/draft.json",
+      "sha256": "ed9e226cc257334fa03d3f27df32aa8e22d320584a5b46d1780fee897faf1cda"
+    },
+    {
+      "path": "output/cross_family_costs/20261023T204321Z/failure.json",
+      "sha256": "21a110dca1df268edd0e0dcfdd5fc87cf7ac44848bb14b5be34df43a0486e8e7"
+    },
+    {
+      "path": "output/cross_family_costs/20261023T204641Z/failure.json",
+      "sha256": "017bcf74dfc0e535340019cfc844196a6fd9e9cec1ae422a1c9156084fdaf84d"
+    }
+  ]
+}
