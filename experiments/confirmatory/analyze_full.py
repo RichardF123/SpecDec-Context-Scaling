@@ -139,6 +139,14 @@ def analyze(batch: Path, out: Path, manifest_path: Path) -> dict:
     unit_map = {(r["family"], r["ctx"], r["mode"]): r for r in units}
     if len(units) != 96:
         raise AssertionError(f"expected 96 family/context/mode units, got {len(units)}")
+    inconsistent_units = [
+        (r["family"], r["ctx"], r["mode"])
+        for r in units if not r["mode_outputs_consistent"]
+    ]
+    if inconsistent_units:
+        raise AssertionError(
+            f"same-mode outputs differ across repetitions/blocks: {inconsistent_units[:4]}"
+        )
 
     pairs = []
     for family in FORMAL_FAMILIES:

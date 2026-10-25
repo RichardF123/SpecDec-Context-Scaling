@@ -271,6 +271,22 @@ def main() -> int:
     ck("T14 FF01–FF16 × 3 ctx 输入 hash 全部复现",
        formal_hash_ok, formal_hash_detail)
 
+    # ---------------- T15：跨 block 同模式输出签名 ----------------
+    with tempfile.TemporaryDirectory(prefix="confirmatory_signature_") as tmp:
+        results = Path(tmp) / "worker_results"
+        results.mkdir()
+        for index in range(2):
+            (results / f"measured_{index:02d}.json").write_text(
+                json.dumps({"run_kind": "measured", "generated_ids": [1, 2, 3]}),
+                encoding="utf-8")
+        ck("T15 一致 measured 输出签名可读",
+           run_mod.measured_output_signature(Path(tmp)) == (1, 2, 3), None)
+        (results / "measured_01.json").write_text(
+            json.dumps({"run_kind": "measured", "generated_ids": [1, 2, 4]}),
+            encoding="utf-8")
+        expect_raises("T15 同任务输出不一致被拒",
+                      lambda: run_mod.measured_output_signature(Path(tmp)), ValueError)
+
     npass = sum(1 for _, ok, _ in CHECKS if ok)
     for name, ok, extra in CHECKS:
         if not ok:

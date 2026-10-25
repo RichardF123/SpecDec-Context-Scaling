@@ -138,11 +138,29 @@ def t_bootstrap_is_reproducible():
     assert a == b and a[0] <= 0.55 <= a[1]
 
 
+def t_cross_block_output_mismatch_refused():
+    with tempfile.TemporaryDirectory() as tmp:
+        batch, manifest = build_batch(Path(tmp))
+        task_dirs = sorted((batch / "tasks").glob("*_FF01_2048_AR_b1"))
+        assert len(task_dirs) == 1
+        path = task_dirs[0] / "worker_results" / "measured_00.json"
+        record = json.loads(path.read_text(encoding="utf-8"))
+        record["generated_ids"][0] = 999
+        path.write_text(json.dumps(record, ensure_ascii=False), encoding="utf-8")
+        try:
+            analyze_full.analyze(batch, batch / "analysis", manifest)
+        except AssertionError as exc:
+            assert "same-mode outputs differ" in str(exc)
+            return
+        raise AssertionError("cross-block output mismatch was accepted")
+
+
 if __name__ == "__main__":
     check("T1 full outputs + five-rep pooled median", t_complete_outputs_and_pooled_median)
     check("T2 unstable 8K ratio restricted", t_unstable_8k_is_restricted_not_deleted)
     check("T3 non-final batch refused", t_nonfinal_batch_refused)
     check("T4 family bootstrap reproducible", t_bootstrap_is_reproducible)
+    check("T5 cross-block output mismatch refused", t_cross_block_output_mismatch_refused)
     print(f"\n{_passed} passed, {_failed} failed")
     raise SystemExit(0 if _failed == 0 else 1)
 

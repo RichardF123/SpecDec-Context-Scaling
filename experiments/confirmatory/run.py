@@ -75,6 +75,21 @@ def task_dirname(task) -> str:
     return f"{task.planned_order:02d}_{task.family_id}_{task.context_tokens}_{task.mode}_b{task.measurement_block}"
 
 
+def measured_output_signature(task_dir: Path) -> tuple[int, ...]:
+    """Return the common measured output, refusing within-task inconsistency."""
+    paths = sorted((Path(task_dir) / "worker_results").glob("*.json"))
+    outputs = []
+    for path in paths:
+        record = json.loads(path.read_text(encoding="utf-8"))
+        if record.get("run_kind") == "measured":
+            outputs.append(tuple(record["generated_ids"]))
+    if not outputs:
+        raise ValueError(f"no measured outputs in {task_dir}")
+    if len(set(outputs)) != 1:
+        raise ValueError(f"same task produced inconsistent measured outputs: {task_dir}")
+    return outputs[0]
+
+
 def print_plan(tasks) -> None:
     for task in tasks:
         print(f"  {task.planned_order:2d}. {task.family_id} ctx={task.context_tokens} "
@@ -267,6 +282,7 @@ def main() -> int:
     with (batch_dir / "batch.json").open("x", encoding="utf-8") as handle:
         json.dump(batch, handle, ensure_ascii=False, indent=2)
     print("批次目录：", batch_dir, flush=True)
+    mode_outputs = {}
     try:
         for index, task in enumerate(tasks):
             if index > 0:
@@ -279,9 +295,21 @@ def main() -> int:
                                  families=families, contexts=contexts,
                                  input_set=args.input_set,
                                  expected_commit=args.expected_commit)
+            task_dir = batch_dir / "tasks" / task_dirname(task)
+            signature = measured_output_signature(task_dir)
+            output_key = (task.family_id, task.context_tokens, task.mode)
+            previous = mode_outputs.get(output_key)
+            if previous is not None and previous != signature:
+                exc = RuntimeError(
+                    "same-mode output differs across measurement blocks: "
+                    f"{output_key}"
+                )
+                exc.task_dir = str(task_dir)
+                raise exc
+            mode_outputs[output_key] = signature
             batch["completed"].append({"index": index, "planned_order": task.planned_order,
                                        "status": launch["status"],
-                                       "task_dir": str(batch_dir / "tasks" / task_dirname(task)),
+                                       "task_dir": str(task_dir),
                                        "actual_start_utc": launch["actual_start_utc"],
                                        "actual_end_utc": launch.get("actual_end_utc")})
             batch["active_index"] = None
