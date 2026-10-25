@@ -1,0 +1,72 @@
+{
+  "schema_version": "confirmatory-evidence-freeze-v1",
+  "created_date": "2026-10-25",
+  "batch_id": "20261025T060242Z_a1bd355f",
+  "batch_status": "formal_batch_verified",
+  "experiment": "specdec_confirmatory_formal",
+  "expected_commit": "6c1774a0d86348f3abe16dcd9d79f38831d87564",
+  "runtime_dirty_worktree": false,
+  "task_count": 192,
+  "measured_record_count": 480,
+  "family_count": 16,
+  "contexts": [
+    2048,
+    4096,
+    8192
+  ],
+  "raw_batch_location_at_freeze": "D:\\RealDSH\\specdec-confirmatory-freeze\\output\\confirmatory_full\\20261025T060242Z_a1bd355f",
+  "raw_tree": {
+    "file_count": 1453,
+    "total_bytes": 29291621,
+    "aggregate_sha256": "15b0fee57362f9b1c990be9beefba6266baadf4d010b7c24ab0804db53fce476"
+  },
+  "key_file_sha256": {
+    "plan.json": "d9fa268926605be7c411bc00102052c525101e6f83b8f3256875744647cd85f8",
+    "summary.json": "490e5817e3fcb60d1af195ccfa0dd03a3108622c544234528c0f204f204a52fd",
+    "analysis/formal_block_shifts.csv": "151ad1cec6f19aa7f6fa2c3b868b0cd8c81d390c4e18d37615d1d8e063d85019",
+    "analysis/formal_context_summary.csv": "6580aa3e71d7c5347bd3f040176283a44f09557d93198592a1bc06b30de7d118",
+    "analysis/formal_family_timing.csv": "2d0f1b5f0b2df6680c0d968a1da1c2e54e93651cb01749b0692bccc8793b64f3",
+    "analysis/formal_order_ab_ba.csv": "77d779a5ecb639bbfddfe2e4579e5dd37274eeabf716442457d838c763a81210",
+    "analysis/formal_pair_summary.csv": "93f4f7090f3e9b520289b4faffb36116482ef250f5b852d00a019d6bee1886a2",
+    "analysis/formal_stability.pdf": "07e9240b520b594012f52d77605edb059452f725c354f4a36e396924d461b00e",
+    "analysis/formal_stability.png": "83b1eb218ad77eec3a6bfc29812c55816ea8c6df50f1e5f090f00de071fffed6",
+    "analysis/formal_stability.svg": "868ba1896fd77747a5ef5c5c2fe7ced8ca3d85fa7ff960c4f3679d6162498da0",
+    "analysis/formal_tasks.csv": "cbc73a9cafa8e7a30e51ca0698845908e8356f0f34036e3f35b44bc5972034cf",
+    "analysis/summary.json": "58c24802385a00e4c12a684d3c6200a8632b73e7ab6428038d7dfc81b6e8635b"
+  },
+  "concise_repository_artifacts": {
+    "formal_context_summary.csv": {
+      "path": "docs\\measurements\\confirmatory_context_summary_2026-10-25.csv",
+      "sha256": "6580aa3e71d7c5347bd3f040176283a44f09557d93198592a1bc06b30de7d118"
+    },
+    "formal_pair_summary.csv": {
+      "path": "docs\\measurements\\confirmatory_pair_summary_2026-10-25.csv",
+      "sha256": "93f4f7090f3e9b520289b4faffb36116482ef250f5b852d00a019d6bee1886a2"
+    },
+    "formal_family_timing.csv": {
+      "path": "docs\\measurements\\confirmatory_family_timing_2026-10-25.csv",
+      "sha256": "2d0f1b5f0b2df6680c0d968a1da1c2e54e93651cb01749b0692bccc8793b64f3"
+    },
+    "formal_block_shifts.csv": {
+      "path": "docs\\measurements\\confirmatory_block_shifts_2026-10-25.csv",
+      "sha256": "151ad1cec6f19aa7f6fa2c3b868b0cd8c81d390c4e18d37615d1d8e063d85019"
+    },
+    "formal_order_ab_ba.csv": {
+      "path": "docs\\measurements\\confirmatory_order_effects_2026-10-25.csv",
+      "sha256": "77d779a5ecb639bbfddfe2e4579e5dd37274eeabf716442457d838c763a81210"
+    },
+    "old_new_comparison": {
+      "path": "docs\\measurements\\confirmatory_old_new_comparison_2026-10-25.csv",
+      "sha256": "2475b46b76cde16b0a042e981010654dde075fd70dc07ea5ca5952d9c1b5943c"
+    },
+    "boundary_counts": {
+      "path": "docs\\measurements\\confirmatory_boundary_counts_2026-10-25.csv",
+      "sha256": "8b2775487967c9938bec81888f96fac9f75aca698f906f5c9facd859bfeac1ef"
+    }
+  },
+  "interpretation": {
+    "ratio": "T_AR_decode / T_SpecDec_decode; values above 1 indicate speculative-decoding speedup",
+    "formal_verdict": "FORMAL_COMPLETE_WITH_RESTRICTED_8K",
+    "8k_scope": "4/16 family ratios reportable; all 16 retained for descriptive accounting"
+  }
+}

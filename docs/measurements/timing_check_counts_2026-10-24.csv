@@ -1,0 +1,19 @@
+ctx,check,label,ok_families,check_families
+2048,ar_within_status,AR within,10,6
+2048,ar_between_status,AR between,10,6
+2048,ar_boundary_status,AR boundary,16,0
+2048,spec_within_status,Spec within,8,8
+2048,spec_between_status,Spec between,15,1
+2048,spec_boundary_status,Spec boundary,8,8
+4096,ar_within_status,AR within,12,4
+4096,ar_between_status,AR between,5,11
+4096,ar_boundary_status,AR boundary,16,0
+4096,spec_within_status,Spec within,6,10
+4096,spec_between_status,Spec between,10,6
+4096,spec_boundary_status,Spec boundary,13,3
+8192,ar_within_status,AR within,13,3
+8192,ar_between_status,AR between,11,5
+8192,ar_boundary_status,AR boundary,16,0
+8192,spec_within_status,Spec within,10,6
+8192,spec_between_status,Spec between,13,3
+8192,spec_boundary_status,Spec boundary,16,0

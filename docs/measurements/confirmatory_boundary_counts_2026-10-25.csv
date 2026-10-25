@@ -1,0 +1,7 @@
+ctx,mode,qualified_reps,evidence_complete_reps,total_reps
+2048,AR,80,80,80
+2048,SpecDec,55,80,80
+4096,AR,80,80,80
+4096,SpecDec,77,80,80
+8192,AR,80,80,80
+8192,SpecDec,80,80,80
