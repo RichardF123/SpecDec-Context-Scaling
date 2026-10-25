@@ -1,0 +1,4 @@
+ctx,families,acceptance_median,rounds_median,mismatch_rounds_median
+2048,4,0.5786516853932584,23.0,13.0
+4096,4,0.598980763709446,22.0,13.5
+8192,4,0.42907407407407405,26.0,19.5
