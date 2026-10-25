@@ -47,6 +47,7 @@ SOURCE_FILES = (
     "experiments/confirmatory/worker.py",
     "experiments/confirmatory/run.py",
     "experiments/confirmatory/analyze_pilot.py",
+    "experiments/confirmatory/analyze_full.py",
     "experiments/confirmatory/audit_full_ready.py",
     "docs/confirmatory_full_protocol_2026-10-25.md",
     "docs/prompt_families_formal_manifest.json",

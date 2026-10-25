@@ -79,6 +79,10 @@ def main() -> int:
         ),
         "preregistration_present": PREREGISTRATION.exists(),
         "all_frozen_sources_present": all((ROOT / rel).exists() for rel in SOURCE_FILES),
+        "formal_analyzer_present": (
+            (ROOT / "experiments/confirmatory/analyze_full.py").exists()
+            and (ROOT / "experiments/confirmatory/test_analyze_full_cpu.py").exists()
+        ),
     }
     code_ready = all(checks.values())
     execution_ready_now = code_ready and not runtime["dirty_worktree"]

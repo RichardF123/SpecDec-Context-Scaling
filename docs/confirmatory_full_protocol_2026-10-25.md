@@ -63,6 +63,14 @@ The statistical unit is the family, not an individual repetition.
 5. Report acceptance, rounds, proposed/accepted tokens, verify/repair calls, generated length and memory beside latency.
 6. Report within-process, between-block and boundary checks separately. Do not delete or replace a family because it receives CHECK.
 
+The frozen offline analysis entry point is
+`python -m experiments.confirmatory.analyze_full <batch_dir>`. It accepts only
+a completed formal batch with exactly 192 tasks and 480 measured runs. For each
+family, context, and mode it pools the 3+2 raw measurements before taking the
+median; it does not take a median of block medians. Context-level uncertainty
+uses a deterministic percentile bootstrap over families (10,000 resamples,
+seed 4207), never over individual repetitions.
+
 ## 8. Output divergence and claim boundary
 
 The primary timing table includes all completed trajectories and reports output equality, common-prefix length and first divergence. If AR and SpecDec outputs differ, the ratio compares the observed latency of two generation strategies on divergent trajectories. It must not be called lossless or identical-output speedup.

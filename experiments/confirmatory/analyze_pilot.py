@@ -379,7 +379,11 @@ def plot_stability(pairs, shifts, stem: Path):
         for mode, offset in (("AR", -0.12), ("SpecDec", 0.12)):
             entries = [r for r in pairs if r["ctx"] == ctx]
             vals = [r["ar_decode_s"] if mode == "AR" else r["spec_decode_s"] for r in entries]
-            x = [list(CONTEXTS).index(ctx) + offset + (i - 1.5) * 0.03 for i in range(len(vals))]
+            # Keep jitter bounded when the formal analyzer supplies 16 families.
+            center = (len(vals) - 1) / 2
+            step = min(0.03, 0.30 / max(len(vals) - 1, 1))
+            x = [list(CONTEXTS).index(ctx) + offset + (i - center) * step
+                 for i in range(len(vals))]
             ax.scatter(x, vals, s=14, color=colors[mode], alpha=0.8, linewidths=0,
                        label=mode if ctx == 2048 else None)
             ax.plot([list(CONTEXTS).index(ctx) + offset - 0.09,
