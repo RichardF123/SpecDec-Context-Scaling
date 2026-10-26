@@ -1,0 +1,7 @@
+﻿context,role,rounds,candidate_calls,bonus_catchup_calls,draft_calls_total,target_block_calls,target_block_input_tokens,target_extra_single_step
+2048,nobonus,16.0,64.0,0.0,64.0,16.0,64.0,0.0
+2048,bonus,13.0,52.0,12.0,64.0,13.0,64.0,0.0
+4096,nobonus,16.0,64.0,0.0,64.0,16.0,64.0,0.0
+4096,bonus,13.0,52.0,12.0,64.0,13.0,64.0,0.0
+8192,nobonus,16.0,64.0,0.0,64.0,16.0,64.0,0.0
+8192,bonus,13.0,52.0,12.0,64.0,13.0,64.0,0.0
