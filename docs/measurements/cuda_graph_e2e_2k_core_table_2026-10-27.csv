@@ -1,0 +1,4 @@
+﻿mode,capture_s,decode_median_s,decode_min_s,decode_max_s,speedup_vs_ar,output_len,output_equal,peak_allocated_gib,device_used_gib
+AR,—,2.4065845999866724,2.3807734000729397,2.5326619000406936,1.0,64,reference,—,—
+eager_bonus,—,2.690521099953912,2.6670702999690548,2.7269583999877796,0.8944678412029166,64,reference,—,—
+graph_replay,—,—,—,—,—,—,blocked(memory),—,—

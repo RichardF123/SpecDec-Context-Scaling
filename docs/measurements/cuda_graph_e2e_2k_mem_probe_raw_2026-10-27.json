@@ -1,0 +1,59 @@
+{
+  "records": [
+    {
+      "name": "chain0",
+      "reserved_gib": 5.751953125,
+      "delta_gib": 1.60546875,
+      "phys_free_gib": 1.0947265625
+    },
+    {
+      "name": "verify0",
+      "reserved_gib": 6.60546875,
+      "delta_gib": 0.876953125,
+      "phys_free_gib": 0.2412109375
+    },
+    {
+      "name": "chain1",
+      "reserved_gib": 8.587890625,
+      "delta_gib": 2.00390625,
+      "phys_free_gib": 0.0
+    },
+    {
+      "name": "verify1",
+      "reserved_gib": 9.455078125,
+      "delta_gib": 0.890625,
+      "phys_free_gib": 0.0
+    },
+    {
+      "name": "chain2",
+      "reserved_gib": 11.423828125,
+      "delta_gib": 1.9921875,
+      "phys_free_gib": 0.0
+    },
+    {
+      "name": "verify2",
+      "reserved_gib": 12.291015625,
+      "delta_gib": 0.890625,
+      "phys_free_gib": 0.0
+    },
+    {
+      "name": "chain3",
+      "reserved_gib": 14.271484375,
+      "delta_gib": 2.00390625,
+      "phys_free_gib": 0.0
+    },
+    {
+      "name": "verify3",
+      "reserved_gib": 15.138671875,
+      "delta_gib": 0.890625,
+      "phys_free_gib": 0.0
+    },
+    {
+      "name": "chain4",
+      "oom": true,
+      "phys_free_gib": 0.0
+    }
+  ],
+  "captured": 8,
+  "total": 26
+}

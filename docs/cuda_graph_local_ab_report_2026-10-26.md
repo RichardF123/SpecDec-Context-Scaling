@@ -92,6 +92,7 @@ draft 走原 GPU 实现无需此补丁。
 - capture 时间：中位 **355 ms**（273–1101 ms；chain 图更久；A1 ~0.3 s、A3 ~1.0 s）。
 - 首次 replay：中位 **29.9 ms**（含 graph 初始化）；稳态 replay 即上表 graph 时间。
 - graph pool 增量：中位 **−70 MiB**、最大 **+24 MiB**（多数情况把临时 tensor 计入池后反而低于 eager 峰值）。
+- 显存结论的限定：**单个固定 shape Graph 在本次进程中成功 capture**；**完整 13 轮 Graph 的总显存尚未测量**。
 - 局限：`peak_reserved` 在本机 WDDM 下报出 >8 GiB 的异常值，**不作为显存结论**；以 pool 增量与审计§10 估算为准。
 
 ## 4. Amdahl 投影（归一化口径）
@@ -105,12 +106,13 @@ draft 走原 GPU 实现无需此补丁。
 | 4K | 0.79 | 4.91× | 2.23× | 0.926 | 3.64 | **3.64** | 3.55 | 7.4% |
 | 8K | 0.81 | 3.71× | 1.35× | 0.874 | 2.44 | **2.43** | 2.34 | 12.6% |
 
-- 投影全部 **>1**，且 conservative 仍为 2.3–4.2：**若局部 graph 能以稳态 replay 的方式覆盖每轮 draft chain +
-  verify，bonus-aware 结构有充分空间跨过 AR**。
+- 投影全部 **>1**，且 conservative 仍为 2.3–4.2：这是 **optimistic fixed-shape local upper bound**——
+  若局部 graph 能以稳态 replay 的方式覆盖每轮 draft chain + verify，bonus-aware 结构有空间跨过 AR；
+  但它**不是** realistic 完整路径预测。
 - **必须同时报告的反向证据**：微基准 eager 的 round 合计（A3+B2 ≈ 267–279 ms）比真实 bonus round（~196–200 ms）
   **更慢**（residual 为负）。说明生产循环里 host launch 与 GPU 有部分重叠；因此上面的 2.4–4.4× 是**上界**，
-  真实集成收益会低于该投影。结合"eager 每步 42–55 ms、graph 7–12/21–38 ms"的事实，launch 确实是可消除的
-  大头，但收益量级应保守看待。
+  真实集成收益会低于该投影。结合"eager 每步 42–55 ms、graph 7–12/21–38 ms"的事实，固定 shape 局部
+  draft/verify 存在显著 launch 开销；**该收益能否在动态完整循环中兑现尚未验证**。
 - **集成阻塞（关键）**：bonus 循环每轮历史 T 都不同 ⇒ 每个 T 单独 capture；13 轮 × capture 0.3–1.1 s
   ≈ 4–14 s ≫ decode 2.5 s ⇒ **"每轮重 capture"不可行**。要兑现 projection，必须改成
   **静态容量缓冲（预分配 KV + padding 注意力 + 预生成 RoPE 表）**，或按固定 shape 分段重捕获（不现实）。
@@ -118,12 +120,13 @@ draft 走原 GPU 实现无需此补丁。
 
 ## 5. 结果分类
 
-**Outcome A**：
+**Outcome A-local（end-to-end integration unverified）**：
 - gate 通过；kernel-only 与 effective 几乎相同（copy 可忽略）；
 - realistic 投影 2.43–4.36× >1，conservative 2.34–4.20 也 >1；
 - 显存增量可忽略（graph pool 中位 −70 MiB）；
-- 结论：**当前 SpecDec 每轮成本主要来自 kernel launch / host 提交与细粒度调度**（draft 单步 42 ms 中约 34 ms 可被 graph 消除），
-  这套执行结构**值得做局部 graph 集成**；但集成方式必须是静态容量重构，而不是"每轮重 capture"。
+- 结论：**固定 shape 的局部 draft/verify 存在显著 launch 开销**（draft 单步 42 ms 中约 34 ms 可被 graph 消除），
+  值得做局部 graph 集成；但**该收益能否在真实双模型、动态 13 轮 cache 推进的完整循环中兑现尚未验证**，
+  需单独做端到端 2K 可行性门。
 
 ## 6. 报告必须回答的 10 个问题
 
@@ -161,3 +164,22 @@ draft 走原 GPU 实现无需此补丁。
   Amdahl 三档投影 vs y=1、各组件 kernel/effective 加速比）
 - 复现：`gate_gpu` 由 `benchmark` 内联执行；`python -m experiments.cuda_graph_local.benchmark --out ...`
   → `python -m experiments.cuda_graph_local.analyze --run ...`
+
+
+---
+
+## 9. 结论修订（end-to-end 2K 可行性门之前，2026-10-27）
+
+本报告在端到端 2K 兑现门（`docs/cuda_graph_e2e_2k_report_2026-10-27.md`）之前先做措辞修订，
+原始数据/CSV/图**未改动**。修订要点：
+
+1. **Outcome 限定**：本节结论为 **Outcome A-local / end-to-end integration unverified**。
+2. **2.4–4.4× 的性质**：它是 **optimistic fixed-shape local upper bound**，**不得**称为 realistic 完整路径预测。
+3. **负 residual**：局部组件时间相加（A3+B2 ≈ 267–279 ms/round）**大于**真实 bonus round（≈196–200 ms），
+   raw residual < 0 ⇒ 局部时间**不可直接按 Amdahl 相加**推断整机收益。
+4. **瓶颈表述**：从"完整 SpecDec 主要是 launch-bound"改为：**固定 shape 的局部 draft/verify 存在显著 launch
+   开销；该收益能否在动态完整循环中兑现尚未验证**。
+5. **显存表述**：单个固定 shape Graph 本次成功 capture；**完整 13 轮 Graph 的总显存尚未测量**。
+6. **保留上下文发现**：拆掉 launch 后的真实时间随上下文增长（Draft A3 37.1→44.0→58.2 ms；Verify M5
+   21.2→25.2→37.5 ms @2K/4K/8K），Graph 相对收益随上下文增大而下降；解释为短上下文主要受 launch 影响、
+   长上下文真实 attention/KV 成本占比提高。该解释只适用于已测量的局部组件，不自动外推整机。

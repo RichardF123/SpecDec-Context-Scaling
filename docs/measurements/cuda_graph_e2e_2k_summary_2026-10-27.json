@@ -1,0 +1,77 @@
+{
+  "schema_version": "cuda-graph-e2e-2k-analysis-v1",
+  "experiment_class": "end_to_end_graph_feasibility_diagnostic",
+  "scope": "F09/2K/bonus-all-accept/64-token",
+  "formal_result_allowed": false,
+  "quality_claim_allowed": false,
+  "production_claim_allowed": false,
+  "run": "output\\cuda_graph_e2e\\run",
+  "outcome": {
+    "kind": "C",
+    "reason": "13 轮 Graph 无法在 8GB 内共存：capture 8/26 时 OOM；每个 chain graph ≈2.00 GiB、每个 verify graph ≈0.89 GiB，外推 26 个 ≈37.6 GiB 保留内存 > 8 GiB 物理显存。"
+  },
+  "ar_decode_s": 2.4065845999866724,
+  "eager_bonus_decode_s": 2.690521099953912,
+  "eager_speedup_vs_ar": 0.8944678412029166,
+  "graph_blocked": true,
+  "memory_probe": {
+    "records": [
+      {
+        "name": "chain0",
+        "reserved_gib": 5.751953125,
+        "delta_gib": 1.60546875,
+        "phys_free_gib": 1.0947265625
+      },
+      {
+        "name": "verify0",
+        "reserved_gib": 6.60546875,
+        "delta_gib": 0.876953125,
+        "phys_free_gib": 0.2412109375
+      },
+      {
+        "name": "chain1",
+        "reserved_gib": 8.587890625,
+        "delta_gib": 2.00390625,
+        "phys_free_gib": 0.0
+      },
+      {
+        "name": "verify1",
+        "reserved_gib": 9.455078125,
+        "delta_gib": 0.890625,
+        "phys_free_gib": 0.0
+      },
+      {
+        "name": "chain2",
+        "reserved_gib": 11.423828125,
+        "delta_gib": 1.9921875,
+        "phys_free_gib": 0.0
+      },
+      {
+        "name": "verify2",
+        "reserved_gib": 12.291015625,
+        "delta_gib": 0.890625,
+        "phys_free_gib": 0.0
+      },
+      {
+        "name": "chain3",
+        "reserved_gib": 14.271484375,
+        "delta_gib": 2.00390625,
+        "phys_free_gib": 0.0
+      },
+      {
+        "name": "verify3",
+        "reserved_gib": 15.138671875,
+        "delta_gib": 0.890625,
+        "phys_free_gib": 0.0
+      },
+      {
+        "name": "chain4",
+        "oom": true,
+        "phys_free_gib": 0.0
+      }
+    ],
+    "captured": 8,
+    "total": 26
+  },
+  "notes": "graph 路径因 13 轮实际 cache 推进需要 26 个固定 shape graph；实测每个 chain graph 保留 ~1.6–2.0 GiB、每个 verify graph ~0.9 GiB；8 GiB 内无法共存 ⇒ Outcome C。不改显存护栏、不改模型路径。"
+}
