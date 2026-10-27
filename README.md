@@ -1,4 +1,4 @@
-# SpecDec：小显存 GPU 上的上下文长度与投机解码性能研究
+# When Does Speculative Decoding Pay Off? A Context-Length Study on an 8 GB GPU
 
 在 RTX 4060 Laptop 8GB 上实现 Qwen2.5 推理引擎，研究固定模型对、精度与推理配置时，上下文长度如何影响 greedy speculative decoding（SpecDec）相对自回归解码（AR）的性能。DSAI 4207 课程项目。
 
