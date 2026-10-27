@@ -1,23 +1,23 @@
-# SpecDec：小显存 GPU 上的上下文长度与推理性能研究
+# SpecDec：小显存 GPU 上的上下文长度与投机解码性能研究
 
-在 RTX 4060 Laptop 8GB 上实现 Qwen2.5 推理引擎，研究固定模型对、精度与推理配置时，上下文长度如何影响 greedy speculative decoding 相对自回归解码（AR）的性能。DSAI 4207 课程项目。
+在 RTX 4060 Laptop 8GB 上实现 Qwen2.5 推理引擎，研究固定模型对、精度与推理配置时，上下文长度如何影响 greedy speculative decoding（SpecDec）相对自回归解码（AR）的性能。DSAI 4207 课程项目。
 
-团队实现模型前向、KV cache、量化辅助函数和投机解码控制循环；张量运算依赖 PyTorch，权重与 tokenizer 来自 Hugging Face，prefill 融合 attention 使用库提供的 cuDNN 路径。**自写推理引擎不等于所有 CUDA 算子均为手写。**
+团队实现了模型前向、KV cache、量化辅助函数与投机解码控制循环；张量运算依赖 PyTorch，权重与 tokenizer 来自 Hugging Face，prefill 融合 attention 使用库提供的 cuDNN 路径。自写推理引擎不等于所有 CUDA 算子均为手写。
 
 ## 项目简介
 
 大模型生成文本包含两个工作阶段：**prefill** 处理已有上下文并建立 KV cache，**decode** 使用缓存逐步生成新 token。上下文变长时，两部分的计算量、缓存访问与临时张量需求都会变化。在 8GB 笔记本 GPU 上，理论上更省 target 调用的算法，也可能被 draft 成本、缓存操作或资源压力抵消。
 
-本项目围绕这一实际问题搭建了可以检查内部数据流的推理系统：先实现并对齐模型，再加入缓存、量化和投机解码，最后建立可复现的测量流程。我们不预设 SpecDec 必然加速，也不预设 KV 压缩必然降低整机延迟；负结果同样需要解释清楚。
+项目在自写推理引擎上构建了一条完整的实验链：先固定配置完成受控对照，再用多组独立的机制实验解释观测结果，最后用诊断性 oracle 分离不同成本来源。所有负结果与失败证据都被保留，没有被后续实验覆盖。
 
 | 问题 | 项目如何回答 |
 |---|---|
 | 上下文变长后，SpecDec 相对 AR 的收益如何变化？ | 固定模型对与推理配置，在 2K / 4K / 8K 比较 decode 与端到端延迟，这是主实验 |
-| 为什么接受率高仍可能不加速？ | 结合接受长度、轮数、target 调用量和独立阶段诊断，分析省下的 target 工作能否抵消额外成本 |
+| 为什么接受率高仍可能不加速？ | 结合接受长度、轮数、target 调用量与独立阶段诊断，拆解省下的 target 工作能否抵消额外成本 |
 | KV 压缩是否改变 8K 条件的资源与性能？ | 使用 V-only FP8 作为次要消融，分别测逻辑缓存、显存、延迟与固定文本质量 |
 | 批量验证与单步 AR 是否保持同样输出？ | 区分控制逻辑正确性与有限精度数值行为，保留完整 token 序列及分歧证据 |
 
-**为什么自建引擎？** 我们需要控制 cache 的布局与裁剪、量化发生的位置、验证块的形状和计时边界。自建引擎提供这些内部接口；参考库用于校验，而不是仅用一个整机速度数字推断原因。
+![实验设计与数据流](docs/figures/experiment_workflow.png)
 
 ## 系统如何工作
 
@@ -47,121 +47,139 @@
 → 继续下一轮，或因 EOS / 长度预算停止
 ```
 
-缓存中可能暂时包含尚未提交的候选，因此 `spec_cache.py` 的长度检查和裁剪不是附属功能，而是算法正确性的一部分。未接受候选不能成为后续生成的有效历史。当前流程的细节与出口契约以 [SpecDec 设计](docs/design_freeze_g4_specdec.md) 和 [cache 契约](docs/design_g4_cache_api.md) 为准。
+缓存中可能暂时包含尚未提交的候选，因此 `spec_cache.py` 的长度检查和裁剪不是附属功能，而是算法正确性的一部分。未接受候选不能成为后续生成的有效历史。流程细节与出口契约以 [SpecDec 设计](docs/design_freeze_g4_specdec.md) 和 [cache 契约](docs/design_g4_cache_api.md) 为准。
 
-V-only FP8 则改变缓存的**存储表示**：K 保持 BF16；每个 token、每个 KV head 的 128 维 V 用 max-abs scale 归一化，再舍入为 E4M3。读取时反量化回计算精度。压缩来自 FP8 payload，而非简单除以 scale；scale 元数据和反量化成本都必须计入结果。
+V-only FP8 改变缓存的**存储表示**：K 保持 BF16；每个 token、每个 KV head 的 128 维 V 用 max-abs scale 归一化，再舍入为 E4M3。读取时反量化回计算精度。压缩来自 FP8 payload，而非简单除以 scale；scale 元数据和反量化成本都计入结果。
 
-## 当前状态（2026-10-24）
+## 正式实验（confirmatory，2026-10-25）
 
-**用户编写的正式 runner 已完成主批次：192 个进程任务、480 条 measured 均已落盘。** 但 57/96 个 family-condition 单元至少存在一项稳定性 CHECK，8K 比值仍按 route C 抑制；数据完整不等于可作加速声明。生产 SpecDec 与 AR 也不保证始终逐 token 一致。
+Frozen configuration（全程未改动）：
 
-**最新协作者入口：[阶段进度与数据分析（2026-10-24）](docs/progress_and_data_analysis_2026-10-24.md)**。包含正式六条件描述性结果、四开发输入成本、GPU trace、修复后的 CUDA Graph 对照及未完成工作。
+| 项目 | 取值 |
+|---|---|
+| 硬件 | NVIDIA GeForce RTX 4060 Laptop GPU，8GB |
+| Target / draft | `Qwen/Qwen2.5-1.5B-Instruct` / `Qwen/Qwen2.5-0.5B-Instruct` |
+| 计算精度 | BF16 |
+| Attention | `cudnn_prefill` 仅融合 prefill；propose / verify / repair 保持 eager |
+| KV | 未量化 BF16（引擎标签 `fp16`） |
+| 上下文 | 2,048 / 4,096 / 8,192 tokens（同一 family 的嵌套前缀） |
+| Prefill chunk | 2,048 tokens |
+| 投机长度 | k = 4 |
+| Decode 上限 | 64 greedy tokens，EOS-aware |
+| 输入 | `formal-v1`，16 个 held-out family，三档上下文 |
+| 重复 | 每个 family×condition 5 次 measured，跨两个测量 block 按 3+2 分配，warm-up 丢弃 |
+| 执行 | AR 为 target-only 进程；SpecDec 为双模型进程；seeded AB/BA 串行调度 |
 
-![实验设计与数据流](docs/figures/experiment_workflow.png)
+正式主批次已完成 **192 个进程任务、480 条 measured**，无失败任务（冻结证据见 [confirmatory_full_results_2026-10-25.md](docs/confirmatory_full_results_2026-10-25.md)）。
 
-| 工作 | 已完成 | 边界与待办 |
+| Context | 可推断 family 数 | 中位 R = T_AR / T_Spec | Bootstrap 95% 区间 | AR decode 中位 (s) | Spec decode 中位 (s) | Spec 更慢 |
+|---:|---:|---:|---:|---:|---:|---:|
+| 2K | 16 | **0.531** | [0.424, 0.606] | 2.591 | 4.772 | 16/16 |
+| 4K | 16 | **0.485** | [0.429, 0.504] | 2.113 | 4.646 | 16/16 |
+| 8K | 4 | **0.522** | [0.360, 0.717] | 2.157 | 4.732 | 16/16（描述性） |
+
+用全部 16 个 family 中位数作描述性统计，SpecDec 的 decode 时间约为 AR 的 1.88×、2.06×、2.14×。8K 有 12 个 family 未通过完整的六项计时检查（边界时钟、block 间稳定性、运行内稳定性），因此只有 4 个 family 进入可推断子集；其余 12 个只作描述性留存。所有 family 在三个上下文下都显示 SpecDec 更慢，方向不依赖聚合统计。
+
+![正式实验结果](docs/figures/confirmatory_final/confirmatory_main_results.png)
+
+工作量为：中位接受率约 0.54 / 0.52 / 0.49，中位轮数约 23 / 23.5 / 24.5；把 block 验证调用与 mismatch 修复调用一并计入后，一次生成约需 39 / 39 / 41 次 target 调用。接受率与 decode 比值在 4K、8K 上的 Pearson 相关约 0.84、0.83，但相关性不构成因果解释。
+
+输出一致性：AR 与 SpecDec 在同一输入下产生完全相同的 64-token 输出，在 2K / 4K / 8K 分别为 3/16、8/16、5/16 个 family；两种模式各自在 16/16 family 上可复现。因此正式结果比较的是"相同配置下两条确定性生成路径的耗时"，不是"相同输出的无损加速"。
+
+## 机制实验链（2026-10-25 至 2026-10-27）
+
+正式结果表明 SpecDec 在所有上下文下都更慢。此后按顺序执行了一组独立实验，逐一排除解释路径：加速失败并非因为接受率低，也不只是因为 target 验证本身慢，更不是因为缺少 CUDA Graph；决定性成本来自 draft 模型的前向本身。
+
+### 1. 执行路径优化（Phase O）
+
+将每轮 8 次同步压缩到 2 次、把 per-step 的 H2D token 拷贝降为 0（GPU token 流、向量化接受判断），decode 时间下降 3.8%–4.5%，但仍慢于 AR。优化后的逐轮账本显示 draft 提议与 repair 仍是主要成本。
+
+### 2. 接受率诊断
+
+在开发 family 上（F09/F03/F11/F04，2K/4K/8K）统计严格接受率：中位 0.579 / 0.599 / 0.429。分析首个不匹配位置的目标模型次优排序：83.5% 的轮次中正确 token 位于 target rank ≤ 5，57.4% 落在 logit 差 ≤ 1.0 的近并列区间——不匹配大多发生在 BF16 数值近并列处。这说明接受率仍有大量可用空间，但也提示"通过更宽松接受规则拿回这些 token"未必改变性能结构。
+
+### 3. Relaxed acceptance（Δ-logit 容忍）
+
+把逐 token 的接受规则从"严格相等"放宽为"候选 token 与 target argmax 的 logit 差在 δ 内"，δ ∈ {0.05, 0.1, 0.3}，并在统计中记录 logit regret 与回滚量。接受率从 0.579 提升到 0.811 / 0.849 / 0.745，但 decode 比值为 0.714 / 0.680 / 0.560，从未超过 1。接受率提升没有转化为速度：轮数与 target 调用量下降有限，repair 调用反而增加，且 token 不再与 AR 逐位相同。结论：接受路径不是瓶颈所在。
+
+### 4. Perfect-acceptance oracle（all-accept）
+
+把每轮候选全部强制接受，把接受率推到上限 1.0，用于测量"在 target 验证形状不变的前提下，SpecDec 的延迟下限"。decode 比值为 0.860 / 0.858 / 0.849（最好单元 0.887）。即使接受率为 100%，依然慢 14%–15%：speculative 模式每个 decode step 需要一次 4-token 的 block verify，其成本高于 AR 的单 token step，draft 提议与 repair 的额外调用进一步叠加。这是该实现结构的**结构性下限**：接受率再高，也无法在这一结构下越过 1.0。
+
+### 5. Bonus-aware all-accept（token 粒度口径）
+
+每轮在 4 个候选之外再让 target 提供一个 free token（accept+1 的粒度），把 64-token 生成所需的轮数从 16 降到 13（52 个候选 token + 12 个 bonus token），验证调用 16→13。decode 比值为 0.912 / 0.931 / 0.874，12 个单元中有 3 个达到 1.01–1.03（跨批次对照，仅作趋势）。与严格路径的逐位一致性 gate 为 11/12，1 个单元因 BF16 舍入并列产生差异（已记录，不放行正式结论）。
+
+### 6. CUDA Graph 局部 A/B
+
+在固定形状下分别对 draft 提链与 target 验证做 CUDA Graph 捕获与回放：draft 16 步提链 3.7–6.0× 加速，target verify 1.4–2.6×；graph kernel 时间与含拷贝的有效时间差 < 2%，即回放本身几乎无额外开销；每个 graph 的保留内存池约 2.0 GiB（draft 链）/ 0.89 GiB（verify）。按这些分量估计的 Amdahl 上界为 2.4–4.4×——该上界建立在固定形状与固定写回的历史上，偏乐观，不能作为端到端 speedup。
+
+### 7. CUDA Graph 端到端可行性（2K）
+
+在 bonus all-accept、2K 条件下让每一轮都走 graph 捕获：26 个逐轮 graph（13 个 chain + 13 个 verify）各需约 2.0 / 0.89 GiB 保留内存，外推约 37.6 GiB，远超 8GB；实际捕获到 8/26 即 OOM。同一批次的 AR 为 2.407 s，eager bonus 为 2.691 s（比值 0.894）。结论：逐轮图捕获在 8GB 上不可行，端到端 CUDA Graph 路线被内存阻断，而非被计算量阻断。
+
+### 8. Draft-free + bonus oracle
+
+为直接测量"draft 前向本身值多少时间"，让 oracle 冻结生成的 64 个目标 token 序列，由 target 在 13 轮验证中回放（每轮 4 候选 + 1 bonus），完全移除 draft 前向。decode 时间 0.555 / 0.545 / 0.540 s，AR 为 2.476 / 2.293 / 2.286 s，S = 4.46 / 4.24 / 4.21。12/12 单元 gate 通过（生成序列与冻结序列逐位相等、`draft_forward_calls = 0`、cache 长度 = ctx+64、draft 常驻、峰值显存 3.82 GiB）。与 bonus oracle 对照（S_AR/S = 0.87–0.92）可以定位：draft 模型的前向计算是决定性成本，验证与 bonus 机制本身只占约 10%。
+
+### 机制链小结
+
+| 实验 | 关键数字 | 回答什么问题 |
 |---|---|---|
-| 自写引擎 | Embedding、RMSNorm、RoPE、GQA、SwiGLU、KV-cache、LM head、greedy generation、chunked prefill；参考实现对齐 | 历史 CPU FP32 与 GPU BF16 对齐证据有各自输入和配置范围 |
-| 投机解码 | Draft 提议、target 批量验证、拒绝修复、cache 回滚、EOS 与长度处理 | 限定范围 BF16 B6 PASS，不等于生产批量验证与 AR 全局 exact-id 等价 |
-| 正确性取证 | 类型覆盖、8K 融合复核、真实 EOS 补测；serial oracle 在对应测试中与 AR 完整一致 | serial 是诊断控制，不进入正式 speedup；生产批量验证仍可能出现可重复的数值分歧 |
-| V-only FP8 KV | K 保持 BF16，V 使用 FP8 E4M3、per-token × per-head scale、group=128 | 历史 eager 质量与压缩结果已记录；新后端独立准入与质量回归待完成 |
-| 正式测量 | runner、pilot、正式六条件主批次已完成；480条边界审计完整 | 57/96单元有稳定性CHECK；正式统计与分层解释待收尾，8K比值抑制 |
-| 成本机制分析 | 历史四开发输入draft约占58%–63%；Nsight采集与Graph干预提供提交/衔接开销证据 | profiler不进入正式计时；新逐轮账本跨family复测受环境门阻断 |
-| CUDA Graph原型 | 修复不对称计时后，16步固定token增长历史B→C耗时下降约55%/77%（target/draft） | 非自由生成；捕获与显存成本高，未证明完整SpecDec加速 |
+| 正式 confirmatory | R = 0.531 / 0.485 / 0.522（8K 限 4 family） | SpecDec 是否加速？否，全上下文、全 family |
+| Phase O 优化 | decode −3.8%–4.5% | 执行路径开销占多大？存在但不足以反转结论 |
+| 接受率诊断 | 严格接受 0.579 / 0.599 / 0.429；近并列 57.4% | 不匹配来自哪里？多为 BF16 数值近并列 |
+| Relaxed acceptance | 接受率 → 0.81 / 0.85 / 0.75；R 0.71 / 0.68 / 0.56 | 放宽接受能加速吗？不能 |
+| All-accept oracle | R = 0.860 / 0.858 / 0.849 | 完美接受是否够？不够，结构下限 ≈0.85 |
+| Bonus all-accept | 轮数 16→13；R 0.912 / 0.931 / 0.874 | 减少轮数能否接近 1？接近但未越过 |
+| 局部 CUDA Graph | draft 3.7–6.0×，verify 1.4–2.6× | graph 能回收多少开销？分数开销，但见下行 |
+| 端到端 CUDA Graph 2K | 26 图 ≈37.6 GiB → OOM | graph 端到端可行吗？内存阻断 |
+| Draft-free oracle | S = 4.46 / 4.24 / 4.21；draft 调用 0 | draft 前向值多少？去掉 draft 即可超越 AR |
 
-下一步：**正式结果分层分析与报告收尾 → 核对阶段内存预算 → 决定是否继续独立机制/优化支线。** 不再重复“runner尚未完成”的旧状态，不把Graph微基准或EAGLE-2意向当成已完成的主实验成果。
+## 结论
 
-## 实现与验证历程
+在冻结的 BF16 Qwen2.5-1.5B / 0.5B、batch=1、k=4、64-token 配置下，SpecDec 在 2K/4K/8K 全部 16 个正式 family 上都慢于 AR（可推断中位 0.531 / 0.485 / 0.522）。后续机制实验给出的解释链为：
 
-各阶段解决的是不同问题，不能把前一阶段的 PASS 当作后一阶段的结论。
+1. 接受率不是瓶颈：放宽到 Δ-logit 或强制完美接受，都无法让 SpecDec 越过 AR；
+2. 结构成本是主因：speculative 结构每步一次 4-token block verify，比 AR 的单 token step 更重；完美接受下也只能达到 ≈0.86；
+3. token 粒度口径（bonus）把轮数从 16 降到 13，最接近盈亏平衡（0.87–0.93），但该路径与 AR 输出不再逐位一致，且 3/12 单元的 1.01–1.03 仅为跨批次趋势；
+4. CUDA Graph 在固定形状下可回收大量执行开销，但 8GB 上逐轮图捕获被内存阻断，端到端不可行；
+5. 决定性成本是 draft 前向：移除 draft 后（bonus 逐位回放）S 达 4.2–4.5×，说明"更便宜、更准的 draft 生成方式"（如 EAGLE 式特征级/MLP 头 draft、共享 target 前向的轻量 head）才是把 SpecDec 推过 1.0 的方向，而不是继续调接受规则或调度。
 
-| 阶段 | 测试目的与方法 | 已获得的证据 |
-|---|---|---|
-| L1 / L2：基础引擎 | 对照参考 logits；比较缓存前向与全量重算；比较 greedy token IDs | 0.5B 基础前向与缓存生成对齐，为后续功能建立基线 |
-| G1：1.5B target | 复制参考权重，分别检查 full-forward、cached-vs-full、生成一致性 | 历史 CPU FP32 最大 logits 差约 `3.1e-05` / `2.0e-05`，四组生成一致；GPU BF16 短窗口另有对齐证据 |
-| G2：长上下文可运行性 | 8K chunked prefill 后继续生成，多轮记录有限性、序列与显存 | 历史单 target operational 测试无 OOM、三轮稳定；不代表当前双模型正式计时已经稳定 |
-| G3：KV 压缩 | 量化 roundtrip、缓存结构、重复确定性、chunk 对照和真实文本 NLL/PPL | 全 K/V FP8 质量损失明显，转为 K BF16 + V FP8；量化方案与证据边界已记录 |
-| G4：投机解码 | Draft 对齐、双模型可行性、cache API、主循环分支、EOS、AR/Spec 对照 | 已实现完整 greedy 流程；通过分层正确性取证区分控制逻辑与生产数值差异 |
-| G5：测量与主采集 | 独立进程、环境门、同步计时、记录格式、失败分类、输入重建 | 正式192任务/480条已采齐；稳定性分层、统计解释与声明资格仍需区分 |
+这些机制实验均为**诊断性 oracle**：它们分离成本来源，不代表可部署实现，不产生正式 speedup 或质量声明。对外声明以 confirmatory 结果与证据清单为准。
 
-### 为什么正确性定位花了较多时间？
+## 测量与证据规范
 
-同一个 target 的单步 AR 与批量验证，在数学结构上应具有对应的因果预测位置，但 BF16 下不保证不同执行形状逐位相同。局部误差可能改变接近并列的 argmax；一旦选择不同 token，两条路径的后续历史也会不同。
+- **测量边界**：decode 以"进入生成循环 → EOS/长度预算"为界计时；prefill 单独计时；加载不进入推理计时。计时使用 CUDA event，AR 与 Spec 同一输入。
+- **重复与随机化**：每个 `(family, condition)` 5 次 measured，跨两个测量 block 3+2 分配；每个进程先做一次 warm-up 并丢弃；AB/BA 调度消除 block 顺序效应。
+- **环境门禁**：每次 GPU 计时前检查可用物理内存（commit 阈值 16 GiB）；环境不达标时等待/重试，不绕过。WDDM 下的 `allocated > 8 GiB` 读数不可信，以物理 `mem_get_info` 与 OOM 为准。
+- **原始产物**：全部逐次运行记录保存在本地 `output/`（gitignored），每条记录含完整 token 序列、stop reason、cache/control 检查、attention 路径、环境遥测、边界时钟与显存统计；汇总表与统计 JSON 在 `docs/measurements/`。
+- **历史证据**：所有历史 FAIL/CHECK/PASS 与公开过的失败原因都保留，后续 PASS 不覆盖旧记录；8K 限制标签、跨批次对照、3 次重复等限制均在对应报告中原样列出。
+- **不可用的口径**：插桩、profiler、oracle、fixed-shape graph 微基准的计时不进入正式 speedup；不同配置、不同批次的数字不直接拼接成结论。
 
-我们因此不能只看最终文本是否相同：需要检查预测位置、缓存长度、接受/拒绝分支，再用同历史中间张量对照隔离数值因素。**Serial oracle** 保留投机控制流程，但用单步 target 决策作为诊断参照。在对应样本上与 AR 一致，支持控制逻辑；它不是生产批量路径，也不能拿来证明生产 SpecDec 的速度或全局输出等价。
+## 仓库结构
 
-当前有限范围 BF16 B6 证据包含 60 次类型覆盖、6 次 8K 融合复核和独立 6 次真实 EOS 补测。历史不完整用例与 FAIL/CHECK 保留；真实 EOS 补测支持其实际执行分支，其他分支还需结合 CPU 控制流证据阅读。详见 [B6 状态与证据](docs/b6_status_and_evidence_index_2026-10-05.md)。
+| 路径 | 内容 |
+|---|---|
+| `specdec/engine/` | 自写模型、attention、KV cache、量化接入与 greedy SpecDec 控制循环 |
+| `specdec/kernels/` | 隔离的 CUDA / Triton 算子研究，不默认等于正式配置所用路径 |
+| `experiments/formal/` | 正式 runner、计划/输入/worker、CPU 测试、证据审计 |
+| `experiments/confirmatory/` | confirmatory AB/BA 实验：run、pilot/full 分析、就绪审计、测试 |
+| `experiments/execution_optimization/` | Phase O 执行路径优化引擎与逐轮账本基准 |
+| `experiments/acceptance_diagnostics/` | 严格接受率与近并列分析 |
+| `experiments/relaxed_specdec/` | Δ-logit 放宽接受、all-accept、bonus all-accept 三组 oracle |
+| `experiments/cuda_graph_local/` | 固定形状下 draft/verify 局部 CUDA Graph A/B |
+| `experiments/cuda_graph_e2e/` | 逐轮图捕获端到端可行性实验（2K） |
+| `experiments/mechanism/` | draft-free + bonus 完美接受 oracle |
+| `docs/` | 设计、冻结协议、实验报告、数据台账、图表与汇总测量 |
+| `scripts/` | 正式 family 构建与 CPU 校验、报告生成脚本 |
+| `output/` | 原始运行产物（本地，gitignored） |
 
-## 研究范围与实验条件
+`docs/figures/` 与 `docs/measurements/` 保存各实验的图表与汇总表；各报告内链接指向对应文件。
 
-主问题只有一个：**上下文增长如何改变固定配置下的 SpecDec 性能？** 自写引擎是实验基础，KV 压缩是次要消融，不把所有实现模块作为并列研究问题。
+## 复现
 
-| 实验线 | 上下文 token 数 | Target KV | 解码策略 | 条件数 |
-|---|---|---|---|---|
-| BF16 主实验 | 2048 / 4096 / 8192 | 未量化 BF16 | AR / SpecDec | 6 |
-| 次要压缩消融 | 8192 | K BF16 + V FP8 | AR / SpecDec | 2 |
-
-旧的 **3×2×2、12 条件矩阵是历史计划**，不是当前主实验规格。FP8 按自己的准入条件放行，不阻塞 BF16 主线。
-
-当前登记配置：
-
-- Target：`Qwen/Qwen2.5-1.5B-Instruct`；draft：`Qwen/Qwen2.5-0.5B-Instruct`；计算精度 BF16。
-- Attention：`cudnn_prefill` 仅融合符合长度策略的 prefill；decode / propose / verify / repair 保持 eager。
-- `k=4`、`chunk=2048`、`max_new=64`；greedy argmax，命中 EOS 即停并记录实际长度；诊断精度干预关闭。
-- AR 使用 target-only 进程；SpecDec 使用双模型进程。加载不进入推理计时。
-- Pilot：开发用 family `F09/F03/F11/F04`；正式：`FF01–FF16`，按清单重建输入并核对长度/hash。
-- 每个 family × condition 合计 5 次 measured，跨两个随机测量 block 按 3+2 分配；每个 `(family, condition, block)` 独立进程做一次 warm-up 并丢弃。
-
-配置冻结不等于正式采集批准。见[配置记录](docs/config_freeze_2026-10-06.md)、[runner 规格](docs/formal_runner_spec_2026-10-06.md)和[准入清单](docs/bf16_formal_admission_2026-10-05.md)。恢复运行规则与引擎基线/runner 版本关系仍需在实现时明确。
-
-### 数据与重复测量如何组织？
-
-正式 family 来自 WikiText-2 train 的预定窗口，pilot 使用已参与开发的 family。每个正式 family 从同一窗口取 2K、4K、8K 嵌套前缀；长度越长，输入包含的信息越多，续写起点也不同。相同长度下的 AR/Spec 对照使用同一输入。
-
-`formal-v1` 从 22 个未使用候选中按确定性规则选出 16 个 family；集合内相对分层为 4/4/4/4，每个源 block 不超过 5 个。清单记录来源、位置和 hash，不按正式性能结果挑选样本。CPU 校验通过 18 项检查，包括 48 个前缀的重建、消费隔离和嵌套关系。
-
-这里有两种不同的 block：**数据源 block** 表示文本截取区域；**测量 block** 表示随机化运行的一轮。主实验共 `16 × 6 × 5 = 480` 次 measured；按每个 `(family, condition, measurement block)` 一个进程组织时，共 192 个进程任务及对应 warm-up。此数量不包含 pilot、失败处置与 FP8 消融。
-
-## 已有发现与结论边界
-
-| 发现 | 实测结果 | 适用范围 |
-|---|---|---|
-| V-only FP8 固定文本质量 | 独立 40 个 2048-token 窗口：平均 ΔNLL `+0.000397`，相对 ΔPPL `+0.040%` | Qwen2.5-1.5B、BF16 compute、历史 eager 路径；不证明分歧后的生成质量等同 |
-| Target 8K 逻辑 KV 压缩 | `224.00 → 169.75 MiB`，约 `1.32×`，含 scale 元数据 | 仅 target KV，不是整模型或双模型显存压缩比 |
-| 压缩不必然加速 | 历史 paired eager 测试峰值仅降约 `0.06 GiB`，decode 未加速 | 反量化有成本；不能直接外推到当前后端 |
-| K-FP8 负结果 | 被测配置下 ΔNLL 约 `+2.4` 或更高，V-only 明显更温和 | 仅本模型、在线 max-abs E4M3 与被测实现，不宣称所有 K 量化不可行 |
-| 批量验证数值行为 | 同历史局部样本中，QK 与 projection 对 `M=1` / `M=4` 形状敏感；生产轨迹可能分歧 | 控制逻辑正确与逐 token 数值复现是不同问题；未证明统一、唯一的 kernel 级根因 |
-
-正式性能指标为 `speedup = T_AR / T_Spec`，大于 1 表示 SpecDec 更快。若输出轨迹不同，须同时报告分歧、实际长度、接受率和调用量，不能称为“相同输出的无损加速”。插桩、serial oracle 和 profiler 计时不作为正式速度数据。
-
-显存分别记录 PyTorch `allocated`、`reserved` 和设备侧占用；`reserved` 不等于物理驻留，不能仅凭它超过 8 GiB 就断言分页或物理超限。旧 FAIL/CHECK 保留，后续 PASS 不覆盖历史记录。
-
-## 指标如何阅读
-
-| 指标 | 单位或定义 | 回答什么问题 |
-|---|---|---|
-| Prefill latency | 秒；AR 为 target prefill，Spec 包含 target 与 draft prefill | 处理输入、建立缓存需要多久？ |
-| Decode latency | 秒；按冻结边界计时，记录实际生成长度 | 生成阶段需要多久？ |
-| Decode throughput | 实际生成 token 数 / decode 秒数，token/s | 每秒生成多少 token？EOS 提前停止时不能仍按 64 计算 |
-| Decode / e2e speedup | 对应边界的 `T_AR / T_Spec`，无量纲 | Spec 是否更快？`0.5×` 表示时间约为 AR 的两倍 |
-| Acceptance rate | 接受候选数 / 提议候选数 | Draft 与 target 在当前轨迹上有多匹配？不是正确率或质量分数 |
-| Accepted length / round counts | 每轮接受长度、轮数、target/draft 调用次数 | 节省了多少调用，额外工作来自哪里？ |
-| NLL / PPL | 固定真实文本上的平均负对数似然；`PPL = exp(mean NLL)` | 改变 KV 表示后，对真实下一 token 的预测损失如何变化？ |
-| Logical KV size | bytes / MiB，含 scale 等元数据 | 缓存表示本身压缩了多少？ |
-| Peak allocated / reserved | MiB 或 GiB，分别报告 | 张量活跃分配与分配器池的峰值是多少？ |
-| Sequence divergence | 完整 token IDs、共同前缀、首分歧位置、长度与 stop reason | AR/Spec 是否走了同一轨迹？不能只比较打印文本片段 |
-
-`1 MiB = 2^20 bytes`，`1 GiB = 2^30 bytes`。所有结果需注明模型、精度、backend、输入、计时边界和代码版本；跨配置、跨工具的数字不能直接拼成一个 speedup。
-
-### 性能分析与正式计时分开
-
-阶段插桩和 profiler 用于解释成本，例如 draft 提议、target 验证、repair、cache 复制、矩阵乘法与反量化分别花了多少时间。它们会改变运行开销，因此应在独立诊断 pass 中执行，不混入正式 measured 数据。融合 attention 的内部步骤也不一定能在 profiler 中拆成独立算子。
-
-Pilot 的作用是验证 runner、计时边界、记录完整性和当前 2K/4K/8K 的稳定性，不是挑选“更容易加速”的正式 family。只有这些工作完成并满足准入要求后，才开始正式采集；目前尚不能用探索性测量宣称加速，也不能将轨迹分歧直接解释成质量下降。
-
-## 本地环境与检查
-
-以下为项目已使用的 Windows / PowerShell 环境命令，不是正式实验启动命令。
+环境（Windows / PowerShell，本机目标为 PyTorch 2.6.0+cu124 与 RTX 4060 Laptop 8GB）：
 
 ```powershell
 py -3.11 -m venv .venv
@@ -173,41 +191,92 @@ python -m pip install -e .
 python -m specdec.cli env-check
 ```
 
-本机目标环境：PyTorch 2.6.0+cu124、RTX 4060 Laptop 8GB。GPU 测试串行运行；环境检查失败时保留失败证据，不绕过护栏伪装成功。
+所有 GPU 实验串行运行；计时前须通过环境门禁；`output/` 为默认产物目录。
 
 ```powershell
-# CPU 正式输入校验；需要本地数据与 tokenizer
+# 正式 family 构建与 CPU 校验（需要本地数据与 tokenizer）
+python -X utf8 scripts/build_formal_families.py
 python -X utf8 scripts/verify_formal_families_cpu.py
 
-# 历史基础对齐工具，不代替当前完整准入
-python -m specdec.engine.align_ours
-python -m specdec.engine.test_cache_equiv
-python -m specdec.engine.align_generate
+# 正式 runner（先 pilot，再 formal；--execute 才会真正运行）
+python -X utf8 -m experiments.formal.run --execute --pilot
+python -X utf8 -m experiments.formal.run --execute --formal
+
+# confirmatory AB/BA（--expected-commit 指定冻结代码）
+python -X utf8 -m experiments.confirmatory.run --execute --input-set pilot
+python -X utf8 -m experiments.confirmatory.run --execute --input-set formal --expected-commit <frozen-sha>
+python -X utf8 -m experiments.confirmatory.analyze_pilot
+python -X utf8 -m experiments.confirmatory.analyze_full
+python -X utf8 -m experiments.confirmatory.audit_full_ready
+
+# Phase O 执行优化基准
+python -X utf8 -m experiments.execution_optimization.bench_dev
+python -X utf8 -m experiments.execution_optimization.analyze_bench
+
+# 接受率诊断 / Δ-logit 放宽 / all-accept / bonus all-accept
+python -X utf8 -m experiments.acceptance_diagnostics.run_dev
+python -X utf8 -m experiments.relaxed_specdec.run_dev --stage b --role relaxed --family F09 --ctx 2048 --delta 0.1
+python -X utf8 -m experiments.relaxed_specdec.run_all_accept --role oracle --family F09 --ctx 2048
+python -X utf8 -m experiments.relaxed_specdec.run_bonus_accept --role bonus --family F09 --ctx 2048
+
+# 局部图 A/B（draft / target）
+python -X utf8 -m experiments.cuda_graph_local.gate_gpu
+python -X utf8 -m experiments.cuda_graph_local.benchmark --family F09 --ctx 2048 --model draft
+python -X utf8 -m experiments.cuda_graph_local.benchmark --family F09 --ctx 2048 --model target
+
+# 端到端图可行性（2K，ar / eager / graph）
+python -X utf8 -m experiments.cuda_graph_e2e.benchmark_2k --mode ar
+python -X utf8 -m experiments.cuda_graph_e2e.benchmark_2k --mode graph
+
+# draft-free + bonus oracle
+python -X utf8 -m experiments.mechanism.run_draft_free_oracle --stage full --mode draft_free --family F09 --ctx 2048
+python -X utf8 -m experiments.mechanism.analyze
 ```
 
-离线模式可使用 `$env:HF_HUB_OFFLINE = "1"`，前提是所需文件已缓存。Manifest 只存来源、长度和 hash，不包含完整 token IDs。原始运行产物主要保存在本地；GitHub 文档同步不等于原始数据全部上传。
+各实验目录下的 `analyze*.py` 把 `output/` 原始数据规约为 `docs/measurements/` 中的汇总表与统计 JSON；`test_*_cpu.py` 为可在无 GPU 环境运行的逻辑测试。离线模型加载可设 `$env:HF_HUB_OFFLINE = "1"`（前提：所需文件已缓存）。
 
-## 代码与文档导航
+## 文档索引
 
-| 路径 | 用途 |
-|---|---|
-| `specdec/engine/model_self.py` | 自写模型、attention、KV-cache、量化接入与生成 |
-| `specdec/engine/spec_dec.py` | Greedy SpecDec 控制循环 |
-| `specdec/engine/spec_cache.py` | Cache 长度、裁剪与一致性契约 |
-| `specdec/engine/` | 对齐、正确性、数值诊断与测量工具 |
-| `specdec/kernels/` | 隔离的 CUDA / Triton 算子研究，不默认等于正式配置所用路径 |
-| `scripts/build_formal_families.py` | 确定性构建正式 family 清单 |
-| `scripts/verify_formal_families_cpu.py` | 输入、消费隔离、hash、分层与嵌套校验 |
+主实验与数据：
 
-- [课程 proposal](docs/pdf/specdec_course_proposal_2026-10-04_final.pdf)：主 6 条件 + 次要 2 条件；存在提交版 PDF 不代表已确认提交。
-- [正式输入清单](docs/prompt_families_formal_manifest.json)：`formal-v1`；16 个 family、三档前缀，18 项 CPU 校验通过。分层为候选集合内相对标签。
-- [G5 测量协议](docs/g5_measurement_protocol.md)：计时、随机化、环境与失败记录。
-- [B6 状态与证据](docs/b6_status_and_evidence_index_2026-10-05.md)、[分层正确性协议](docs/specdec_correctness_protocol_v2_2026-10-04.md)：正确性声明范围。
-- [正确性归因与处理报告（2026-10-07，19 页 PDF）](docs/pdf/specdec_correctness_localization_report_2026-10-07.pdf)：从分歧发现、同历史定位和因果干预，到逐行候选评估、serial oracle、B6/EOS 收尾与最终分层处理。生成源为 `scripts/generate_correctness_localization_report.py`；保留生产数值差异与历史 FAIL/CHECK，不宣称全局 exact-id 等价。
-- [10 月 6 日阶段记录](docs/stage_checkpoint_2026-10-06.md)、[协作者阶段报告](docs/collaborator_status_2026-10-04.md)：历史进展与证据索引；历史“下一步”不替代当前配置。
-- [数据台账](docs/data_ledger.md)：实测结果、配置与历史 FAIL/CHECK。
-- [FP8 设计](docs/design_freeze_fp8_kv.md)、[SpecDec 设计](docs/design_freeze_g4_specdec.md)、[cache 契约](docs/design_g4_cache_api.md)。
-- [投机解码教学](docs/specdec_explained.md)（[PDF](docs/pdf/specdec_speculative_decoding_explained.pdf)）：原理、张量与代码；历史 exact-id 说明应结合当前数值证据阅读。
-- [协作者 PR 评审](docs/collaborator_pr_review_2026-10-02.md)、[kernel 研究说明](specdec/kernels/README.md)。
+- [Confirmatory 完整结果（2026-10-25）](docs/confirmatory_full_results_2026-10-25.md) — 正式数字、8K 限制、机制证据与声明边界
+- [Confirmatory pilot 报告（2026-10-24）](docs/confirmatory_pilot_report_2026-10-24.md)、[测量预注册](docs/confirmatory_measurement_preregistration_2026-10-24.md)、[完整协议](docs/confirmatory_full_protocol_2026-10-25.md)
+- [阶段进度与数据分析（2026-10-24）](docs/progress_and_data_analysis_2026-10-24.md)、[数据台账](docs/data_ledger.md)、[G5 测量协议](docs/g5_measurement_protocol.md)
 
-旧版 v6/v7/v7.1 计划与阶段日报保留在 `docs/` 供复盘；其中 12 条件、旧精度口径和历史验收不作为当前正式执行合同。性能与质量声明须指向真实测量及对应配置，不把诊断结果或外推估计写成正式实验结果。
+机制实验（按时间顺序）：
+
+- [执行热路径审计（2026-10-25）](docs/specdec_execution_hotpath_audit_2026-10-25.md) / [执行优化报告（2026-10-25）](docs/specdec_execution_optimization_report_2026-10-25.md)
+- [接受率诊断（2026-10-26）](docs/acceptance_diagnostics_report_2026-10-26.md)
+- [Relaxed SpecDec 机制报告（2026-10-26）](docs/relaxed_specdec_mechanism_report_2026-10-26.md)
+- [All-accept 延迟下限（2026-10-26）](docs/all_accept_latency_floor_report_2026-10-26.md)
+- [Bonus all-accept oracle 报告（2026-10-26）](docs/bonus_accept_oracle_report_2026-10-26.md) / [设计审计](docs/bonus_accept_design_audit_2026-10-26.md)
+- [局部 CUDA Graph A/B 报告（2026-10-26）](docs/cuda_graph_local_ab_report_2026-10-26.md) / [设计审计](docs/cuda_graph_local_ab_design_audit_2026-10-26.md)
+- [端到端 2K 图实验报告（2026-10-27）](docs/cuda_graph_e2e_2k_report_2026-10-27.md) / [设计审计](docs/cuda_graph_e2e_2k_design_audit_2026-10-27.md)
+- [Draft-free oracle 报告（2026-10-27）](docs/draft_free_oracle_report_2026-10-27.md)
+
+设计与正确性：
+
+- [配置冻结（2026-10-06）](docs/config_freeze_2026-10-06.md)、[正式 runner 规格](docs/formal_runner_spec_2026-10-06.md)、[BF16 准入清单](docs/bf16_formal_admission_2026-10-05.md)
+- [SpecDec 设计](docs/design_freeze_g4_specdec.md)、[cache 契约](docs/design_g4_cache_api.md)、[FP8 设计](docs/design_freeze_fp8_kv.md)
+- [B6 状态与证据](docs/b6_status_and_evidence_index_2026-10-05.md)、[分层正确性协议](docs/specdec_correctness_protocol_v2_2026-10-04.md)、[正确性归因报告（PDF）](docs/pdf/specdec_correctness_localization_report_2026-10-07.pdf)
+- [投机解码教学](docs/specdec_explained.md)（[PDF](docs/pdf/specdec_speculative_decoding_explained.pdf)）
+
+历史归档：`docs/` 中保留旧版计划、每日报告与阶段检查点；其中的配置口径与验收标准不构成当前正式执行合同。性能与质量声明以 confirmatory 结果与 `docs/measurements/` 中的证据为准。
+
+## 已知限制
+
+- 单机、单请求、batch=1、单一 GPU（RTX 4060 Laptop 8GB）；结论不外推到批处理、其他 GPU 或生产 serving 引擎。
+- 正式结果是对"两条确定性生成路径的耗时比较"，其中 AR 与 Spec 输出在多数 family 上不一致；不一致由 BF16 形状敏感（M=1 vs M=4）引起，属数值行为而非控制逻辑错误。
+- 8K 只有 4 个 family 通过全部计时检查；描述性 8K 数字不与其他上下文合并。
+- 机制实验为诊断性 oracle，不可部署；部分数字来自开发 family 与跨批次对照，仅作趋势参考。
+- CUDA Graph 的端到端结论是"在 8GB 上不可行"（内存阻断），不是"graph 计算上无效"；未来若采用有界容量/静态 padding 或共享池方案，需要重新测量。
+
+## 后续方向
+
+1. 用更便宜、更准的 draft 生成替代独立 draft 模型前向（如特征级 draft / 共享 target 前向的轻量头 / 检索或 n-gram 回退），这是 draft-free 实验直接指向的路径。
+2. 评估静态容量或 padding 的 graph 方案在本模型对上的可行性（图数量与保留内存的固定上界），并以逐位 gate 约束输出一致性。
+3. 结束 k 敏感性与上下文效应的辅助分析，作为主实验之外的补充证据。
+
+## 团队与课程信息
+
+DSAI 4207 课程项目。代码与文档由团队成员维护；`docs/pdf/specdec_course_proposal_2026-10-04_final.pdf` 为课程 proposal 提交版，`specdec_frozen_submission_proposal_3members.md` 为冻结提交口径。
