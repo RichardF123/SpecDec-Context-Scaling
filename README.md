@@ -239,6 +239,7 @@ python -X utf8 -m experiments.mechanism.analyze
 
 主实验与数据：
 
+- [中文版阶段性技术报告（2026-10-26，PDF）](docs/pdf/specdec_chinese_stage_report_2026-10-26.pdf)（[可编辑 Markdown](docs/specdec_chinese_stage_report_2026-10-26.md)）— 截至 10-26 的阶段汇总：正式结果、成本机制、Phase O、接受率诊断与后续路线
 - [Confirmatory 完整结果（2026-10-25）](docs/confirmatory_full_results_2026-10-25.md) — 正式数字、8K 限制、机制证据与声明边界
 - [Confirmatory pilot 报告（2026-10-24）](docs/confirmatory_pilot_report_2026-10-24.md)、[测量预注册](docs/confirmatory_measurement_preregistration_2026-10-24.md)、[完整协议](docs/confirmatory_full_protocol_2026-10-25.md)
 - [阶段进度与数据分析（2026-10-24）](docs/progress_and_data_analysis_2026-10-24.md)、[数据台账](docs/data_ledger.md)、[G5 测量协议](docs/g5_measurement_protocol.md)
